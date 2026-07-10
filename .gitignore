@@ -1,0 +1,8 @@
+# runtime artifacts of xauusd_adaptive_bot.py
+logs/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+KILL_SWITCH
+__pycache__/
+*.pyc
