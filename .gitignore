@@ -1,11 +1,13 @@
-# credentials -- never commit these
-.env
-
-# runtime artifacts (both bots)
-logs/
-*.sqlite3
-*.sqlite3-wal
-*.sqlite3-shm
-KILL_SWITCH
+# python
 __pycache__/
 *.pyc
+
+# runtime artifacts of XAUUSD_Adaptive_Bot
+ctrader_bot/journal_output/
+EMERGENCY_STOP.txt
+*.csv
+
+# misc
+.DS_Store
+logs/
+*.sqlite3
