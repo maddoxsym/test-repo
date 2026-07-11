@@ -1,0 +1,2 @@
+# The bot is pure Python standard library plus one dependency:
+requests>=2.31
