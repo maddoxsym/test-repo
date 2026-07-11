@@ -1471,6 +1471,25 @@ class DatabaseManager:
             (day, start_equity, end_equity, realised, trades, wins, losses,
              max_dd, locked))
 
+    def upsert_weekly(self, week: str, start_equity: float,
+                      end_equity: float, realised: float, trades: int,
+                      max_dd: float) -> None:
+        self.execute(
+            "INSERT INTO weekly_stats VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(week) DO UPDATE SET end_equity=excluded.end_equity, "
+            "realised=excluded.realised, trades=excluded.trades, "
+            "max_drawdown=excluded.max_drawdown",
+            (week, start_equity, end_equity, realised, trades, max_dd))
+
+    def upsert_monthly(self, month: str, start_equity: float,
+                       end_equity: float, realised: float,
+                       trades: int) -> None:
+        self.execute(
+            "INSERT INTO monthly_stats VALUES (?,?,?,?,?) "
+            "ON CONFLICT(month) DO UPDATE SET end_equity=excluded.end_equity, "
+            "realised=excluded.realised, trades=excluded.trades",
+            (month, start_equity, end_equity, realised, trades))
+
     def record_backtest(self, run_id: str, data_desc: str, cfg_hash: str,
                         start: str, end: str, metrics: Dict[str, Any]) -> None:
         self.execute(
@@ -2870,6 +2889,7 @@ class WeekState:
     start_equity: float
     realised: float = 0.0
     min_equity: float = 0.0
+    trades_opened: int = 0
 
 
 class RiskManager:
@@ -2877,13 +2897,22 @@ class RiskManager:
     nothing here ever increases risk. Locks only clear on the natural
     boundary (new broker day / new week), never intra-period."""
 
-    def __init__(self, cfg: Config, db: DatabaseManager):
+    def __init__(self, cfg: Config, db: DatabaseManager,
+                 persist_state: bool = True):
+        """persist_state=False (backtests) still writes daily/weekly stats
+        rows to `db` but never reads or writes the live bot_state keys, so a
+        research run can share a database file with the live bot without
+        clobbering its restart-recovery state."""
         self.cfg = cfg
         self.db = db
+        self.persist_state = persist_state
         self.day: Optional[DayState] = None
         self.week: Optional[WeekState] = None
-        self.consecutive_losses: int = int(db.get_state("consecutive_losses", 0) or 0)
-        self._restore()
+        self.consecutive_losses: int = 0
+        if persist_state:
+            self.consecutive_losses = int(
+                db.get_state("consecutive_losses", 0) or 0)
+            self._restore()
 
     # -- persistence ----------------------------------------------------------
     def _restore(self) -> None:
@@ -2897,6 +2926,8 @@ class RiskManager:
                                      if k in WeekState.__dataclass_fields__})
 
     def _persist(self) -> None:
+        if not self.persist_state:
+            return
         if self.day:
             self.db.set_state("day_state", asdict(self.day))
         if self.week:
@@ -2929,10 +2960,36 @@ class RiskManager:
             self.day = DayState(day=dk, start_equity=equity, min_equity=equity)
         wk = self._week_key(t)
         if self.week is None or self.week.week != wk:
+            if self.week is not None:
+                self.db.upsert_weekly(self.week.week, self.week.start_equity,
+                                      equity, self.week.realised,
+                                      self.week.trades_opened,
+                                      self._dd(self.week.start_equity,
+                                               self.week.min_equity))
             self.week = WeekState(week=wk, start_equity=equity,
                                   min_equity=equity)
         self.day.min_equity = min(self.day.min_equity or equity, equity)
         self.week.min_equity = min(self.week.min_equity or equity, equity)
+        self._persist()
+
+    def flush(self, t: datetime, equity: float) -> None:
+        """Persist the CURRENT (unfinished) day and week to the stats
+        tables. Called at shutdown and at backtest end so the final period
+        is never lost."""
+        if self.day is not None:
+            self.db.upsert_daily(self.day.day, self.day.start_equity,
+                                 equity, self.day.realised,
+                                 self.day.trades_opened, self.day.wins,
+                                 self.day.losses,
+                                 self._dd(self.day.start_equity,
+                                          min(self.day.min_equity, equity)),
+                                 self.lock_reason(t, equity).value)
+        if self.week is not None:
+            self.db.upsert_weekly(self.week.week, self.week.start_equity,
+                                  equity, self.week.realised,
+                                  self.week.trades_opened,
+                                  self._dd(self.week.start_equity,
+                                           min(self.week.min_equity, equity)))
         self._persist()
 
     @staticmethod
@@ -2947,6 +3004,9 @@ class RiskManager:
             self.day.trades_opened += 1
             key = session.value
             self.day.session_trades[key] = self.day.session_trades.get(key, 0) + 1
+        if self.week:
+            self.week.trades_opened += 1
+        if self.day or self.week:
             self._persist()
 
     def register_close(self, profit: float) -> None:
@@ -4881,6 +4941,97 @@ class ReportGenerator:
                 f"realised={re_:+.2f} trades={n} W/L={w}/{l} "
                 f"maxDD={dd:.2%} lock={lock}")
 
+    # -- weekly / monthly (aggregated from journaled data) -----------------
+    def _closed_trade_rows(self) -> List[Tuple]:
+        return self.db.query(
+            "SELECT entry_time, model, session, profit, tf_plan FROM trades "
+            "WHERE status='CLOSED' AND entry_time IS NOT NULL")
+
+    @staticmethod
+    def _week_of(ts: str) -> str:
+        iso = datetime.fromisoformat(ts).isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"
+
+    def _trade_summary(self, rows: List[Tuple]) -> List[str]:
+        """Best/worst model, best session and best TF combo for a period."""
+        if not rows:
+            return ["   no closed trades in this period"]
+        by_model: Dict[str, List[float]] = {}
+        by_session: Dict[str, List[float]] = {}
+        by_combo: Dict[str, List[float]] = {}
+        for _ts, model, session, profit, tf_plan in rows:
+            by_model.setdefault(model, []).append(profit)
+            by_session.setdefault(session, []).append(profit)
+            try:
+                plan = json.loads(tf_plan or "{}")
+                combo = f"{plan.get('bias', '?')}/{plan.get('decision', '?')}" \
+                        f"/{plan.get('entry', '?')}"
+            except (json.JSONDecodeError, TypeError):
+                combo = "?"
+            by_combo.setdefault(combo, []).append(profit)
+
+        def _best_worst(d: Dict[str, List[float]]) -> Tuple[str, str]:
+            nets = {k: sum(v) for k, v in d.items()}
+            best = max(nets, key=nets.get)
+            worst = min(nets, key=nets.get)
+            return (f"{best} ({nets[best]:+.2f}, {len(d[best])} trades)",
+                    f"{worst} ({nets[worst]:+.2f}, {len(d[worst])} trades)")
+        bm, wm = _best_worst(by_model)
+        bs, _ = _best_worst(by_session)
+        bc, wc = _best_worst(by_combo)
+        return [f"   best model:  {bm}", f"   worst model: {wm}",
+                f"   best session: {bs}",
+                f"   best TF combo:  {bc}", f"   worst TF combo: {wc}"]
+
+    def weekly_report(self, week: str) -> str:
+        days = [r for r in self.db.query(
+            "SELECT day,start_equity,end_equity,realised,trades,wins,losses,"
+            "max_drawdown FROM daily_stats ORDER BY day")
+            if self._week_of(r[0]) == week]
+        wk_rows = self.db.query(
+            "SELECT start_equity,end_equity,realised,trades,max_drawdown "
+            "FROM weekly_stats WHERE week=?", (week,))
+        trades = [r for r in self._closed_trade_rows()
+                  if self._week_of(r[0]) == week]
+        if not days and not wk_rows and not trades:
+            return f"no data for week {week}"
+        if wk_rows:
+            se, ee, re_, n, dd = wk_rows[0]
+        else:
+            se = days[0][1] if days else 0.0
+            ee = days[-1][2] if days else 0.0
+            re_ = sum(d[3] for d in days)
+            n = sum(d[4] for d in days)
+            dd = max((d[7] for d in days), default=0.0)
+        wins = sum(1 for r in trades if r[3] > 0)
+        lines = [f"WEEKLY REPORT {week}: days={len(days)} start={se:.2f} "
+                 f"end={ee:.2f} realised={re_:+.2f} trades={n} "
+                 f"W/L={wins}/{len(trades) - wins} maxDD={dd:.2%}"]
+        lines += self._trade_summary(trades)
+        # keep the weekly_stats table in sync with what was reported
+        self.db.upsert_weekly(week, se, ee, re_, n, dd)
+        return "\n".join(lines)
+
+    def monthly_report(self, month: str) -> str:
+        days = [r for r in self.db.query(
+            "SELECT day,start_equity,end_equity,realised,trades "
+            "FROM daily_stats ORDER BY day") if r[0][:7] == month]
+        trades = [r for r in self._closed_trade_rows() if r[0][:7] == month]
+        if not days and not trades:
+            return f"no data for month {month}"
+        se = days[0][1] if days else 0.0
+        ee = days[-1][2] if days else 0.0
+        re_ = sum(d[3] for d in days) if days \
+            else sum(r[3] for r in trades)
+        n = sum(d[4] for d in days) if days else len(trades)
+        wins = sum(1 for r in trades if r[3] > 0)
+        lines = [f"MONTHLY REPORT {month}: days={len(days)} start={se:.2f} "
+                 f"end={ee:.2f} realised={re_:+.2f} trades={n} "
+                 f"W/L={wins}/{len(trades) - wins}"]
+        lines += self._trade_summary(trades)
+        self.db.upsert_monthly(month, se, ee, re_, n)
+        return "\n".join(lines)
+
 
 # ===========================================================================
 # SECTION 27 — SYNTHETIC DATA (mechanics verification only)
@@ -5103,7 +5254,7 @@ class BacktestEngine:
         builder = ContextBuilder(cfg, engine, sessions, news)
         execu = ExecutionManager(cfg, self.db)
         sizer = PositionSizer(cfg)
-        risk = RiskManager(cfg, DatabaseManager(":memory:"))
+        risk = RiskManager(cfg, self.db, persist_state=False)
         tmgr = TradeManager(cfg)
 
         equity = cfg.backtest_initial_equity
@@ -5260,6 +5411,7 @@ class BacktestEngine:
             tr.status = TradeStatus.CANCELLED
             execu.pending_trades.remove(tr)
             execu.closed_trades.append(tr)
+        risk.flush(final.time + timedelta(minutes=base_tf.minutes), equity)
 
         all_trades = execu.closed_trades
         metrics = PerformanceAnalyzer.metrics(all_trades, curve,
@@ -5620,6 +5772,12 @@ class BotController:
             return 10
         finally:
             self._persist()
+            try:
+                eq = self._equity()
+                if eq > 0:
+                    self.risk.flush(utcnow(), eq)
+            except Exception as exc:
+                log.warning("could not flush period stats at shutdown: %s", exc)
             self.notify.event("bot stopped")
             self.connector.shutdown()
             self.db.close()
@@ -6858,6 +7016,102 @@ class TestBacktestEngine(unittest.TestCase):
             self.assertEqual(mc["runs"], 0)
 
 
+class TestReports(unittest.TestCase):
+    def setUp(self):
+        self.cfg = Config()
+        self.db = DatabaseManager(":memory:")
+
+    def _mk_closed_trade(self, entry_time: datetime, profit: float,
+                         model: SetupModel = SetupModel.TREND_CONTINUATION,
+                         session: SessionName = SessionName.LONDON) -> Trade:
+        plan = TimeframePlan(Timeframe.H1, Timeframe.M15, Timeframe.M15,
+                             Timeframe.M5, Timeframe.M15, "test")
+        setup = Setup(new_id("setup"), model, Direction.LONG, entry_time,
+                      100.0, 100.0, 95.0, 110.0, 115.0, None,
+                      EntryMode.MARKET_ON_CONFIRM, 85.0, SetupGrade.A,
+                      ScoreBreakdown(), plan, Regime.STRONG_BULL, session,
+                      TrendState.BULLISH, atr=1.0)
+        return Trade(new_id("trade"), setup, TradeStatus.CLOSED, 0.0, 1.0,
+                     0.01, 500.0, entry_price=100.0, entry_time=entry_time,
+                     stop_price=95.0, initial_stop=95.0, tp1=110.0,
+                     tp2=115.0, exit_price=100.0 + profit / 100.0,
+                     exit_time=entry_time + timedelta(hours=2),
+                     exit_reason=ExitReason.TAKE_PROFIT, profit=profit)
+
+    def test_week_rollover_writes_weekly_stats(self):
+        rm = RiskManager(self.cfg, self.db)
+        mon1 = datetime(2025, 1, 6, 9, 0, tzinfo=UTC)     # 2025-W02
+        rm.roll(mon1, 10_000.0)
+        rm.register_open(mon1, SessionName.LONDON)
+        rm.register_close(+120.0)
+        mon2 = datetime(2025, 1, 13, 9, 0, tzinfo=UTC)    # 2025-W03
+        rm.roll(mon2, 10_120.0)
+        rows = self.db.query("SELECT week, realised, trades FROM weekly_stats "
+                             "WHERE week='2025-W02'")
+        self.assertTrue(rows)
+        self.assertAlmostEqual(rows[0][1], 120.0)
+        self.assertEqual(rows[0][2], 1)
+
+    def test_flush_persists_current_periods(self):
+        rm = RiskManager(self.cfg, self.db)
+        t = datetime(2025, 1, 7, 9, 0, tzinfo=UTC)
+        rm.roll(t, 10_000.0)
+        rm.register_close(-80.0)
+        rm.flush(t + timedelta(hours=4), 9_920.0)
+        d = self.db.query("SELECT realised, end_equity FROM daily_stats "
+                          "WHERE day='2025-01-07'")
+        w = self.db.query("SELECT realised FROM weekly_stats "
+                          "WHERE week='2025-W02'")
+        self.assertTrue(d and w)
+        self.assertAlmostEqual(d[0][0], -80.0)
+        self.assertAlmostEqual(d[0][1], 9_920.0)
+        self.assertAlmostEqual(w[0][0], -80.0)
+
+    def test_backtest_risk_state_is_isolated(self):
+        rm = RiskManager(self.cfg, self.db, persist_state=False)
+        t = datetime(2025, 1, 7, 9, 0, tzinfo=UTC)
+        rm.roll(t, 10_000.0)
+        rm.register_close(+50.0)
+        rm.flush(t, 10_050.0)
+        # stats rows written, but live restart-recovery state untouched
+        self.assertTrue(self.db.query("SELECT 1 FROM daily_stats"))
+        self.assertIsNone(self.db.get_state("day_state"))
+        rm2 = RiskManager(self.cfg, self.db)   # a live manager sees nothing
+        self.assertIsNone(rm2.day)
+
+    def test_weekly_and_monthly_reports(self):
+        t = datetime(2025, 1, 7, 9, 0, tzinfo=UTC)        # 2025-W02
+        self.db.journal_trade(self._mk_closed_trade(t, +150.0), Mode.PAPER,
+                              "XAUUSD")
+        self.db.journal_trade(
+            self._mk_closed_trade(t + timedelta(days=1), -60.0,
+                                  model=SetupModel.RANGE_EXTREME,
+                                  session=SessionName.NEW_YORK),
+            Mode.PAPER, "XAUUSD")
+        self.db.upsert_daily("2025-01-07", 10_000.0, 10_150.0, 150.0,
+                             1, 1, 0, 0.0, "NONE")
+        self.db.upsert_daily("2025-01-08", 10_150.0, 10_090.0, -60.0,
+                             1, 0, 1, 0.006, "NONE")
+        rg = ReportGenerator(self.db)
+        weekly = rg.weekly_report("2025-W02")
+        self.assertIn("WEEKLY REPORT 2025-W02", weekly)
+        self.assertIn("W/L=1/1", weekly)
+        self.assertIn("best model:  TREND_CONTINUATION", weekly)
+        self.assertIn("worst model: RANGE_EXTREME", weekly)
+        monthly = rg.monthly_report("2025-01")
+        self.assertIn("MONTHLY REPORT 2025-01", monthly)
+        self.assertIn("realised=+90.00", monthly)
+        self.assertTrue(self.db.query("SELECT 1 FROM weekly_stats "
+                                      "WHERE week='2025-W02'"))
+        self.assertTrue(self.db.query("SELECT 1 FROM monthly_stats "
+                                      "WHERE month='2025-01'"))
+
+    def test_empty_period_reports_say_so(self):
+        rg = ReportGenerator(self.db)
+        self.assertIn("no data", rg.weekly_report("2030-W01"))
+        self.assertIn("no data", rg.monthly_report("2030-01"))
+
+
 def run_tests(verbose: bool = True) -> int:
     """Run the built-in suite; returns a process exit code."""
     loader = unittest.TestLoader()
@@ -6866,7 +7120,8 @@ def run_tests(verbose: bool = True) -> int:
                 TestFVG, TestOrderBlocks, TestRegime, TestTimeframeSelection,
                 TestScoring, TestPositionSizing, TestRiskLocks,
                 TestTradeHelpers, TestSessionsAndNews,
-                TestResampleNoLookahead, TestSafeguards, TestBacktestEngine):
+                TestResampleNoLookahead, TestSafeguards, TestReports,
+                TestBacktestEngine):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2 if verbose else 1)
     result = runner.run(suite)
@@ -6948,6 +7203,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="override SQLite database path")
     parser.add_argument("--report-day", default="",
                         help="print the daily report for YYYY-MM-DD and exit")
+    parser.add_argument("--report-week", default="",
+                        help="print the weekly report for YYYY-Www "
+                             "(e.g. 2025-W07) and exit")
+    parser.add_argument("--report-month", default="",
+                        help="print the monthly report for YYYY-MM and exit")
     parser.add_argument("--emergency-close", action="store_true",
                         help="close all bot positions at MT5 and exit")
     parser.add_argument("--i-understand-live-risk", action="store_true",
@@ -6976,9 +7236,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.emergency_close:
         return run_emergency_close(cfg)
 
-    if args.report_day:
+    if args.report_day or args.report_week or args.report_month:
         db = DatabaseManager(cfg.db_path)
-        print(ReportGenerator(db).daily_report(args.report_day))
+        rg = ReportGenerator(db)
+        if args.report_day:
+            print(rg.daily_report(args.report_day))
+        if args.report_week:
+            print(rg.weekly_report(args.report_week))
+        if args.report_month:
+            print(rg.monthly_report(args.report_month))
         db.close()
         return 0
 
