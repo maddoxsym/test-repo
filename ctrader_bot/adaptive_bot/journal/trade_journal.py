@@ -61,8 +61,8 @@ class TradeJournal:
             candidates.append(base)
         home = os.path.expanduser("~")
         candidates.append(os.path.join(home, "Documents", "XAUUSD_Adaptive_Bot"))
-        candidates.append(os.path.join(os.path.dirname(
-            os.path.abspath(__file__)), "..", "..", "journal_output"))
+        candidates.append(os.path.join(home, "XAUUSD_Adaptive_Bot"))
+        candidates.append(os.path.join(os.getcwd(), "XAUUSD_Adaptive_Bot_journal"))
         for cand in candidates:
             try:
                 os.makedirs(cand, exist_ok=True)

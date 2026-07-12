@@ -46,8 +46,7 @@ from adaptive_bot.core.models import (Candle, CTraderSymbolSpec, Direction,
                                       ScoreBreakdown, SessionName, Setup,
                                       SetupGrade, SetupModel, Timeframe,
                                       Trade, TradeStatus, TrendState, new_id)
-from adaptive_bot.execution.order_manager import (OrderFacts, OrderManager,
-                                                  Preflight)
+from adaptive_bot.execution.order_manager import OrderFacts, OrderManager
 from adaptive_bot.execution.position_manager import PositionManager
 from adaptive_bot.filters.news_filter import NewsFilter
 from adaptive_bot.filters.session_filter import SessionManager
@@ -373,7 +372,6 @@ class XAUUSD_Adaptive_Bot(object):
     # ------------------------------------------------------- trigger & entry
     def _try_trigger(self, now, m1_candles):
         setup, expiry = self._armed
-        cfg = self.cfg
         if now > expiry:
             api.Print(f"SETUP EXPIRED without M1 trigger: {setup.model.value} "
                       f"{setup.direction.value} score {setup.score:.1f}")
@@ -893,7 +891,11 @@ class XAUUSD_Adaptive_Bot(object):
 
     def _emergency_file_present(self):
         name = self.cfg.emergency_stop_file
-        for base in (self.journal.directory, _BOT_DIR):
+        candidates = (self.journal.directory,
+                      os.path.join(os.path.expanduser("~"), "Documents",
+                                   "XAUUSD_Adaptive_Bot"),
+                      os.getcwd())
+        for base in candidates:
             if base and os.path.exists(os.path.join(base, name)):
                 return True
         return self.cfg.emergency_stop

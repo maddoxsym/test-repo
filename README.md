@@ -6,6 +6,10 @@ This repository contains **XAUUSD_Adaptive_Bot**, a native cTrader Algo
 
 Everything lives in [`ctrader_bot/`](ctrader_bot/):
 
+* **[`ctrader_bot/XAUUSD_Adaptive_Bot_V3_main.py`](ctrader_bot/XAUUSD_Adaptive_Bot_V3_main.py)
+  — the single self-contained file to paste into the cTrader editor**
+  (cTrader embeds only the main Python file, so this inlines the whole
+  strategy; class `XAUUSD_Adaptive_Bot_V3`).
 * [`ctrader_bot/README.md`](ctrader_bot/README.md) — install into cTrader
   Mac, build, configure, backtest, run on demo, emergency stop, logs and
   CSV journal, known limitations.

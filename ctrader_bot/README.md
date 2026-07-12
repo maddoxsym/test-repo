@@ -22,44 +22,33 @@ transparent 0–100 setup score, strict risk limits and a CSV journal.
 
 ---
 
-## 1. Install into cTrader Mac
+## 1. Install into cTrader Mac — use the SINGLE FILE
+
+> **Important:** cTrader embeds and executes **only the main Python file**
+> of a cBot — it does not package sibling folders. That is why the modular
+> layout crashes at runtime with `No module named 'adaptive_bot'`. The
+> supported build is therefore the **self-contained single file**:
+>
+> **`XAUUSD_Adaptive_Bot_V3_main.py`** (everything inlined, no local
+> imports, no `__file__`, standard library only).
 
 1. Open **cTrader** → **Algo** section (the robot icon in the left rail).
-2. Click **New cBot** → in the dropdown choose **Python** → name it exactly
-   `XAUUSD_Adaptive_Bot`.
-   cTrader creates the cBot's source folder containing a generated
-   `XAUUSD_Adaptive_Bot.py` (plus `robot_wrapper.py` and a companion `.cs`
-   file — leave those two alone).
-3. Find that source folder on disk. On Mac it lives under cTrader's
-   Documents/cAlgo data folder, e.g.
-   `~/Documents/cAlgo/Sources/Robots/XAUUSD_Adaptive_Bot/…` — the easiest
-   way is to right-click the cBot in cTrader and use the option to show/open
-   the source location, or search for `XAUUSD_Adaptive_Bot.py` in Finder.
-4. Copy from this repository **into that folder, next to the generated
-   `.py` file**:
-   * the whole `adaptive_bot/` directory (all subfolders),
-   * and REPLACE the generated `XAUUSD_Adaptive_Bot.py` with the
-     `XAUUSD_Adaptive_Bot.py` from this repo.
-   Do **not** delete or modify `robot_wrapper.py` or the generated `.cs`
-   file.
-5. Back in cTrader, open the cBot in the code editor and press
-   **Build** (⌘B / the Build button).
+2. Click **New cBot** → choose **Python** → name it
+   `XAUUSD_Adaptive_Bot_V3`.
+3. Open the new cBot in cTrader's code editor, **select all** the template
+   code and **replace it with the entire contents of
+   `ctrader_bot/XAUUSD_Adaptive_Bot_V3_main.py`** from this repository.
+   (Do not touch `robot_wrapper.py` or the companion `.cs` file that
+   cTrader generates — they stay as generated.)
+4. Press **Build** (⌘B). No extra files, folders or Python packages are
+   needed.
 
-### If the build complains about imports
+The cBot class inside the file is named exactly `XAUUSD_Adaptive_Bot_V3`.
 
-* `ModuleNotFoundError: adaptive_bot` → the `adaptive_bot/` folder is not
-  sitting in the same directory as `XAUUSD_Adaptive_Bot.py`. Re-check step 4
-  — the main file bootstraps `sys.path` with its own directory, so the
-  package must be its sibling.
-* `robot_wrapper` or `cAlgo.API` errors → you replaced or renamed the
-  generated wrapper files; recreate the cBot and copy only what step 4 says.
-* If your cTrader build's generated template differs (e.g. a different
-  class base), keep the generated file's first ~8 lines (imports) and class
-  declaration line, and paste everything else from this repo's main file
-  into the class body — the method names (`on_start`, `on_tick`, `on_stop`)
-  are the cTrader-standard Python handlers.
-
-The bot needs **no third-party Python packages** — standard library only.
+*The modular tree (`XAUUSD_Adaptive_Bot.py` + `adaptive_bot/`) remains in
+the repo as the readable, unit-tested source that the single file is
+generated from — develop and run `tests/` against it, but paste only the
+V3 single file into cTrader.*
 
 ## 2. Select Skilling demo + GOLD
 
@@ -77,7 +66,10 @@ will refuse to run.
 
 ## 3. Configure
 
-All settings live in `adaptive_bot/core/config.py` with safe defaults
+In the single-file build, edit the `Config` dataclass **inside
+`XAUUSD_Adaptive_Bot_V3_main.py`** (search for `class Config` — it is the
+same block as `adaptive_bot/core/config.py`, which remains the reference
+for the modular tree). All settings ship with safe defaults
 (risk 0.25%/trade, 1%/day, 3 trades/day, min score 70, min RR 1.5, spread
 cap 60 points, break-even/trailing/partial **off**, sessions Asia/London/NY
 **on** with London+NY preferred). Edit the file and press Build again.

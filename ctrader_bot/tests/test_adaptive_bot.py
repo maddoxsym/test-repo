@@ -16,8 +16,8 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from adaptive_bot.core.config import Config, ConfigValidator
-from adaptive_bot.core.helpers import atr_series, resample, tf_bucket_start
+from adaptive_bot.core.config import Config
+from adaptive_bot.core.helpers import resample, tf_bucket_start
 from adaptive_bot.core.models import (Candle, CTraderSymbolSpec, Direction,
                                       FVGState, LockReason, ScoreBreakdown,
                                       SessionName, Setup, SetupGrade,
@@ -35,7 +35,6 @@ from adaptive_bot.strategy.fair_value_gap import FVGDetector
 from adaptive_bot.strategy.liquidity import LiquidityDetector
 from adaptive_bot.strategy.market_structure import (StructureAnalyzer,
                                                     SwingDetector)
-from adaptive_bot.strategy.regime import MarketRegimeDetector
 from adaptive_bot.strategy.setup_scoring import SetupScorer
 from adaptive_bot.strategy.strategy_engine import (FIXED_PLAN, ContextBuilder,
                                                    StrategyEngine)

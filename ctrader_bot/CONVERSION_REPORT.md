@@ -1,5 +1,22 @@
 # CONVERSION_REPORT — MT5/OANDA ➜ native cTrader Python cBot
 
+> **V3 single-file build:** cTrader embeds only the main Python file of a
+> cBot and does not package sibling directories, so the modular layout
+> fails at runtime with `No module named 'adaptive_bot'`. The deployable
+> artefact is **`XAUUSD_Adaptive_Bot_V3_main.py`** (class
+> `XAUUSD_Adaptive_Bot_V3`): the entire `adaptive_bot` package inlined
+> into one self-contained file — no local imports, no `__file__`, no
+> third-party packages. It is generated from the modular tree, which stays
+> in the repo as the unit-tested source of truth. The V3 file passed
+> `py_compile`, pyflakes (only the expected `api`/`TimeFrame`/`TradeType`
+> star-import names remain, provided by cTrader at runtime), and a
+> runtime smoke test against a mocked cTrader API covering: live-account
+> refusal, EURUSD refusal, 130 simulated minutes of ticks with new-bar
+> detection and M5 decisions, a real order execution path
+> (ExecuteMarketOrder → ModifyPosition → journal, risk capped at 0.25%),
+> duplicate-order blocking, broker-side close reconciliation from History,
+> and the emergency-stop file.
+
 This report documents the full conversion of the repository's previous
 trading bots into `XAUUSD_Adaptive_Bot`, a native cTrader Algo Python cBot
 for GOLD on a Skilling demo account.

@@ -29,7 +29,7 @@ from ..core.config import Config
 from ..core.helpers import atr_series, is_displacement
 from ..core.models import (Candle, Direction, FairValueGap, LiquidityKind,
                            LiquidityLevel, OrderBlock, Regime, RegimeReading,
-                           ScoreBreakdown, SessionName, Setup, SetupGrade,
+                           SessionName, Setup, SetupGrade,
                            SetupModel, StructureEvent, StructureEventKind,
                            SweepEvent, Timeframe, TimeframePlan, TrendState,
                            Zone, ZoneKind, new_id)
