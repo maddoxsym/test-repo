@@ -1,88 +1,143 @@
-# XAUUSD Adaptive Trading Bot
+# Memcoin Trader — multi-agent trading system
 
-A fully automated, adaptive gold (XAUUSD) trading system for MetaTrader 5,
-contained in **one Python file**: [`xauusd_adaptive_bot.py`](xauusd_adaptive_bot.py).
+> **Project pivot (July 2026)**: the owner moved away from memecoin
+> trading for religious reasons. Active development now targets **gold
+> (XAU/USD)** — see **[docs/GOLD.md](docs/GOLD.md)** and the `goldtrader/`
+> package (spot + MetaTrader 5 demo bridge, configurable leverage,
+> long-only mode). The memecoin system below remains as a working
+> reference implementation and is no longer actively traded.
 
-It reads higher-timeframe market structure, detects liquidity, supply/demand
-zones, fair value gaps and order blocks, waits for sweep + displacement +
-BOS/CHoCH/MSS confirmation, and only then trades — with structural stops,
-setup-graded position sizing and hard capital-protection locks.
+A zero-dependency Python system in which **five cooperating AIs** research,
+vet, and paper-trade Solana memecoins — every entry at low market cap,
+every exit owned by a disciplined risk engine, and a self-improvement loop
+that evolves the strategy parameters against a market simulator calibrated
+to real pump.fun-era statistics.
 
-> **No profitability is claimed or implied.** The daily +2%/+3% figures in
-> the config are risk-off throttles, not targets the bot chases. Capital
-> protection overrides profit everywhere in the code.
+> **This system never touches real money.** It has no wallet, no keys, and
+> deliberately no live-execution code. Paper trade until the numbers earn
+> anything more — and read the disclaimer at the bottom.
 
-## Modes
+## The agents
 
-| Mode | What it does | Requirements |
-|------|--------------|--------------|
-| `BACKTEST` | Research on CSV or synthetic candles | any OS, stdlib only |
-| `PAPER` *(default)* | Live analysis, simulated fills, no orders | Windows + MT5 terminal |
-| `DEMO` | Real orders on an MT5 **demo** account | Windows + MT5 terminal |
-| `LIVE` | Real money — **disabled by default**, quadruple-gated | Windows + MT5 + explicit opt-in |
-
-## Quick start
-
-```bash
-# Core (backtest/tests, any OS)
-pip install requests
-
-# Full stack (paper/demo/live — Windows only; MetaTrader5 has no Linux build)
-pip install MetaTrader5 numpy pandas requests
-
-python xauusd_adaptive_bot.py --test                        # 86 built-in tests
-python xauusd_adaptive_bot.py --mode BACKTEST --synthetic   # mechanics check
-python xauusd_adaptive_bot.py --mode BACKTEST --data m5.csv --walk-forward
-python xauusd_adaptive_bot.py --mode PAPER                  # default mode
-python xauusd_adaptive_bot.py --report-day 2025-01-07
-python xauusd_adaptive_bot.py --report-week 2025-W02
-python xauusd_adaptive_bot.py --report-month 2025-01
-python xauusd_adaptive_bot.py --emergency-close             # close everything
+```
+                        ┌────────────────────────────────────┐
+                        │            ORCHESTRATOR            │
+                        └────────────────────────────────────┘
+   discovery                 vetting                intelligence
+┌─────────────┐   ┌────────────────────────┐   ┌─────────────────────┐
+│   SCOUT     │──▶│      RUG CHECKER       │   │  NEWS AGENT         │
+│ new coins,  │   │ mint/freeze authority, │   │  narrative metas    │
+│ low mcap    │   │ LP lock, holder spread,│   ├─────────────────────┤
+│ only        │   │ deployer bags → VETO   │   │  WHALE TRACKER      │
+└─────────────┘   └────────────────────────┘   │  measured-PnL       │
+                              │                │  wallets, copy sigs │
+                              ▼                └─────────────────────┘
+     ┌────────────────────────────────────────────────┐
+     │                  STRATEGIES                    │
+     │  graduation_sniper · momentum · copy_trade ·   │
+     │  dip_buyer                                     │
+     └────────────────────────────────────────────────┘
+                              │ buy signals
+                              ▼
+     ┌────────────────────────────────────────────────┐
+     │   RISK ENGINE — sizing, stops, TP ladder,      │
+     │   moonbag trailing stop, rug exits             │
+     └────────────────────────────────────────────────┘
+                              ▲
+     ┌────────────────────────────────────────────────┐
+     │   STRATEGY LAB — evolves every parameter by    │
+     │   paper-trading mutations across market seeds  │
+     └────────────────────────────────────────────────┘
 ```
 
-Credentials come **only** from environment variables (`MT5_LOGIN`,
-`MT5_PASSWORD`, `MT5_SERVER`, optional `TELEGRAM_BOT_TOKEN`,
-`TELEGRAM_CHAT_ID`, `NEWS_API_KEY`). Nothing is hard-coded.
+| Agent | Job |
+|---|---|
+| **Scout** | Finds newly launched coins (pump.fun bonding curve, DexScreener new pairs) and enforces the house rule: only low market caps enter the funnel |
+| **Rug Checker** | Background check with hard veto: mint/freeze authority, LP lock/burn, holder concentration, deployer bags, socials, liquidity. Keeps re-checking open positions and forces instant exits on rug signals |
+| **News Agent** | Tracks the hot narrative meta (dogs → AI → politics → …) and boosts/penalizes signals by fit |
+| **Whale Tracker** | Maintains measured track records of trader wallets; flags convergent smart-money entries; powers copy trading |
+| **Strategy Lab** | The AI that improves the other AIs: evolutionary search over every strategy/risk parameter, fitness = drawdown-penalized return across multiple simulated market seeds |
 
-## Safety model (enforced in code, covered by tests)
+## Quickstart (no installs — pure stdlib, Python 3.10+)
 
-- 5% risk per trade is a **hard ceiling** the validator refuses to raise;
-  defaults are 0.5–2% by setup grade (B/A/A+), score < 70 = no trade.
-- Daily −5% / weekly −10% / 3-consecutive-loss locks; +2% soft and +3% hard
-  daily profit stops (measured from broker-day-reset equity).
-- Stops are structural, never widened, never removed; volumes round **down**;
-  minimum-lot-too-risky setups are rejected.
-- No martingale, no grid, no averaging losers, no risk increase after losses.
-- LIVE requires: `--mode LIVE` **and** `LIVE_TRADING_ENABLED = True` **and**
-  `--i-understand-live-risk` **and** account/server matching **and** recorded
-  backtest runs meeting research standards **and** the backtest/paper/demo
-  verification flags you set only after reviewing each phase yourself.
-- Kill switch: create a file named `KILL_SWITCH` next to the bot.
+```bash
+# 1. Paper-trade 72 simulated hours of memecoin market
+python3 -m memetrader backtest --hours 72 --verbose
 
-## What's inside the single file
+# 2. Let the Strategy Lab evolve better parameters (writes data/best_params.json)
+python3 -m memetrader evolve --generations 6 --population 10
 
-Config + validator, structured logging, SQLite journaling (every accepted
-*and* rejected setup, config audit trail, heartbeats, daily/weekly/monthly
-stats), swing/structure/liquidity/zone/FVG/order-block detectors, an
-11-class market-regime classifier, an adaptive timeframe selector, six entry
-models with 0–100 scoring, true-monetary position sizing from live broker
-symbol specs, a look-ahead-free candle backtester (conservative SL-first
-intrabar assumption), walk-forward analysis, Monte Carlo trade reshuffling,
-paper simulator, MT5 execution path with pre-flight checklist and restart
-reconciliation, Telegram alerts, and an 86-test built-in suite
-(`--test`).
+# 3. Re-test with the evolved champion (picked up automatically)
+python3 -m memetrader backtest --hours 72
 
-## Known limitations
+# 4. LIVE paper trading on real market data (needs internet; still no real money)
+python3 -m memetrader paper --minutes 120
 
-- Candle-based backtests can't know intrabar order of SL vs TP → the engine
-  assumes **stop first** (conservative) and documents every assumption in
-  its report output.
-- The MetaTrader5 Python package is Windows-only; on other platforms the bot
-  runs BACKTEST and tests, and refuses live-feed modes with a clear message.
-- Without `NEWS_API_KEY` the news filter logs that live news protection is
-  incomplete and relies on manual blackout windows + spread/volatility locks.
-  It never fabricates events.
-- Synthetic-data runs verify mechanics only, never profitability.
+# 5. Inspect the saved live-paper portfolio anytime
+python3 -m memetrader report
 
-Full setup, CSV format, MT5 configuration and per-mode instructions are in
-the header docstring of `xauusd_adaptive_bot.py`.
+# 6. Quick-flip mode (buy, take profit immediately, move on) + tiny bankroll
+python3 -m memetrader backtest --scalp --bankroll 20 --hours 24
+
+# 7. The persistent $20 campaign: one simulated trading day per run,
+#    equity carries over, dated ledger written to data/pnl_log.md
+python3 -m memetrader campaign
+```
+
+### Quick-flip (scalp) profile
+
+`--scalp` switches the exit ladder to fast profit-taking: **sell 60% at
++30%, 25% at +60%, 10% at +120%**, 25% stop, 18% trailing stop, nothing
+held past ~2 hours. `python3 -m memetrader evolve --scalp` evolves this
+profile separately (champion: `data/best_params_scalp.json`).
+
+Example simulator results (72h, $1,000 start — **simulator numbers do not
+promise live results**):
+
+```
+final equity  $22,352   return +2135%   trades 119   win rate 89%   max DD 3.9%
+  copy_trade         44 trades  avg  8.10x   +$12,149
+  momentum           31 trades  avg  4.47x   +$5,985
+  graduation_sniper  36 trades  avg  2.06x   +$3,426
+  dip_buyer           8 trades  avg  1.31x   +$609
+```
+
+## Documentation
+
+- **[docs/MARKET_STUDY.md](docs/MARKET_STUDY.md)** — the memecoin market
+  from Dogecoin (2013) through pump.fun industrialization to 2026: the hard
+  statistics, why "$50 → $50M" stories are survivorship bias, and how each
+  finding became a system rule.
+- **[docs/STRATEGIES.md](docs/STRATEGIES.md)** — the four strategies, the
+  rug-check gate, the exit ladder, and the evolution loop, with every
+  tunable explained.
+- **[docs/PLATFORMS.md](docs/PLATFORMS.md)** — what to use alongside
+  Phantom (GMGN for copy trading, Axiom/Photon for terminals, RugCheck for
+  safety), wallet hygiene, and how to pick wallets worth copying.
+
+## Project layout
+
+```
+memetrader/
+  config.py            every tunable parameter (evolvable)
+  models.py            shared dataclasses
+  datafeed/
+    simulator.py       offline market calibrated to real memecoin statistics
+    live.py            DexScreener + pump.fun + RugCheck clients (keyless)
+  agents/              scout, rug_checker, news_agent, whale_tracker, strategy_lab
+  strategies/          graduation_sniper, momentum, copy_trade, dip_buyer
+  engine/              portfolio, risk (exits/sizing), paper_broker (slippage), orchestrator
+  main.py              CLI
+data/
+  best_params.json     Strategy Lab champion (auto-loaded)
+  watch_wallets.json   wallets to copy (seed from GMGN/Kolscan leaderboards)
+```
+
+## Disclaimer
+
+Memecoins are the highest-risk corner of crypto: most tokens are scams,
+most traders lose money, and nothing in this repository changes those base
+rates. This code is a research and paper-trading tool, not financial
+advice and not an invitation to deploy capital. Simulator performance
+(however good) does not predict live performance. If you ever trade real
+money, use a separate small wallet you can afford to lose entirely.

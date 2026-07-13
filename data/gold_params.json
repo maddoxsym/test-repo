@@ -1,0 +1,37 @@
+{
+  "exit_style": "binary",
+  "allow_short": true,
+  "max_leverage": 200.0,
+  "ema_fast": 20,
+  "ema_slow": 60,
+  "trend_min_slope": 0.0001,
+  "mr_window": 45,
+  "mr_entry_z": -2.6,
+  "mr_max_trend_z": 0.8,
+  "bo_lookback": 120,
+  "bo_min_range_expansion": 1.6,
+  "risk": {
+    "starting_bankroll_usd": 3000.0,
+    "risk_per_trade": 0.04,
+    "max_concurrent_positions": 1,
+    "max_per_strategy": 1,
+    "max_position_usd": 1000000.0,
+    "min_position_usd": 2.0,
+    "stop_loss": 0.006,
+    "trailing_stop": 0.004,
+    "tp_multiples": [
+      1.012
+    ],
+    "tp_fractions": [
+      1.0
+    ],
+    "max_hold_minutes": 600.0,
+    "stale_exit_multiple": 1.0002,
+    "spike_sell_threshold": 0.0025,
+    "spike_sell_fraction": 1.0,
+    "spike_min_multiple": 1.0015,
+    "daily_loss_limit": 0.15,
+    "profit_lock_trigger": 999.0,
+    "profit_lock_keep": 0.5
+  }
+}
