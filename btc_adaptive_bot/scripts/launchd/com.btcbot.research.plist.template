@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OPTIONAL launchd configuration for macOS.
+
+  Keeps the research experiment running across reboots and restarts it if the
+  process exits unexpectedly. The 14-day timer is stored in SQLite, so a restart
+  RESUMES the same experiment rather than starting a new one.
+
+  Install:
+    1. Replace __PROJECT_DIR__ with the absolute path to btc_adaptive_bot
+       and __USER__ with your macOS short username:
+         sed -e "s|__PROJECT_DIR__|$(pwd)|g" -e "s|__USER__|$(whoami)|g" \
+           scripts/launchd/com.btcbot.research.plist.template \
+           > ~/Library/LaunchAgents/com.btcbot.research.plist
+    2. Load it:
+         launchctl load -w ~/Library/LaunchAgents/com.btcbot.research.plist
+    3. Check it:
+         launchctl list | grep btcbot
+         tail -f __PROJECT_DIR__/logs/launchd.out.log
+
+  Stop / remove:
+         launchctl unload -w ~/Library/LaunchAgents/com.btcbot.research.plist
+
+  Notes:
+    * KeepAlive restarts the bot on unexpected exit. A clean Ctrl+C shutdown
+      inside a launchd-managed process will also be restarted — unload the agent
+      first if you want the bot to stay stopped.
+    * caffeinate (-i -s) prevents idle sleep while the bot runs. Closing the
+      laptop lid can STILL suspend the machine depending on your hardware and
+      power settings. For a genuinely uninterrupted 14 days, keep the lid open
+      or connect an external display with "Prevent automatic sleeping" enabled
+      in System Settings -> Displays -> Advanced (or use a desktop Mac).
+    * Sleep interrupts market data but does NOT reset the experiment timer.
+      The outage is recorded, and by default the 14-day window is not extended.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.btcbot.research</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>-s</string>
+        <string>__PROJECT_DIR__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>btcbot.app.cli</string>
+        <string>--config</string>
+        <string>config/research.yaml</string>
+        <string>research</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__PROJECT_DIR__/src</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <!-- Start at login and keep running. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+
+    <!-- Do not hammer the exchange if the bot crash-loops. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/launchd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <false/>
+</dict>
+</plist>

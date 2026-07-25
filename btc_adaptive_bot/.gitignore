@@ -1,0 +1,48 @@
+# ---- secrets ----
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+secrets.*
+credentials.*
+*token*.json
+
+# ---- databases / private data ----
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+backups/
+
+# ---- private logs ----
+logs/
+*.log
+*.log.*
+*.jsonl
+
+# ---- generated reports & exports ----
+reports/
+exports/
+
+# ---- python ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# ---- os / editor ----
+.DS_Store
+.idea/
+.vscode/

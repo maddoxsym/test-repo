@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "btc-adaptive-bot"
+version = "1.0.0"
+description = "Adaptive BTC trading research system — Bybit Demo only, no real-money trading"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "httpx==0.28.1",
+    "websockets==16.1.1",
+    "pydantic==2.13.4",
+    "PyYAML==6.0.3",
+    "numpy==2.4.6",
+    "python-dotenv==1.2.2",
+    "fastapi==0.139.2",
+    "uvicorn==0.51.0",
+    "Jinja2==3.1.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.16.0",
+]
+
+[project.scripts]
+btcbot = "btcbot.app.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "integration: tests that exercise several subsystems together",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",    # long lines are allowed; docstrings and log messages explain a lot
+    "UP042",   # `str, Enum` is deliberate — values serialise directly to JSON/SQLite
+    "SIM102",  # nested ifs are often clearer than a compound condition in strategy logic
+    "SIM108",  # an explicit if/else is easier to read than a nested ternary here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests intentionally poke at private state and assert on broad exception types
+# (pydantic raises ValidationError, which is not part of our public contract).
+"tests/**" = ["B017", "SIM117", "F841"]

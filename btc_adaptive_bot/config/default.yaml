@@ -1,0 +1,275 @@
+# ============================================================
+#  BTC Adaptive Bot — default configuration
+#  Every value here can be changed without touching source code.
+#  Validated at startup; invalid values fail loudly with the exact path.
+#
+#  There is no setting in this file (or any file) that enables
+#  real-money trading. That is enforced in code, not configuration.
+# ============================================================
+
+experiment:
+  name: BYBIT_DEMO_RESEARCH
+  research_duration_days: 14
+  expected_demo_equity: 10000.0
+  # none          -> 14 real calendar days, outages recorded but not compensated (default)
+  # extend_by_outage -> scheduled end moves out by recorded outage time (must be explicit)
+  outage_adjustment_policy: none
+  # How open demo positions are handled when the 14 days end.
+  # close_at_end   -> flatten the attributable demo position at market
+  # manage_to_exit -> stop new entries, let the open position reach its stop/target
+  finalization_policy: close_at_end
+  auto_transition_to_champion: true
+
+market:
+  primary_symbol: BTCUSDT
+  # Categories the system may use for REAL demo orders, subject to runtime discovery.
+  # Bybit demo is a UTA; `spot` is the safe documented default (long-only, no leverage).
+  enabled_categories: ["spot"]
+  preferred_category: spot
+  quote_currency: USDT
+  base_currency: BTC
+  # Bybit kline intervals. "3" is a native Bybit interval (verified in docs).
+  timeframes: ["1", "3", "5", "15", "30", "60", "240"]
+  # Timeframe used by the regime engine for the macro view.
+  regime_timeframe: "60"
+  regime_context_timeframe: "240"
+
+exchange:
+  recv_window_ms: 5000
+  request_timeout_seconds: 15
+  max_retries: 4
+  retry_backoff_base_seconds: 0.75
+  instrument_refresh_minutes: 60
+  # Public market data comes from mainnet public streams (Bybit docs: demo has no
+  # public stream; public data is identical to mainnet). Read-only, unauthenticated.
+  public_ws_enabled: true
+  private_ws_enabled: true
+  orderbook_depth: 50
+  ws_ping_interval_seconds: 20
+  ws_reconnect_max_backoff_seconds: 60
+
+data:
+  candle_buffer: 1500
+  history_days: 400
+  history_timeframes: ["5", "15", "60", "240"]
+  # If a critical stream exceeds its staleness budget, trading pauses.
+  max_staleness_seconds:
+    ticker: 25
+    kline: 180
+    orderbook: 45
+  backfill_on_start: true
+  cache_dir: data/history
+
+risk:
+  # Fraction of DEMO equity risked on a normal actual-demo trade.
+  normal_risk_pct: 0.0075
+  min_risk_pct: 0.005
+  # Hard ceiling. Sizing may never exceed this, whatever the inputs say.
+  max_risk_pct: 0.02
+  # Notional ceiling as a fraction of equity (spot cash cap).
+  max_notional_pct_equity: 0.95
+  max_concurrent_demo_positions: 1
+  # Refuse absurdly tight stops that would explode position size.
+  min_stop_distance_pct: 0.0008
+  min_stop_distance_atr_mult: 0.15
+  max_stop_distance_pct: 0.15
+  # Equity protection for the demo account.
+  daily_loss_limit_pct: 0.10
+  drawdown_derisk_threshold_pct: 0.08
+  drawdown_derisk_factor: 0.5
+  # Confidence scaling band applied to the normal risk figure.
+  confidence_size_floor: 0.6
+  confidence_size_ceiling: 1.4
+
+shadow:
+  initial_equity: 10000.0
+  risk_pct: 0.01
+  max_concurrent_per_strategy: 1
+  # Shadow accounts may test alternative sizing models (research only).
+  alternative_sizing_models: ["fixed_fractional", "volatility_target", "confidence_scaled"]
+  fee_rate_taker: 0.00055
+  fee_rate_maker: 0.0002
+  slippage_bps: 2.0
+
+allocator:
+  # thompson | ucb | confidence_weighted
+  method: thompson
+  min_observations_before_exploitation: 12
+  forced_exploration_ratio: 0.25
+  cooldown_seconds_per_strategy: 900
+  global_cooldown_seconds: 120
+  max_demo_orders_per_hour: 12
+  max_demo_orders_per_day: 120
+  min_signal_confidence: 0.45
+  # Prior strength given to Layer-1 (historical) and Layer-2 (shadow) evidence
+  # when a strategy has few real demo observations.
+  historical_prior_weight: 0.35
+  shadow_prior_weight: 0.45
+  regime_suitability_weight: 0.2
+
+backtesting:
+  fee_rate_taker: 0.00055
+  fee_rate_maker: 0.0002
+  slippage_bps: 2.0
+  spread_bps: 1.0
+  latency_ms: 250
+  partial_fill_probability: 0.15
+  # Stress multipliers used for robustness scoring.
+  stress_multipliers: [1.0, 2.0, 4.0]
+  train_fraction: 0.5
+  validation_fraction: 0.2
+  # remainder is out-of-sample
+  embargo_bars: 20
+  walk_forward_windows: 6
+  walk_forward_mode: rolling   # rolling | anchored
+  min_trades_for_confidence: 30
+
+regime:
+  adx_trend_threshold: 22.0
+  adx_strong_trend_threshold: 32.0
+  atr_lookback: 14
+  realized_vol_lookback: 48
+  vol_expansion_ratio: 1.35
+  vol_contraction_ratio: 0.7
+  range_compression_percentile: 25.0
+  range_expansion_percentile: 75.0
+  slope_lookback: 20
+  persistence_lookback: 30
+  min_confidence: 0.4
+
+news:
+  enabled: true
+  poll_interval_seconds: 300
+  providers:
+    - name: rss
+      enabled: true
+      # No API key needed. Official/organisation feeds only — no scraping.
+      feeds:
+        - "https://www.coindesk.com/arc/outboundfeeds/rss/"
+        - "https://cointelegraph.com/rss"
+        - "https://bitcoinmagazine.com/feed"
+        - "https://www.federalreserve.gov/feeds/press_all.xml"
+        - "https://www.sec.gov/news/pressreleases.rss"
+    - name: cryptopanic
+      enabled: true          # silently skipped when CRYPTOPANIC_API_KEY is unset
+    - name: newsapi
+      enabled: false         # requires NEWSAPI_API_KEY
+    - name: macro_calendar
+      enabled: true          # built-in scheduled macro events (FOMC/CPI/NFP windows)
+  max_age_minutes: 240
+  high_impact_pause_minutes: 20
+  high_impact_size_factor: 0.5
+  degraded_confidence_factor: 0.9
+  # Track whether news gating actually helps; if it hurts out-of-sample, influence shrinks.
+  adaptive_influence: true
+  influence_floor: 0.0
+  influence_ceiling: 1.0
+
+learning:
+  enabled: true
+  evaluation_interval_minutes: 60
+  min_trades_for_parameter_update: 40
+  min_trades_for_high_confidence: 30
+  candidate_generation_interval_hours: 12
+  max_candidates_per_strategy: 3
+  # A candidate must beat production by this much on held-out data to be promoted.
+  promotion_min_expectancy_improvement: 0.08
+  promotion_min_new_trades: 25
+  promotion_max_drawdown_ratio: 1.25
+  promotion_min_profit_factor: 1.1
+  parameter_stability_neighbours: 2
+  parameter_stability_min_ratio: 0.6
+  calibration_bins: 5
+
+scoring:
+  # Weights for the 12 components of the final score. Normalised internally.
+  weights:
+    oos_expectancy: 0.14
+    walk_forward_consistency: 0.11
+    shadow_expectancy: 0.12
+    demo_performance: 0.14
+    profit_factor: 0.08
+    risk_adjusted_return: 0.09
+    max_drawdown: 0.08
+    observations: 0.07
+    regime_stability: 0.06
+    parameter_stability: 0.04
+    cost_robustness: 0.05
+    consistency: 0.02
+  bootstrap_samples: 2000
+  bootstrap_confidence: 0.9
+  min_trades_full_credit: 40
+  min_trades_any_credit: 8
+  # Penalty applied when a single trade dominates total profit.
+  single_winner_concentration_threshold: 0.4
+  period_concentration_threshold: 0.6
+
+champion:
+  min_score_gap_for_single_champion: 3.0
+  min_demo_trades: 10
+  min_total_observations: 40
+  ensemble_min_regimes: 2
+  ensemble_advantage_threshold: 2.5
+  # Challenger promotion after Day 14
+  challenger_min_new_trades: 25
+  challenger_min_expectancy_improvement: 0.1
+  challenger_evaluation_interval_hours: 6
+  decay_rolling_window: 30
+  decay_expectancy_drop_threshold: 0.5
+  decay_min_trades: 25
+
+safety:
+  # The mainnet negative control sends the key ONCE, read-only, to the mainnet host and
+  # requires it to FAIL. It proves the key cannot act on real money.
+  # Set false to skip (recorded in experiment metadata and warned about at startup).
+  mainnet_negative_control: true
+  reverify_interval_minutes: 60
+  max_consecutive_api_errors: 12
+  max_orders_per_minute: 6
+  price_sanity_min: 1000.0
+  price_sanity_max: 5000000.0
+  price_jump_reject_pct: 0.25
+  safe_mode_cooldown_seconds: 300
+  require_demo_verification_for_orders: true
+
+database:
+  path: data/btcbot.db
+  backup_dir: data/backups
+  backup_interval_hours: 6
+  busy_timeout_ms: 10000
+
+logging:
+  level: INFO
+  console: true
+  file: logs/btcbot.log
+  json_file: logs/events.jsonl
+  max_bytes: 20971520
+  backup_count: 10
+
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 8787
+  refresh_seconds: 5
+
+reporting:
+  output_dir: reports
+  export_dir: reports/exports
+  daily_report_hour_utc: 0
+
+notifications:
+  enabled: false
+  console: true
+  telegram: false
+  discord: false
+
+strategies:
+  # Empty `enabled` means "every registered strategy".
+  # Put explicit IDs here to run a subset, e.g. ["ema_trend_15m", "vwap_reversion_5m"].
+  enabled: []
+  disabled: []
+  # Per-strategy parameter overrides, e.g.
+  #   ema_trend_15m:
+  #     fast: 21
+  #     slow: 55
+  overrides: {}

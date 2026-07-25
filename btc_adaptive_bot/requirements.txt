@@ -1,0 +1,16 @@
+# Runtime dependencies — pinned.
+# Deliberately small: no deep-learning framework is used anywhere in this project.
+httpx==0.28.1              # REST client (sync + async), HTTP/2 capable
+websockets==16.1.1         # market data + private streams
+pydantic==2.13.4           # configuration validation
+PyYAML==6.0.3              # configuration files
+numpy==2.4.6               # indicator maths, statistics, bootstrap
+python-dotenv==1.2.2       # .env credential loading
+fastapi==0.139.2           # local dashboard
+uvicorn==0.51.0            # dashboard server
+Jinja2==3.1.6              # HTML report rendering
+
+# Development / test
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.0

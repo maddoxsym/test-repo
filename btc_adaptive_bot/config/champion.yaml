@@ -1,0 +1,28 @@
+# ============================================================
+#  Champion profile — post-Day-14 operation on the SAME Bybit Demo account.
+#  The selected champion controls actual demo execution; challengers keep
+#  running in shadow mode and can earn promotion on evidence.
+#  Used by ./scripts/run_champion.sh
+# ============================================================
+extends: default.yaml
+
+experiment:
+  name: BYBIT_DEMO_CHAMPION
+  # Champion mode is open-ended; the 14-day countdown belongs to the research
+  # experiment and is not restarted here.
+  research_duration_days: 14
+
+allocator:
+  # Champion mode exploits the validated champion; exploration is reduced but not
+  # eliminated, so challengers still gather live evidence.
+  forced_exploration_ratio: 0.1
+  min_signal_confidence: 0.5
+  max_demo_orders_per_hour: 8
+
+risk:
+  normal_risk_pct: 0.0075
+  max_risk_pct: 0.015
+
+learning:
+  enabled: true
+  evaluation_interval_minutes: 120

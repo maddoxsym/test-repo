@@ -1,0 +1,29 @@
+# ============================================================
+#  Research profile — the 14-day Bybit Demo experiment.
+#  Inherits every value from default.yaml; only overrides below.
+#  Used by ./scripts/run_research.sh
+# ============================================================
+extends: default.yaml
+
+experiment:
+  name: BYBIT_DEMO_RESEARCH
+  research_duration_days: 14
+
+# The research phase is intentionally data-hungry: many shadow strategies running
+# concurrently, and a real demo order whenever a qualifying setup appears. Trade
+# frequency is governed by setup availability, cooldowns and risk — not by an
+# artificial per-day cap.
+allocator:
+  forced_exploration_ratio: 0.3
+  max_demo_orders_per_hour: 12
+  cooldown_seconds_per_strategy: 900
+
+learning:
+  enabled: true
+  evaluation_interval_minutes: 60
+
+news:
+  enabled: true
+
+dashboard:
+  enabled: true
