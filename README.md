@@ -72,6 +72,14 @@ paper simulator, MT5 execution path with pre-flight checklist and restart
 reconciliation, Telegram alerts, and an 86-test built-in suite
 (`--test`).
 
+## Also in this repo
+
+[`btc_ai_confluence_10layer.pine`](btc_ai_confluence_10layer.pine) — a TradingView
+indicator (Pine v6) applying the same 10-layer confluence idea to crypto/BTC: regime,
+HTF bias, SMC (sweeps, BOS/CHoCH, order blocks, FVGs, premium/discount), confirmation,
+a 0-100 confidence score, risk locks, dynamic exits and a built-in bar-by-bar strategy
+report. Setup and honest limits: [`PINE_INDICATOR.md`](PINE_INDICATOR.md).
+
 ## Known limitations
 
 - Candle-based backtests can't know intrabar order of SL vs TP → the engine

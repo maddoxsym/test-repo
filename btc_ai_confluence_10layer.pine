@@ -1,0 +1,1244 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  AI CONFLUENCE ENGINE — 10-LAYER SETUP SCANNER + BUILT-IN STRATEGY REPORT
+//  Crypto / BTC oriented.  Indicator only: it never sends an order anywhere.
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//  WHAT IT DOES
+//  ------------
+//  Layer 1  Market regime      trend vs range (ADX), volatility level + expansion,
+//                              bull / bear / neutral context.  Wrong regime = no trade.
+//  Layer 2  HTF bias           daily + 4H trend, PDH/PDL, PWH/PWL, equilibrium.
+//  Layer 3  Smart money        liquidity sweeps, BOS, CHoCH, order blocks, FVGs,
+//                              premium / discount (dealing-range) zones.
+//  Layer 4  Confirmation       strong close, volume surge, momentum, break retest.
+//  Layer 5  Confidence score   every layer contributes weighted points -> 0-100.
+//                              Below the threshold the setup is logged, not taken.
+//  Layer 6  Risk management    fixed fractional risk, daily / weekly loss locks,
+//                              max drawdown halt, consecutive-loss lock, de-risking
+//                              after a losing streak.
+//  Layer 7  Position sizing    from equity, stop distance, confidence and volatility,
+//                              capped by a leverage / notional limit.
+//  Layer 8  Dynamic exits      partial at 1R, break-even only when earned, ATR trail,
+//                              structure-flip exit, time stop.
+//  Layer 9  News awareness     manual blackout windows + high-impact date list +
+//                              automatic volatility-shock pause.  (Pine cannot read a
+//                              news feed — this is a scheduler, not a news API.)
+//  Layer 10 Journal + report   every trade labelled on the chart with the reason it was
+//                              taken, plus a full performance panel: win rate,
+//                              expectancy, profit factor, Sharpe, Sortino, max DD,
+//                              MAE / MFE, streaks, and a confidence-bucket breakdown so
+//                              you can see which scores actually make money.
+//
+//  HOW TO USE
+//  ----------
+//  1. TradingView -> Pine Editor -> paste -> Save -> Add to chart.
+//  2. Start on BTCUSDT (or BTCUSD.P) 15m / 1H.  Defaults are tuned for that.
+//  3. The right-hand panels show what the engine sees right now, why it is or is not
+//     trading, and how the whole rule set performed on the history your plan loads.
+//  4. Tune ONE thing at a time and watch Profit factor / Expectancy / Max DD — not the
+//     equity number.  Under ~50 trades the statistics mean almost nothing.
+//
+//  HONEST LIMITS — read this before trusting a single number in the panel
+//  ---------------------------------------------------------------------
+//  * The simulator is bar-by-bar.  A bar that touches both stop and target is booked
+//    as a LOSS (stop first).  That is deliberately pessimistic, not accurate.
+//  * Entries fill at the close of the signal bar plus your slippage input.  Real fills
+//    on a fast BTC candle are worse.
+//  * Fees and slippage are inputs and default to taker-ish values.  Put your venue's
+//    real numbers in or the report is lying to you.
+//  * HTF values come from the last CLOSED higher-timeframe bar, so nothing repaints,
+//    but that also means the bias lags by up to one HTF bar.
+//  * Results depend on the settings and on how much history your plan loads.
+//    Re-optimising until the panel looks good is curve fitting — the fastest known way
+//    to lose money with a tool like this.
+//  * No profitability is claimed or implied.  Paper trade it first.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+indicator("AI Confluence Engine — 10 Layer [BTC]", "AI Confluence 10L", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 300)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+G_ENG = "⚙️ Engine"
+G_L1  = "① Market regime"
+G_L2  = "② Higher timeframe bias"
+G_L3  = "③ Smart money concepts"
+G_L4  = "④ Confirmation"
+G_L5  = "⑤ Confidence score"
+G_L6  = "⑥ Risk management"
+G_L7  = "⑦ Position sizing"
+G_L8  = "⑧ Dynamic exits"
+G_L9  = "⑨ News / event awareness"
+G_L10 = "⑩ Journal & performance"
+G_UI  = "🎨 Display"
+
+// ── Engine ────────────────────────────────────────────────────────────────────
+i_style     = input.string("Trend-following", "Strategy type", options = ["Trend-following", "Reversal / mean-revert", "Both"], group = G_ENG,
+     tooltip = "Trend-following demands a trending regime and HTF agreement.\nReversal demands a ranging regime and an extreme of the dealing range.")
+i_allowLong = input.bool(true, "Longs",  group = G_ENG, inline = "dir")
+i_allowShort= input.bool(true, "Shorts", group = G_ENG, inline = "dir")
+i_waitClose = input.bool(true, "Only act on closed bars (no repaint)", group = G_ENG)
+i_atrLen    = input.int(14, "ATR length", minval = 2, maxval = 200, group = G_ENG)
+
+// ── Layer 1 : market regime ───────────────────────────────────────────────────
+i_adxLen    = input.int(14, "ADX / DI length", minval = 2, group = G_L1)
+i_adxSmooth = input.int(14, "ADX smoothing",   minval = 1, group = G_L1)
+i_adxTrend  = input.float(22.0, "ADX ≥ this = trending", minval = 5, step = 0.5, group = G_L1)
+i_adxRange  = input.float(18.0, "ADX ≤ this = ranging",  minval = 1, step = 0.5, group = G_L1)
+i_emaFast   = input.int(21,  "EMA fast", minval = 2, group = G_L1, inline = "ema")
+i_emaSlow   = input.int(50,  "EMA slow", minval = 2, group = G_L1, inline = "ema")
+i_emaBias   = input.int(200, "EMA bias", minval = 2, group = G_L1, inline = "ema")
+i_volLb     = input.int(200, "Volatility percentile lookback", minval = 20, group = G_L1)
+i_volMinR   = input.float(20.0, "Min ATR percentile to trade", minval = 0, maxval = 100, step = 1, group = G_L1)
+i_volMaxR   = input.float(95.0, "Max ATR percentile to trade", minval = 0, maxval = 100, step = 1, group = G_L1)
+i_volSlope  = input.int(10, "Volatility expansion lookback", minval = 1, maxval = 200, group = G_L1)
+i_reqRegime = input.bool(true, "HARD FILTER: regime must match strategy type", group = G_L1)
+
+// ── Layer 2 : higher timeframe bias ───────────────────────────────────────────
+i_htf1      = input.timeframe("D",   "Bias TF #1", group = G_L2, inline = "htf")
+i_htf2      = input.timeframe("240", "Bias TF #2", group = G_L2, inline = "htf")
+i_reqHtf    = input.bool(true, "HARD FILTER: trade only with HTF bias", group = G_L2,
+     tooltip = "Ignored in pure Reversal mode, where taking the other side is the point.")
+i_reqBothHtf= input.bool(false, "…and require BOTH timeframes to agree", group = G_L2)
+i_showLv    = input.bool(true, "Draw PDH / PDL / PWH / PWL", group = G_L2)
+i_levelBuf  = input.float(0.15, "Level proximity (× ATR)", minval = 0.01, step = 0.05, group = G_L2)
+
+// ── Layer 3 : smart money concepts ────────────────────────────────────────────
+i_pivL      = input.int(5, "Swing pivot left",  minval = 1, group = G_L3, inline = "piv")
+i_pivR      = input.int(5, "Swing pivot right", minval = 1, group = G_L3, inline = "piv")
+i_structVal = input.int(20, "BOS / CHoCH stays valid for N bars", minval = 1, group = G_L3)
+i_reqStruct = input.bool(true, "HARD FILTER: need a recent BOS / CHoCH", group = G_L3)
+i_sweepLb   = input.int(20, "Liquidity lookback", minval = 3, group = G_L3)
+i_sweepVal  = input.int(8,  "Sweep stays valid for N bars", minval = 1, group = G_L3)
+i_reqSweep  = input.bool(false, "HARD FILTER: need a liquidity sweep", group = G_L3)
+i_obMax     = input.int(6,  "Order blocks kept per side", minval = 1, maxval = 20, group = G_L3)
+i_obLookback= input.int(12, "Bars to search back for the OB candle", minval = 2, maxval = 50, group = G_L3)
+i_fvgMinAtr = input.float(0.15, "Min FVG size (× ATR)", minval = 0, step = 0.05, group = G_L3)
+i_fvgMax    = input.int(8, "FVGs kept per side", minval = 1, maxval = 20, group = G_L3)
+i_reqPoi    = input.bool(false, "HARD FILTER: price must be in an FVG or order block", group = G_L3)
+i_rangeLb   = input.int(60, "Dealing-range lookback (premium / discount)", minval = 10, group = G_L3)
+i_reqPd     = input.bool(false, "HARD FILTER: longs in discount, shorts in premium", group = G_L3)
+
+// ── Layer 4 : confirmation ────────────────────────────────────────────────────
+i_bodyPct   = input.float(0.55, "Strong close: body ÷ range ≥", minval = 0.1, maxval = 1, step = 0.05, group = G_L4)
+i_volLen    = input.int(20, "Volume average length", minval = 2, group = G_L4)
+i_volMult   = input.float(1.5, "Volume surge multiple", minval = 1, step = 0.1, group = G_L4)
+i_rsiLen    = input.int(14, "RSI length", minval = 2, group = G_L4)
+i_retestBar = input.int(12, "Retest window after a break (bars)", minval = 1, group = G_L4)
+i_reqConf   = input.bool(true,  "HARD FILTER: need a strong candle close", group = G_L4)
+i_reqVolume = input.bool(false, "HARD FILTER: need a volume surge", group = G_L4)
+i_reqMom    = input.bool(true,  "HARD FILTER: need momentum agreement", group = G_L4)
+i_reqRetest = input.bool(false, "HARD FILTER: need a retest of the break", group = G_L4)
+
+// ── Layer 5 : confidence score ────────────────────────────────────────────────
+i_minScore  = input.float(80.0, "Minimum score to trade", minval = 0, maxval = 100, step = 1, group = G_L5)
+i_wTrend    = input.float(20, "Weight · HTF trend",         minval = 0, step = 1, group = G_L5)
+i_wSweep    = input.float(15, "Weight · liquidity sweep",   minval = 0, step = 1, group = G_L5)
+i_wFvg      = input.float(10, "Weight · fair value gap",    minval = 0, step = 1, group = G_L5)
+i_wVol      = input.float(15, "Weight · volume",            minval = 0, step = 1, group = G_L5)
+i_wVola     = input.float(10, "Weight · volatility filter", minval = 0, step = 1, group = G_L5)
+i_wMom      = input.float(15, "Weight · momentum",          minval = 0, step = 1, group = G_L5)
+i_wRegime   = input.float(15, "Weight · market regime",     minval = 0, step = 1, group = G_L5)
+i_wStruct   = input.float(0,  "Weight · structure (BOS/CHoCH) — optional", minval = 0, step = 1, group = G_L5)
+i_wOb       = input.float(0,  "Weight · order block — optional",           minval = 0, step = 1, group = G_L5)
+i_wPd       = input.float(0,  "Weight · premium / discount — optional",    minval = 0, step = 1, group = G_L5)
+i_wRetest   = input.float(0,  "Weight · retest — optional",                minval = 0, step = 1, group = G_L5,
+     tooltip = "The score is normalised by the sum of the weights you enable, so it is always 0-100. A bucket that cannot be evaluated (e.g. volume on a feed without it) is dropped from the denominator instead of scoring zero.")
+
+// ── Layer 6 : risk management ─────────────────────────────────────────────────
+i_equity0   = input.float(10000, "Starting equity", minval = 1, group = G_L6)
+i_riskPct   = input.float(0.5, "Risk per trade %", minval = 0.01, maxval = 5, step = 0.05, group = G_L6)
+i_riskCap   = input.float(2.0, "Hard ceiling on risk per trade %", minval = 0.01, maxval = 5, step = 0.05, group = G_L6)
+i_maxDayL   = input.float(3.0,  "Max daily loss %",  minval = 0.1, step = 0.1, group = G_L6)
+i_maxWeekL  = input.float(6.0,  "Max weekly loss %", minval = 0.1, step = 0.1, group = G_L6)
+i_maxDD     = input.float(15.0, "Max drawdown % (halts the engine)", minval = 1, step = 0.5, group = G_L6)
+i_maxConsec = input.int(3, "Consecutive losses → stop for the day", minval = 1, group = G_L6)
+i_derisk2   = input.float(0.5,  "Risk multiplier after 2 losses",  minval = 0.1, maxval = 1, step = 0.05, group = G_L6)
+i_derisk3   = input.float(0.25, "Risk multiplier after 3+ losses", minval = 0.1, maxval = 1, step = 0.05, group = G_L6)
+i_dayTarget = input.float(0.0, "Stop for the day after +% (0 = off)", minval = 0, step = 0.5, group = G_L6)
+
+// ── Layer 7 : position sizing ─────────────────────────────────────────────────
+i_scaleConf = input.bool(true, "Scale size with confidence score", group = G_L7)
+i_confMin   = input.float(0.6, "Size multiplier at threshold score", minval = 0.1, maxval = 1, step = 0.05, group = G_L7)
+i_confMax   = input.float(1.0, "Size multiplier at score 100",       minval = 0.1, maxval = 1, step = 0.05, group = G_L7)
+i_scaleVol  = input.bool(true, "Dampen size when volatility is extreme", group = G_L7)
+i_volTarget = input.float(2.0, "Reference ATR % of price", minval = 0.1, step = 0.1, group = G_L7)
+i_maxLev    = input.float(3.0, "Max notional ÷ equity (leverage cap)", minval = 0.1, step = 0.1, group = G_L7)
+i_feePct    = input.float(0.05, "Fee per side %", minval = 0, step = 0.01, group = G_L7)
+i_slipPct   = input.float(0.02, "Slippage %",     minval = 0, step = 0.01, group = G_L7)
+
+// ── Layer 8 : dynamic exits ───────────────────────────────────────────────────
+i_slSwingLb = input.int(10, "Stop: swing lookback", minval = 2, group = G_L8)
+i_slBuf     = input.float(0.35, "Stop buffer (× ATR)", minval = 0, step = 0.05, group = G_L8)
+i_slMinAtr  = input.float(0.5, "Min stop distance (× ATR)", minval = 0.1, step = 0.1, group = G_L8)
+i_slMaxAtr  = input.float(4.0, "Max stop distance (× ATR) — wider = skip the setup", minval = 0.5, step = 0.1, group = G_L8)
+i_tp1R      = input.float(1.0, "Partial target (R)", minval = 0.1, step = 0.1, group = G_L8)
+i_tp2R      = input.float(3.0, "Final target (R)",   minval = 0.2, step = 0.1, group = G_L8)
+i_usePartial= input.bool(true, "Take a partial at the first target", group = G_L8)
+i_partialPct= input.float(50, "Partial size %", minval = 1, maxval = 99, step = 5, group = G_L8)
+i_beAfter   = input.bool(true, "Move to break-even after the partial", group = G_L8)
+i_beOffset  = input.float(0.05, "Break-even offset (× ATR, covers fees)", minval = 0, step = 0.01, group = G_L8)
+i_useTrail  = input.bool(true, "Trail the stop in a strong trend", group = G_L8)
+i_trailFrom = input.float(1.5, "Start trailing after (R)", minval = 0.1, step = 0.1, group = G_L8)
+i_trailAtr  = input.float(2.0, "Trail distance (× ATR)",   minval = 0.2, step = 0.1, group = G_L8)
+i_exitStruct= input.bool(true, "Exit on opposite CHoCH / BOS", group = G_L8)
+i_maxBars   = input.int(150, "Time stop (bars, 0 = off)", minval = 0, group = G_L8)
+
+// ── Layer 9 : news / event awareness ──────────────────────────────────────────
+i_tz        = input.string("UTC", "Timezone for the filters below", group = G_L9)
+i_useBlk1   = input.bool(false, "Blackout window 1", group = G_L9, inline = "b1")
+i_blk1      = input.session("1225-1400", "", group = G_L9, inline = "b1",
+     tooltip = "CPI / FOMC style window in the timezone above. Crypto has no calendar of its own, but macro prints still move BTC.")
+i_useBlk2   = input.bool(false, "Blackout window 2", group = G_L9, inline = "b2")
+i_blk2      = input.session("1755-1900", "", group = G_L9, inline = "b2")
+i_evDates   = input.string("", "High-impact dates (YYYY-MM-DD, comma separated)", group = G_L9)
+i_evMode    = input.string("Pause trading", "On a high-impact date", options = ["Pause trading", "Raise score threshold"], group = G_L9)
+i_evBump    = input.float(10.0, "Threshold bump when raising", minval = 0, step = 1, group = G_L9)
+i_shockOn   = input.bool(true, "Auto-pause on a volatility shock", group = G_L9)
+i_shockMult = input.float(3.0, "Shock = bar range > N × ATR", minval = 1, step = 0.1, group = G_L9)
+i_shockBars = input.int(5, "Pause for N bars after a shock", minval = 1, group = G_L9)
+i_wkndOff   = input.bool(false, "No new trades at the weekend", group = G_L9)
+
+// ── Layer 10 : journal & performance ──────────────────────────────────────────
+i_from      = input.time(timestamp("01 Jan 2018 00:00 +0000"), "Simulate from", group = G_L10)
+i_to        = input.time(timestamp("01 Jan 2099 00:00 +0000"), "Simulate to",   group = G_L10)
+i_showTrades= input.bool(true, "Label every entry and exit",  group = G_L10)
+i_showPerf  = input.bool(true, "Performance report panel",    group = G_L10)
+i_showBuck  = input.bool(true, "Confidence-bucket breakdown", group = G_L10)
+i_showState = input.bool(true, "Live layer dashboard",        group = G_L10)
+
+// ── Display ───────────────────────────────────────────────────────────────────
+i_txt       = input.string(size.small, "Panel text size", options = [size.tiny, size.small, size.normal], group = G_UI)
+i_posState  = input.string(position.top_right,    "Dashboard position", options = [position.top_right, position.top_left, position.middle_right, position.middle_left], group = G_UI)
+i_posPerf   = input.string(position.bottom_right, "Report position",    options = [position.bottom_right, position.bottom_left, position.top_left, position.middle_left], group = G_UI)
+i_posBuck   = input.string(position.bottom_left,  "Bucket position",    options = [position.bottom_left, position.bottom_right, position.middle_left, position.top_left], group = G_UI)
+i_showZones = input.bool(true, "Draw FVGs and order blocks", group = G_UI)
+i_showStruct= input.bool(true, "Draw BOS / CHoCH", group = G_UI)
+i_showSweep = input.bool(true, "Mark liquidity sweeps", group = G_UI)
+i_showEq    = input.bool(true, "Draw equilibrium of the dealing range", group = G_UI)
+i_cBull     = input.color(#26a69a, "Bullish", group = G_UI, inline = "c")
+i_cBear     = input.color(#ef5350, "Bearish", group = G_UI, inline = "c")
+i_cNeut     = input.color(#787b86, "Neutral", group = G_UI, inline = "c")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BASE CALCULATIONS   (every ta.* call lives at global scope, on every bar)
+// ═══════════════════════════════════════════════════════════════════════════════
+atrRaw   = ta.atr(i_atrLen)
+atrSafe  = math.max(nz(atrRaw), syminfo.mintick)
+atrPct   = close > 0 ? atrSafe / close * 100.0 : 0.0
+barRange = math.max(high - low, syminfo.mintick)
+bodyRat  = math.abs(close - open) / barRange
+
+emaF     = ta.ema(close, i_emaFast)
+emaS     = ta.ema(close, i_emaSlow)
+emaB     = ta.ema(close, i_emaBias)
+rsiV     = ta.rsi(close, i_rsiLen)
+[mLine, mSig, mHist] = ta.macd(close, 12, 26, 9)
+[diP, diM, adxRaw]   = ta.dmi(i_adxLen, i_adxSmooth)
+adxV     = nz(adxRaw)
+
+volAvail = not na(volume) and nz(volume) > 0
+volAvg   = ta.sma(volume, i_volLen)
+volSurge = volAvail and not na(volAvg) and volAvg > 0 and volume >= volAvg * i_volMult
+volMild  = volAvail and not na(volAvg) and volAvg > 0 and volume >= volAvg
+
+atrRank   = nz(ta.percentrank(atrSafe, i_volLb))
+atrBefore = atrSafe[i_volSlope]
+volExpand = not na(atrBefore) and atrBefore > 0 and atrSafe > atrBefore
+volBand   = atrRank >= i_volMinR and atrRank <= i_volMaxR
+
+// pre-computed swing references used by the stop placement (never call ta.* in an if)
+slLowRef  = ta.lowest(low,   i_slSwingLb)
+slHighRef = ta.highest(high, i_slSwingLb)
+hiPool    = ta.highest(high, i_sweepLb)[1]
+loPool    = ta.lowest(low,   i_sweepLb)[1]
+rngHi     = ta.highest(high, i_rangeLb)
+rngLo     = ta.lowest(low,   i_rangeLb)
+
+inWindow = time >= i_from and time <= i_to
+barOk    = i_waitClose ? barstate.isconfirmed : true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 1 — MARKET REGIME
+// ═══════════════════════════════════════════════════════════════════════════════
+isTrending = adxV >= i_adxTrend
+isRanging  = adxV <= i_adxRange
+bullCtx    = close > emaB and emaF > emaS
+bearCtx    = close < emaB and emaF < emaS
+
+regimeTxt = isTrending ? (bullCtx ? "Trending ▲" : bearCtx ? "Trending ▼" : "Trending (mixed)") : isRanging ? "Ranging" : "Transition"
+volTxt    = (atrRank >= 80 ? "High vol" : atrRank <= 20 ? "Low vol" : "Normal vol") + (volExpand ? " · expanding" : " · contracting")
+biasTxt   = bullCtx ? "Bullish" : bearCtx ? "Bearish" : "Neutral"
+
+trendMode = i_style == "Trend-following" or i_style == "Both"
+revMode   = i_style == "Reversal / mean-revert" or i_style == "Both"
+
+bool regimeOkL = false
+bool regimeOkS = false
+if trendMode
+    if isTrending and bullCtx and volBand
+        regimeOkL := true
+    if isTrending and bearCtx and volBand
+        regimeOkS := true
+if revMode
+    if isRanging and volBand
+        regimeOkL := true
+        regimeOkS := true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 2 — HIGHER TIMEFRAME BIAS   (last CLOSED HTF bar -> no repaint)
+// ═══════════════════════════════════════════════════════════════════════════════
+[h1c, h1f, h1s] = request.security(syminfo.tickerid, i_htf1, [close[1], ta.ema(close, i_emaFast)[1], ta.ema(close, i_emaSlow)[1]], lookahead = barmerge.lookahead_on)
+[h2c, h2f, h2s] = request.security(syminfo.tickerid, i_htf2, [close[1], ta.ema(close, i_emaFast)[1], ta.ema(close, i_emaSlow)[1]], lookahead = barmerge.lookahead_on)
+[pdH, pdL]      = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pwH, pwL]      = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+h1Bull = not na(h1f) and not na(h1s) and h1f > h1s and h1c > h1s
+h1Bear = not na(h1f) and not na(h1s) and h1f < h1s and h1c < h1s
+h2Bull = not na(h2f) and not na(h2s) and h2f > h2s and h2c > h2s
+h2Bear = not na(h2f) and not na(h2s) and h2f < h2s and h2c < h2s
+
+htfBullOk = i_reqBothHtf ? (h1Bull and h2Bull) : (h1Bull or h2Bull)
+htfBearOk = i_reqBothHtf ? (h1Bear and h2Bear) : (h1Bear or h2Bear)
+htfTxt    = (h1Bull ? "D▲" : h1Bear ? "D▼" : "D·") + "  " + (h2Bull ? "HTF2▲" : h2Bear ? "HTF2▼" : "HTF2·")
+
+lvlBuf  = atrSafe * i_levelBuf
+nearPdH = not na(pdH) and math.abs(close - pdH) <= lvlBuf
+nearPdL = not na(pdL) and math.abs(close - pdL) <= lvlBuf
+nearPwH = not na(pwH) and math.abs(close - pwH) <= lvlBuf
+nearPwL = not na(pwL) and math.abs(close - pwL) <= lvlBuf
+atLevel = nearPdH or nearPdL or nearPwH or nearPwL
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 3 — SMART MONEY CONCEPTS
+// ═══════════════════════════════════════════════════════════════════════════════
+// ── swings + BOS / CHoCH ──────────────────────────────────────────────────────
+ph = ta.pivothigh(high, i_pivL, i_pivR)
+pl = ta.pivotlow(low,   i_pivL, i_pivR)
+
+var float swHigh   = na
+var float swLow    = na
+var float refHigh  = na     // level whose break = bullish structure event
+var float refLow   = na
+var int   strucDir = 0
+
+if not na(ph)
+    swHigh  := ph
+    refHigh := ph
+if not na(pl)
+    swLow  := pl
+    refLow := pl
+
+bool bosUp   = false
+bool bosDn   = false
+bool chochUp = false
+bool chochDn = false
+
+if not na(refHigh) and close > refHigh
+    if strucDir == -1
+        chochUp := true
+    else
+        bosUp := true
+    strucDir := 1
+    refHigh  := na
+if not na(refLow) and close < refLow
+    if strucDir == 1
+        chochDn := true
+    else
+        bosDn := true
+    strucDir := -1
+    refLow   := na
+
+breakUp = bosUp or chochUp
+breakDn = bosDn or chochDn
+
+var int   lastBullBrk    = na
+var int   lastBearBrk    = na
+var float lastBullBrkLvl = na
+var float lastBearBrkLvl = na
+if breakUp
+    lastBullBrk    := bar_index
+    lastBullBrkLvl := close
+if breakDn
+    lastBearBrk    := bar_index
+    lastBearBrkLvl := close
+
+strucBullOk = not na(lastBullBrk) and (bar_index - lastBullBrk) <= i_structVal
+strucBearOk = not na(lastBearBrk) and (bar_index - lastBearBrk) <= i_structVal
+strucTxt    = strucDir == 1 ? "Bullish" : strucDir == -1 ? "Bearish" : "Undefined"
+
+// ── liquidity sweeps ──────────────────────────────────────────────────────────
+bool sweepBearNow = not na(hiPool) and high > hiPool and close < hiPool and close < open
+bool sweepBullNow = not na(loPool) and low  < loPool and close > loPool and close > open
+if not na(pdH) and high > pdH and close < pdH
+    sweepBearNow := true
+if not na(pdL) and low < pdL and close > pdL
+    sweepBullNow := true
+if not na(pwH) and high > pwH and close < pwH
+    sweepBearNow := true
+if not na(pwL) and low < pwL and close > pwL
+    sweepBullNow := true
+
+var int lastSweepBull = na
+var int lastSweepBear = na
+if sweepBullNow
+    lastSweepBull := bar_index
+if sweepBearNow
+    lastSweepBear := bar_index
+sweepBullOk = not na(lastSweepBull) and (bar_index - lastSweepBull) <= i_sweepVal
+sweepBearOk = not na(lastSweepBear) and (bar_index - lastSweepBear) <= i_sweepVal
+
+// ── fair value gaps ───────────────────────────────────────────────────────────
+var array<box>   fvgBox = array.new<box>()
+var array<float> fvgTop = array.new<float>()
+var array<float> fvgBot = array.new<float>()
+var array<int>   fvgDir = array.new<int>()
+var array<bool>  fvgOn  = array.new<bool>()
+
+f_pushFvg(_dir, _top, _bot) =>
+    box bx = na
+    if i_showZones
+        bx := box.new(math.max(0, bar_index - 2), _top, bar_index + 1, _bot,
+             border_color = color.new(_dir == 1 ? i_cBull : i_cBear, 40),
+             bgcolor = color.new(_dir == 1 ? i_cBull : i_cBear, 88))
+    array.push(fvgBox, bx)
+    array.push(fvgTop, _top)
+    array.push(fvgBot, _bot)
+    array.push(fvgDir, _dir)
+    array.push(fvgOn, true)
+    if array.size(fvgBox) > i_fvgMax * 2
+        old = array.shift(fvgBox)
+        if not na(old)
+            box.delete(old)
+        array.shift(fvgTop)
+        array.shift(fvgBot)
+        array.shift(fvgDir)
+        array.shift(fvgOn)
+    array.size(fvgBox)
+
+fvgMin     = atrSafe * i_fvgMinAtr
+bullFvgNew = low > high[2] and (low - high[2]) >= fvgMin and close > open
+bearFvgNew = high < low[2] and (low[2] - high) >= fvgMin and close < open
+
+if bullFvgNew
+    f_pushFvg(1, low, high[2])
+if bearFvgNew
+    f_pushFvg(-1, low[2], high)
+
+bool inBullFvg = false
+bool inBearFvg = false
+if array.size(fvgBox) > 0
+    for i = 0 to array.size(fvgBox) - 1
+        if array.get(fvgOn, i)
+            zt = array.get(fvgTop, i)
+            zb = array.get(fvgBot, i)
+            zd = array.get(fvgDir, i)
+            zx = array.get(fvgBox, i)
+            if (zd == 1 ? close < zb : close > zt)
+                array.set(fvgOn, i, false)
+                if not na(zx)
+                    box.set_bgcolor(zx, color.new(i_cNeut, 94))
+                    box.set_border_color(zx, color.new(i_cNeut, 70))
+            else
+                if not na(zx)
+                    box.set_right(zx, bar_index + 1)
+                if low <= zt and high >= zb
+                    if zd == 1
+                        inBullFvg := true
+                    else
+                        inBearFvg := true
+
+// ── order blocks ──────────────────────────────────────────────────────────────
+var array<box>   obBox = array.new<box>()
+var array<float> obTop = array.new<float>()
+var array<float> obBot = array.new<float>()
+var array<int>   obDir = array.new<int>()
+var array<bool>  obOn  = array.new<bool>()
+
+f_pushOb(_dir, _top, _bot, _left) =>
+    box bx = na
+    if i_showZones
+        bx := box.new(math.max(0, _left), _top, bar_index + 1, _bot,
+             border_color = color.new(_dir == 1 ? i_cBull : i_cBear, 20),
+             bgcolor = color.new(_dir == 1 ? i_cBull : i_cBear, 82), border_width = 1)
+    array.push(obBox, bx)
+    array.push(obTop, _top)
+    array.push(obBot, _bot)
+    array.push(obDir, _dir)
+    array.push(obOn, true)
+    if array.size(obBox) > i_obMax * 2
+        old = array.shift(obBox)
+        if not na(old)
+            box.delete(old)
+        array.shift(obTop)
+        array.shift(obBot)
+        array.shift(obDir)
+        array.shift(obOn)
+    array.size(obBox)
+
+// the last opposing candle before the displacement that broke structure
+if breakUp
+    int obIdx = -1
+    for k = 1 to i_obLookback
+        if obIdx == -1 and close[k] < open[k]
+            obIdx := k
+    if obIdx > 0
+        f_pushOb(1, high[obIdx], low[obIdx], bar_index - obIdx)
+if breakDn
+    int obIdx = -1
+    for k = 1 to i_obLookback
+        if obIdx == -1 and close[k] > open[k]
+            obIdx := k
+    if obIdx > 0
+        f_pushOb(-1, high[obIdx], low[obIdx], bar_index - obIdx)
+
+bool inBullOb = false
+bool inBearOb = false
+if array.size(obBox) > 0
+    for i = 0 to array.size(obBox) - 1
+        if array.get(obOn, i)
+            zt = array.get(obTop, i)
+            zb = array.get(obBot, i)
+            zd = array.get(obDir, i)
+            zx = array.get(obBox, i)
+            if (zd == 1 ? close < zb : close > zt)
+                array.set(obOn, i, false)
+                if not na(zx)
+                    box.set_bgcolor(zx, color.new(i_cNeut, 92))
+                    box.set_border_color(zx, color.new(i_cNeut, 60))
+            else
+                if not na(zx)
+                    box.set_right(zx, bar_index + 1)
+                if low <= zt and high >= zb
+                    if zd == 1
+                        inBullOb := true
+                    else
+                        inBearOb := true
+
+inBullPoi = inBullFvg or inBullOb
+inBearPoi = inBearFvg or inBearOb
+
+// ── premium / discount (dealing range) ────────────────────────────────────────
+eqLvl    = (rngHi + rngLo) / 2.0
+rngSz    = math.max(rngHi - rngLo, syminfo.mintick)
+posInR   = (close - rngLo) / rngSz                 // 0 = range low, 1 = range high
+discount = posInR <= 0.5
+premium  = posInR >= 0.5
+deepDisc = posInR <= 0.33
+deepPrem = posInR >= 0.67
+pdTxt    = str.tostring(posInR * 100, "#") + "% of range · " + (discount ? "discount" : "premium")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 4 — CONFIRMATION
+// ═══════════════════════════════════════════════════════════════════════════════
+strongBull = close > open and bodyRat >= i_bodyPct and (close - low)  / barRange >= 0.6
+strongBear = close < open and bodyRat >= i_bodyPct and (high - close) / barRange >= 0.6
+
+momBull  = rsiV > 50 and rsiV > rsiV[1]
+momBear  = rsiV < 50 and rsiV < rsiV[1]
+macdBull = mHist > 0 and mHist > mHist[1]
+macdBear = mHist < 0 and mHist < mHist[1]
+
+retestBull = strucBullOk and not na(lastBullBrkLvl) and (bar_index - lastBullBrk) >= 1 and (bar_index - lastBullBrk) <= i_retestBar and low  <= lastBullBrkLvl + lvlBuf and close > lastBullBrkLvl
+retestBear = strucBearOk and not na(lastBearBrkLvl) and (bar_index - lastBearBrk) >= 1 and (bar_index - lastBearBrk) <= i_retestBar and high >= lastBearBrkLvl - lvlBuf and close < lastBearBrkLvl
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 9 — NEWS / EVENT AWARENESS   (a scheduler, NOT a news feed)
+// ═══════════════════════════════════════════════════════════════════════════════
+inBlk1 = i_useBlk1 and not na(time(timeframe.period, i_blk1, i_tz))
+inBlk2 = i_useBlk2 and not na(time(timeframe.period, i_blk2, i_tz))
+
+var array<string> evList = str.split(str.replace_all(i_evDates, " ", ""), ",")
+todayStr   = str.format_time(time, "yyyy-MM-dd", i_tz)
+isEventDay = array.size(evList) > 0 and array.includes(evList, todayStr)
+
+var int shockBar = na
+if i_shockOn and barRange > atrSafe * i_shockMult
+    shockBar := bar_index
+inShock = i_shockOn and not na(shockBar) and (bar_index - shockBar) < i_shockBars
+
+isWeekend = dayofweek(time, i_tz) == dayofweek.saturday or dayofweek(time, i_tz) == dayofweek.sunday
+wkndBlock = i_wkndOff and isWeekend
+
+pauseNews = inBlk1 or inBlk2 or inShock or wkndBlock or (isEventDay and i_evMode == "Pause trading")
+scoreBump = isEventDay and i_evMode == "Raise score threshold" ? i_evBump : 0.0
+scoreNeed = math.min(100.0, i_minScore + scoreBump)
+newsTxt   = inShock ? "Volatility shock" : inBlk1 or inBlk2 ? "Blackout window" : wkndBlock ? "Weekend" : isEventDay ? "High-impact date" : "Clear"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 5 — CONFIDENCE SCORE  (weights normalised to 0-100)
+// ═══════════════════════════════════════════════════════════════════════════════
+float wTot = 0.0
+float sL   = 0.0
+float sS   = 0.0
+
+// 1 · HTF trend
+if i_wTrend > 0
+    wTot += i_wTrend
+    if h1Bull
+        sL += i_wTrend * 0.55
+    if h2Bull
+        sL += i_wTrend * 0.45
+    if h1Bear
+        sS += i_wTrend * 0.55
+    if h2Bear
+        sS += i_wTrend * 0.45
+
+// 2 · liquidity sweep
+if i_wSweep > 0
+    wTot += i_wSweep
+    if sweepBullNow
+        sL += i_wSweep
+    else if sweepBullOk
+        sL += i_wSweep * 0.7
+    if sweepBearNow
+        sS += i_wSweep
+    else if sweepBearOk
+        sS += i_wSweep * 0.7
+
+// 3 · fair value gap
+if i_wFvg > 0
+    wTot += i_wFvg
+    if inBullFvg
+        sL += i_wFvg
+    else if bullFvgNew
+        sL += i_wFvg * 0.6
+    if inBearFvg
+        sS += i_wFvg
+    else if bearFvgNew
+        sS += i_wFvg * 0.6
+
+// 4 · volume  (dropped from the denominator on feeds without volume)
+if i_wVol > 0 and volAvail
+    wTot += i_wVol
+    if volSurge and close > open
+        sL += i_wVol
+    else if volMild and close > open
+        sL += i_wVol * 0.5
+    if volSurge and close < open
+        sS += i_wVol
+    else if volMild and close < open
+        sS += i_wVol * 0.5
+
+// 5 · volatility filter
+if i_wVola > 0
+    wTot += i_wVola
+    float v = 0.0
+    if volBand
+        v := i_wVola * (volExpand ? 1.0 : 0.7)
+    else if atrRank >= i_volMinR * 0.5
+        v := i_wVola * 0.35
+    sL += v
+    sS += v
+
+// 6 · momentum
+if i_wMom > 0
+    wTot += i_wMom
+    if momBull
+        sL += i_wMom * 0.6
+    if macdBull
+        sL += i_wMom * 0.4
+    if momBear
+        sS += i_wMom * 0.6
+    if macdBear
+        sS += i_wMom * 0.4
+
+// 7 · market regime
+if i_wRegime > 0
+    wTot += i_wRegime
+    if regimeOkL
+        sL += i_wRegime
+    else if isTrending and bullCtx
+        sL += i_wRegime * 0.5
+    if regimeOkS
+        sS += i_wRegime
+    else if isTrending and bearCtx
+        sS += i_wRegime * 0.5
+
+// 8-11 · optional buckets (weight 0 by default)
+if i_wStruct > 0
+    wTot += i_wStruct
+    if strucBullOk
+        sL += i_wStruct * (breakUp ? 1.0 : 0.75)
+    if strucBearOk
+        sS += i_wStruct * (breakDn ? 1.0 : 0.75)
+if i_wOb > 0
+    wTot += i_wOb
+    if inBullOb
+        sL += i_wOb
+    if inBearOb
+        sS += i_wOb
+if i_wPd > 0
+    wTot += i_wPd
+    if deepDisc
+        sL += i_wPd
+    else if discount
+        sL += i_wPd * 0.6
+    if deepPrem
+        sS += i_wPd
+    else if premium
+        sS += i_wPd * 0.6
+if i_wRetest > 0
+    wTot += i_wRetest
+    if retestBull
+        sL += i_wRetest
+    if retestBear
+        sS += i_wRetest
+
+scoreL = wTot > 0 ? math.min(100.0, sL / wTot * 100.0) : 0.0
+scoreS = wTot > 0 ? math.min(100.0, sS / wTot * 100.0) : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 6 — EQUITY, DAY / WEEK BOOKKEEPING
+// ═══════════════════════════════════════════════════════════════════════════════
+var float eq       = i_equity0
+var float eqPeak   = i_equity0
+var float dayEq    = i_equity0
+var float weekEq   = i_equity0
+var bool  lockDay  = false
+var bool  lockWeek = false
+var bool  lockStrk = false
+var bool  halted   = false
+var int   consecL  = 0
+var float maxDDpct = 0.0
+var int   firstTs  = na
+
+if na(firstTs) and inWindow
+    firstTs := time
+
+dayId   = time("D")
+weekId  = time("W")
+newDay  = not na(dayId)  and (na(dayId[1])  or dayId  != dayId[1])
+newWeek = not na(weekId) and (na(weekId[1]) or weekId != weekId[1])
+
+if newDay
+    dayEq   := eq
+    lockDay := false
+    lockStrk := false
+if newWeek
+    weekEq   := eq
+    lockWeek := false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  POSITION STATE + PERFORMANCE ACCUMULATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+var bool   pOpen    = false
+var int    pDir     = 0
+var float  pEntry   = na
+var float  pStop    = na
+var float  pStop0   = na
+var float  pRisk    = na      // per-unit risk (entry to initial stop)
+var float  pTp1     = na
+var float  pTp2     = na
+var float  pQty     = na
+var float  pRiskAmt = na      // currency actually at risk
+var bool   pPart    = false
+var bool   pBe      = false
+var int    pBar     = na
+var float  pMae     = 0.0
+var float  pMfe     = 0.0
+var float  pReal    = 0.0     // realised currency (incl. fees) so far this trade
+var float  pScore   = na
+var string pWhy     = ""
+var float  pRunHi   = na
+var float  pRunLo   = na
+
+var int   nTrade  = 0
+var int   nWin    = 0
+var int   nLoss   = 0
+var float sumR    = 0.0
+var float sumR2   = 0.0
+var float sumNeg2 = 0.0
+var float sumWinR = 0.0
+var float sumLosR = 0.0
+var float grossW  = 0.0
+var float grossL  = 0.0
+var float sumMae  = 0.0
+var float sumMfe  = 0.0
+var float sumBars = 0.0
+var int   maxConsL= 0
+var int   curConsW= 0
+var int   maxConsW= 0
+var int   nLong   = 0
+var int   nLongW  = 0
+var float rLong   = 0.0
+var int   nShort  = 0
+var int   nShortW = 0
+var float rShort  = 0.0
+var float bestR   = 0.0
+var float worstR  = 0.0
+
+var array<int>   bkN = array.new<int>(4, 0)
+var array<float> bkR = array.new<float>(4, 0.0)
+var array<int>   bkW = array.new<int>(4, 0)
+
+var int cntSetup  = 0   // bars where the raw score cleared the threshold
+var int cntFilter = 0   // …killed by a hard filter
+var int cntRisk   = 0   // …killed by a risk lock
+var int cntNews   = 0   // …killed by the news layer
+var int cntSize   = 0   // …rejected because the structural stop was unusable
+
+f_bucket(_s, _thr) =>
+    float bw = math.max(1.0, (100.0 - _thr) / 4.0)
+    float d  = math.max(0.0, _s - _thr)
+    int   bi = d < bw ? 0 : d < bw * 2 ? 1 : d < bw * 3 ? 2 : 3
+    bi
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 8 — MANAGE THE OPEN POSITION   (always before a new entry)
+// ═══════════════════════════════════════════════════════════════════════════════
+float  exPx    = na
+string exWhy   = ""
+bool   didExit = false
+float  exitR   = 0.0
+
+if pOpen
+    // excursions, in R
+    advR = pDir == 1 ? (pEntry - low) / pRisk : (high - pEntry) / pRisk
+    favR = pDir == 1 ? (high - pEntry) / pRisk : (pEntry - low) / pRisk
+    pMae  := math.max(pMae, math.max(0.0, advR))
+    pMfe  := math.max(pMfe, math.max(0.0, favR))
+    pRunHi := math.max(nz(pRunHi, high), high)
+    pRunLo := math.min(nz(pRunLo, low),  low)
+
+    stopHit = pDir == 1 ? low  <= pStop : high >= pStop
+    tp1Hit  = pDir == 1 ? high >= pTp1  : low  <= pTp1
+    tp2Hit  = pDir == 1 ? high >= pTp2  : low  <= pTp2
+
+    if stopHit
+        // conservative: a bar that touches both stop and target is booked as the stop
+        exPx  := pDir == 1 ? pStop * (1.0 - i_slipPct / 100.0) : pStop * (1.0 + i_slipPct / 100.0)
+        exWhy := pBe ? "Break-even stop" : pStop != pStop0 ? "Trailing stop" : "Stop loss"
+    else
+        if i_usePartial and tp1Hit and not pPart
+            qPart = pQty * i_partialPct / 100.0
+            gross = pDir == 1 ? (pTp1 - pEntry) * qPart : (pEntry - pTp1) * qPart
+            fee   = qPart * pTp1 * i_feePct / 100.0
+            pReal += gross - fee
+            eq    += gross - fee
+            pQty  := pQty - qPart
+            pPart := true
+            if i_beAfter
+                pStop := pDir == 1 ? pEntry + atrSafe * i_beOffset : pEntry - atrSafe * i_beOffset
+                pBe   := true
+            if i_showTrades
+                label.new(bar_index, pTp1, "TP1 " + str.tostring(i_partialPct, "#") + "%",
+                     style = pDir == 1 ? label.style_label_down : label.style_label_up,
+                     color = color.new(i_cNeut, 30), textcolor = color.white, size = size.tiny)
+        if tp2Hit
+            exPx  := pTp2
+            exWhy := "Final target " + str.tostring(i_tp2R, "#.#") + "R"
+        else if i_exitStruct and ((pDir == 1 and breakDn) or (pDir == -1 and breakUp))
+            exPx  := close
+            exWhy := "Structure flip"
+        else if i_maxBars > 0 and (bar_index - pBar) >= i_maxBars
+            exPx  := close
+            exWhy := "Time stop"
+        else if i_useTrail
+            runR = pDir == 1 ? (pRunHi - pEntry) / pRisk : (pEntry - pRunLo) / pRisk
+            if runR >= i_trailFrom
+                newStop = pDir == 1 ? pRunHi - atrSafe * i_trailAtr : pRunLo + atrSafe * i_trailAtr
+                pStop := pDir == 1 ? math.max(pStop, newStop) : math.min(pStop, newStop)
+
+// ── book the closed trade ─────────────────────────────────────────────────────
+if pOpen and not na(exPx)
+    gross = pDir == 1 ? (exPx - pEntry) * pQty : (pEntry - exPx) * pQty
+    fee   = pQty * exPx * i_feePct / 100.0
+    pReal += gross - fee
+    eq    += gross - fee
+
+    tradeR = pRiskAmt > 0 ? pReal / pRiskAmt : 0.0
+    isWin  = pReal > 0
+
+    nTrade  += 1
+    sumR    += tradeR
+    sumR2   += tradeR * tradeR
+    sumMae  += pMae
+    sumMfe  += pMfe
+    sumBars += bar_index - pBar
+    bestR   := nTrade == 1 ? tradeR : math.max(bestR, tradeR)
+    worstR  := nTrade == 1 ? tradeR : math.min(worstR, tradeR)
+
+    if isWin
+        nWin     += 1
+        grossW   += pReal
+        sumWinR  += tradeR
+        consecL  := 0
+        curConsW += 1
+        maxConsW := math.max(maxConsW, curConsW)
+    else
+        nLoss    += 1
+        grossL   += math.abs(pReal)
+        sumLosR  += tradeR
+        sumNeg2  += tradeR * tradeR
+        consecL  += 1
+        curConsW := 0
+        maxConsL := math.max(maxConsL, consecL)
+        if consecL >= i_maxConsec
+            lockStrk := true
+
+    if pDir == 1
+        nLong += 1
+        rLong += tradeR
+        if isWin
+            nLongW += 1
+    else
+        nShort += 1
+        rShort += tradeR
+        if isWin
+            nShortW += 1
+
+    bi = f_bucket(pScore, i_minScore)
+    array.set(bkN, bi, array.get(bkN, bi) + 1)
+    array.set(bkR, bi, array.get(bkR, bi) + tradeR)
+    if isWin
+        array.set(bkW, bi, array.get(bkW, bi) + 1)
+
+    if i_showTrades
+        label.new(bar_index, exPx, (isWin ? "▲ " : "▼ ") + str.tostring(tradeR, "#.##") + "R",
+             style = pDir == 1 ? label.style_label_down : label.style_label_up,
+             color = color.new(isWin ? i_cBull : i_cBear, 20), textcolor = color.white, size = size.tiny,
+             tooltip = exWhy +
+                 "\nEntry " + str.tostring(pEntry, format.mintick) + "   Exit " + str.tostring(exPx, format.mintick) +
+                 "\nMAE " + str.tostring(pMae, "#.##") + "R    MFE " + str.tostring(pMfe, "#.##") + "R" +
+                 "\nP/L " + str.tostring(pReal, "#.##") + "   Equity " + str.tostring(eq, "#.##") +
+                 "\nBars held " + str.tostring(bar_index - pBar) + "\n\n" + pWhy)
+
+    didExit := true
+    exitR   := tradeR
+    pOpen   := false
+    pDir    := 0
+    pPart   := false
+    pBe     := false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 6 — LOCKS AND RISK THROTTLES  (evaluated after every equity change)
+// ═══════════════════════════════════════════════════════════════════════════════
+eqPeak   := math.max(eqPeak, eq)
+ddNow    = eqPeak > 0 ? (eq / eqPeak - 1.0) * 100.0 : 0.0
+maxDDpct := math.min(maxDDpct, ddNow)
+
+dayPnlPct  = dayEq  > 0 ? (eq / dayEq  - 1.0) * 100.0 : 0.0
+weekPnlPct = weekEq > 0 ? (eq / weekEq - 1.0) * 100.0 : 0.0
+
+if dayPnlPct <= -i_maxDayL
+    lockDay := true
+if i_dayTarget > 0 and dayPnlPct >= i_dayTarget
+    lockDay := true
+if weekPnlPct <= -i_maxWeekL
+    lockWeek := true
+if -ddNow >= i_maxDD
+    halted := true
+
+riskFree  = not halted and not lockDay and not lockWeek and not lockStrk
+riskMult  = consecL >= 3 ? i_derisk3 : consecL == 2 ? i_derisk2 : 1.0
+confMultL = i_scaleConf ? i_confMin + (i_confMax - i_confMin) * math.min(1.0, math.max(0.0, (scoreL - scoreNeed) / math.max(1.0, 100.0 - scoreNeed))) : 1.0
+confMultS = i_scaleConf ? i_confMin + (i_confMax - i_confMin) * math.min(1.0, math.max(0.0, (scoreS - scoreNeed) / math.max(1.0, 100.0 - scoreNeed))) : 1.0
+volMult   = i_scaleVol ? math.min(1.0, i_volTarget / math.max(atrPct, 0.01)) : 1.0
+riskState = halted ? "HALTED · max drawdown" : lockWeek ? "LOCKED · weekly loss" : lockDay ? (dayPnlPct > 0 ? "LOCKED · daily target" : "LOCKED · daily loss") : lockStrk ? "LOCKED · loss streak" : consecL >= 2 ? "De-risked ×" + str.tostring(riskMult, "#.##") : "Normal"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SETUP QUALIFICATION  (layers 1-5 and 9 combined)
+// ═══════════════════════════════════════════════════════════════════════════════
+htfLongOk  = (revMode and not trendMode) ? true : (not i_reqHtf or htfBullOk)
+htfShortOk = (revMode and not trendMode) ? true : (not i_reqHtf or htfBearOk)
+
+bool okL = i_allowLong  and scoreL >= scoreNeed
+bool okS = i_allowShort and scoreS >= scoreNeed
+bool rawL = okL
+bool rawS = okS
+
+okL := okL and (not i_reqRegime or regimeOkL)
+okL := okL and htfLongOk
+okL := okL and (not i_reqStruct or strucBullOk)
+okL := okL and (not i_reqSweep  or sweepBullOk)
+okL := okL and (not i_reqPoi    or inBullPoi)
+okL := okL and (not i_reqPd     or discount)
+okL := okL and (not i_reqConf   or strongBull)
+okL := okL and (not i_reqVolume or volSurge)
+okL := okL and (not i_reqMom    or momBull)
+okL := okL and (not i_reqRetest or retestBull)
+
+okS := okS and (not i_reqRegime or regimeOkS)
+okS := okS and htfShortOk
+okS := okS and (not i_reqStruct or strucBearOk)
+okS := okS and (not i_reqSweep  or sweepBearOk)
+okS := okS and (not i_reqPoi    or inBearPoi)
+okS := okS and (not i_reqPd     or premium)
+okS := okS and (not i_reqConf   or strongBear)
+okS := okS and (not i_reqVolume or volSurge)
+okS := okS and (not i_reqMom    or momBear)
+okS := okS and (not i_reqRetest or retestBear)
+
+if barOk and inWindow and (rawL or rawS)
+    cntSetup += 1
+    if not (okL or okS)
+        cntFilter += 1
+    else if pauseNews
+        cntNews += 1
+    else if not riskFree
+        cntRisk += 1
+
+tradeReady = barOk and inWindow and riskFree and not pauseNews and not pOpen
+bool goLong  = tradeReady and okL and (not okS or scoreL >= scoreS)
+bool goShort = tradeReady and okS and (not okL or scoreS >  scoreL)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 7 — POSITION SIZING + ENTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+bool firedLong  = false
+bool firedShort = false
+
+if goLong or goShort
+    int   dir  = goLong ? 1 : -1
+    float sc   = goLong ? scoreL : scoreS
+    float fill = dir == 1 ? close * (1.0 + i_slipPct / 100.0) : close * (1.0 - i_slipPct / 100.0)
+
+    // structural stop, clamped into a sane ATR band
+    float swingRef = dir == 1 ? math.min(slLowRef, nz(swLow, low)) : math.max(slHighRef, nz(swHigh, high))
+    float stopPx   = dir == 1 ? swingRef - atrSafe * i_slBuf : swingRef + atrSafe * i_slBuf
+    float dist     = math.abs(fill - stopPx)
+
+    if dist < atrSafe * i_slMinAtr
+        dist   := atrSafe * i_slMinAtr
+        stopPx := dir == 1 ? fill - dist : fill + dist
+
+    if dist > 0 and dist <= atrSafe * i_slMaxAtr
+        float rPct  = math.min(i_riskCap, i_riskPct * riskMult * (dir == 1 ? confMultL : confMultS) * volMult)
+        float qty   = eq * rPct / 100.0 / dist
+        float capQt = fill > 0 ? eq * i_maxLev / fill : qty
+        bool  capped = qty > capQt
+        qty := math.min(qty, capQt)
+        float rAmt  = qty * dist
+        float feeIn = qty * fill * i_feePct / 100.0
+
+        if qty > 0 and rAmt > 0
+            pOpen    := true
+            pDir     := dir
+            pEntry   := fill
+            pStop    := stopPx
+            pStop0   := stopPx
+            pRisk    := dist
+            pTp1     := dir == 1 ? fill + dist * i_tp1R : fill - dist * i_tp1R
+            pTp2     := dir == 1 ? fill + dist * i_tp2R : fill - dist * i_tp2R
+            pQty     := qty
+            pRiskAmt := rAmt
+            pPart    := false
+            pBe      := false
+            pBar     := bar_index
+            pMae     := 0.0
+            pMfe     := 0.0
+            pReal    := -feeIn
+            eq       := eq - feeIn
+            pScore   := sc
+            pRunHi   := high
+            pRunLo   := low
+            pWhy     := "Score " + str.tostring(sc, "#.#") + "/100 · risk " + str.tostring(rPct, "#.###") + "% (" + str.tostring(rAmt, "#.##") + ")" +
+                 "\n① " + regimeTxt + " · " + volTxt +
+                 "\n② " + htfTxt + (atLevel ? " · at a key level" : "") +
+                 "\n③ structure " + strucTxt +
+                 " · sweep " + (dir == 1 ? (sweepBullOk ? "yes" : "no") : (sweepBearOk ? "yes" : "no")) +
+                 " · FVG " + (dir == 1 ? (inBullFvg ? "in" : bullFvgNew ? "fresh" : "no") : (inBearFvg ? "in" : bearFvgNew ? "fresh" : "no")) +
+                 " · OB " + (dir == 1 ? (inBullOb ? "in" : "no") : (inBearOb ? "in" : "no")) +
+                 "\n③ " + pdTxt +
+                 "\n④ candle " + (dir == 1 ? (strongBull ? "strong" : "weak") : (strongBear ? "strong" : "weak")) +
+                 " · volume " + (not volAvail ? "n/a" : volSurge ? "surge" : volMild ? "above avg" : "thin") +
+                 " · RSI " + str.tostring(rsiV, "#.#") +
+                 " · retest " + (dir == 1 ? (retestBull ? "yes" : "no") : (retestBear ? "yes" : "no")) +
+                 "\n⑦ size " + str.tostring(qty, "#.######") + " · notional " + str.tostring(qty * fill, "#.##") + (capped ? " (capped by leverage limit)" : "")
+            firedLong  := dir == 1
+            firedShort := dir == -1
+
+            if i_showTrades
+                label.new(bar_index, dir == 1 ? low - atrSafe * 0.6 : high + atrSafe * 0.6,
+                     (dir == 1 ? "LONG " : "SHORT ") + str.tostring(sc, "#"),
+                     style = dir == 1 ? label.style_label_up : label.style_label_down,
+                     color = color.new(dir == 1 ? i_cBull : i_cBear, 15), textcolor = color.white, size = size.small,
+                     tooltip = pWhy + "\n\nEntry  " + str.tostring(fill, format.mintick) +
+                         "\nStop   " + str.tostring(stopPx, format.mintick) +
+                         "\nTP1    " + str.tostring(pTp1, format.mintick) +
+                         "\nTP2    " + str.tostring(pTp2, format.mintick))
+                line.new(bar_index, stopPx, bar_index + 12, stopPx, color = color.new(i_cBear, 30), style = line.style_dashed)
+                line.new(bar_index, pTp2,   bar_index + 12, pTp2,   color = color.new(i_cBull, 30), style = line.style_dashed)
+                line.new(bar_index, fill,   bar_index + 12, fill,   color = color.new(i_cNeut, 30))
+        else
+            cntSize += 1
+    else
+        cntSize += 1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DERIVED PERFORMANCE METRICS
+// ═══════════════════════════════════════════════════════════════════════════════
+winRate  = nTrade > 0 ? nWin * 100.0 / nTrade : 0.0
+avgR     = nTrade > 0 ? sumR / nTrade : 0.0
+vR       = nTrade > 1 ? math.max(0.0, sumR2 / nTrade - avgR * avgR) : 0.0
+sdR      = math.sqrt(vR)
+sharpeT  = sdR > 0 ? avgR / sdR : 0.0
+dsd      = nTrade > 0 ? math.sqrt(sumNeg2 / nTrade) : 0.0
+sortinoT = dsd > 0 ? avgR / dsd : 0.0
+pfV      = grossL > 0 ? grossW / grossL : grossW > 0 ? 999.0 : 0.0
+netPct   = i_equity0 > 0 ? (eq / i_equity0 - 1.0) * 100.0 : 0.0
+avgMae   = nTrade > 0 ? sumMae / nTrade : 0.0
+avgMfe   = nTrade > 0 ? sumMfe / nTrade : 0.0
+avgBars  = nTrade > 0 ? sumBars / nTrade : 0.0
+recFact  = maxDDpct < 0 ? netPct / math.abs(maxDDpct) : 0.0
+avgWinR  = nWin  > 0 ? sumWinR / nWin  : 0.0
+avgLosR  = nLoss > 0 ? sumLosR / nLoss : 0.0
+yearsRun = not na(firstTs) and time > firstTs ? (time - firstTs) / 31557600000.0 : 0.0
+trPerYr  = yearsRun > 0.05 ? nTrade / yearsRun : 0.0
+sharpeA  = trPerYr > 0 ? sharpeT * math.sqrt(trPerYr) : 0.0
+expPct   = avgR * i_riskPct
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  VISUALS
+// ═══════════════════════════════════════════════════════════════════════════════
+plotshape(i_showSweep and sweepBullNow, "Liquidity sweep ↑", shape.triangleup,   location.belowbar, #ffb300, size = size.tiny)
+plotshape(i_showSweep and sweepBearNow, "Liquidity sweep ↓", shape.triangledown, location.abovebar, #ffb300, size = size.tiny)
+
+if i_showStruct and breakUp
+    line.new(bar_index - 1, close, bar_index + 3, close, color = color.new(i_cBull, 20))
+    label.new(bar_index, close, chochUp ? "CHoCH↑" : "BOS↑", style = label.style_label_left,
+         color = color.new(i_cBull, 70), textcolor = i_cBull, size = size.tiny)
+if i_showStruct and breakDn
+    line.new(bar_index - 1, close, bar_index + 3, close, color = color.new(i_cBear, 20))
+    label.new(bar_index, close, chochDn ? "CHoCH↓" : "BOS↓", style = label.style_label_left,
+         color = color.new(i_cBear, 70), textcolor = i_cBear, size = size.tiny)
+
+plot(i_showLv ? pdH : na, "PDH", color = color.new(#42a5f5, 30), style = plot.style_linebr)
+plot(i_showLv ? pdL : na, "PDL", color = color.new(#42a5f5, 30), style = plot.style_linebr)
+plot(i_showLv ? pwH : na, "PWH", color = color.new(#ab47bc, 40), style = plot.style_linebr)
+plot(i_showLv ? pwL : na, "PWL", color = color.new(#ab47bc, 40), style = plot.style_linebr)
+plot(i_showEq ? eqLvl : na, "Equilibrium", color = color.new(i_cNeut, 40), style = plot.style_linebr)
+
+plot(pOpen ? pStop  : na, "Active stop",   color = i_cBear, style = plot.style_linebr, linewidth = 2)
+plot(pOpen ? pTp2   : na, "Active target", color = i_cBull, style = plot.style_linebr, linewidth = 2)
+plot(pOpen ? pEntry : na, "Active entry",  color = i_cNeut, style = plot.style_linebr)
+
+bgcolor(i_showState and pauseNews  ? color.new(#ffb300, 92) : na, title = "News / shock pause")
+bgcolor(i_showState and not riskFree ? color.new(#ef5350, 92) : na, title = "Risk lock")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PANELS
+// ═══════════════════════════════════════════════════════════════════════════════
+cOk  = #26a69a
+cBad = #ef5350
+cWrn = #ffb300
+cDim = #b2b5be
+cHdr = #ffffff
+
+f_row(_t, _r, _k, _v, _c) =>
+    table.cell(_t, 0, _r, _k, text_color = cDim, text_size = i_txt, text_halign = text.align_left)
+    table.cell(_t, 1, _r, _v, text_color = _c,   text_size = i_txt, text_halign = text.align_right)
+    _r + 1
+
+var table tState = table.new(i_posState, 2, 20, bgcolor = color.new(#131722, 10), frame_color = #434651, frame_width = 1, border_color = color.new(#434651, 50), border_width = 1)
+var table tPerf  = table.new(i_posPerf,  2, 24, bgcolor = color.new(#131722, 10), frame_color = #434651, frame_width = 1, border_color = color.new(#434651, 50), border_width = 1)
+var table tBuck  = table.new(i_posBuck,  4, 7,  bgcolor = color.new(#131722, 10), frame_color = #434651, frame_width = 1, border_color = color.new(#434651, 50), border_width = 1)
+
+if barstate.islast and i_showState
+    table.clear(tState, 0, 0, 1, 19)
+    table.cell(tState, 0, 0, "AI CONFLUENCE — LIVE", text_color = cHdr, text_size = i_txt, text_halign = text.align_left)
+    table.cell(tState, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = cHdr, text_size = i_txt, text_halign = text.align_right)
+    int r = 1
+    r := f_row(tState, r, "① Regime",       regimeTxt, isTrending ? cOk : isRanging ? cWrn : cDim)
+    r := f_row(tState, r, "① Volatility",   volTxt + " (" + str.tostring(atrRank, "#") + "%)", volBand ? cOk : cBad)
+    r := f_row(tState, r, "① Bias",         biasTxt + " · ADX " + str.tostring(adxV, "#.#"), bullCtx ? cOk : bearCtx ? cBad : cDim)
+    r := f_row(tState, r, "② HTF bias",     htfTxt, htfBullOk ? cOk : htfBearOk ? cBad : cDim)
+    r := f_row(tState, r, "② Key levels",   (nearPdH ? "PDH " : "") + (nearPdL ? "PDL " : "") + (nearPwH ? "PWH " : "") + (nearPwL ? "PWL" : "") + (atLevel ? "" : "—"), atLevel ? cWrn : cDim)
+    r := f_row(tState, r, "③ Structure",    strucTxt + (strucBullOk ? " · ▲break" : strucBearOk ? " · ▼break" : ""), strucDir == 1 ? cOk : strucDir == -1 ? cBad : cDim)
+    r := f_row(tState, r, "③ Sweep",        sweepBullOk ? "sell-side taken ▲" : sweepBearOk ? "buy-side taken ▼" : "—", sweepBullOk ? cOk : sweepBearOk ? cBad : cDim)
+    r := f_row(tState, r, "③ FVG / OB",     inBullPoi ? "in bullish zone" : inBearPoi ? "in bearish zone" : "—", inBullPoi ? cOk : inBearPoi ? cBad : cDim)
+    r := f_row(tState, r, "③ Prem / disc",  pdTxt, discount ? cOk : cBad)
+    r := f_row(tState, r, "④ Confirmation", (strongBull ? "strong ▲" : strongBear ? "strong ▼" : "weak") + (volSurge ? " · vol↑" : "") + (momBull ? " · mom▲" : momBear ? " · mom▼" : ""), strongBull or strongBear ? cOk : cDim)
+    r := f_row(tState, r, "⑨ Events",       newsTxt, pauseNews ? cBad : cOk)
+    r := f_row(tState, r, "⑤ Score LONG",   str.tostring(scoreL, "#.#") + " / " + str.tostring(scoreNeed, "#"), scoreL >= scoreNeed ? cOk : cDim)
+    r := f_row(tState, r, "⑤ Score SHORT",  str.tostring(scoreS, "#.#") + " / " + str.tostring(scoreNeed, "#"), scoreS >= scoreNeed ? cBad : cDim)
+    r := f_row(tState, r, "⑥ Risk state",   riskState, riskFree ? cOk : cBad)
+    r := f_row(tState, r, "⑥ Day / week",   str.tostring(dayPnlPct, "#.##") + "% / " + str.tostring(weekPnlPct, "#.##") + "%", dayPnlPct >= 0 ? cOk : cBad)
+    r := f_row(tState, r, "⑦ Next risk",    str.tostring(math.min(i_riskCap, i_riskPct * riskMult * math.max(confMultL, confMultS) * volMult), "#.###") + "% of " + str.tostring(eq, "#.##"), cDim)
+    r := f_row(tState, r, "⑧ Position",     pOpen ? (pDir == 1 ? "LONG " : "SHORT ") + str.tostring(pQty, "#.#####") + " @ " + str.tostring(pEntry, format.mintick) : "flat", pOpen ? (pDir == 1 ? cOk : cBad) : cDim)
+    livR = pOpen and pRisk > 0 ? (pDir == 1 ? (close - pEntry) / pRisk : (pEntry - close) / pRisk) : 0.0
+    r := f_row(tState, r, "⑧ Open trade",   pOpen ? str.tostring(livR, "#.##") + "R · stop " + str.tostring(pStop, format.mintick) : "—", pOpen ? (livR >= 0 ? cOk : cBad) : cDim)
+
+if barstate.islast and i_showPerf
+    table.clear(tPerf, 0, 0, 1, 23)
+    table.cell(tPerf, 0, 0, "STRATEGY REPORT", text_color = cHdr, text_size = i_txt, text_halign = text.align_left)
+    table.cell(tPerf, 1, 0, str.tostring(nTrade) + " trades", text_color = cHdr, text_size = i_txt, text_halign = text.align_right)
+    int r = 1
+    r := f_row(tPerf, r, "Net return",         str.tostring(netPct, "#.##") + "%", netPct >= 0 ? cOk : cBad)
+    r := f_row(tPerf, r, "Equity",             str.tostring(eq, "#.##") + "  (from " + str.tostring(i_equity0, "#") + ")", netPct >= 0 ? cOk : cBad)
+    r := f_row(tPerf, r, "Win rate",           str.tostring(winRate, "#.#") + "%  (" + str.tostring(nWin) + "W / " + str.tostring(nLoss) + "L)", winRate >= 50 ? cOk : cWrn)
+    r := f_row(tPerf, r, "Expectancy",         str.tostring(avgR, "#.###") + "R  ≈ " + str.tostring(expPct, "#.###") + "% per trade", avgR > 0 ? cOk : cBad)
+    r := f_row(tPerf, r, "Profit factor",      str.tostring(pfV, "#.##"), pfV >= 1.3 ? cOk : pfV >= 1.0 ? cWrn : cBad)
+    r := f_row(tPerf, r, "Sharpe (per trade)", str.tostring(sharpeT, "#.###"), sharpeT > 0 ? cOk : cBad)
+    r := f_row(tPerf, r, "Sharpe (annualised)",trPerYr > 0 ? str.tostring(sharpeA, "#.##") + "  (" + str.tostring(trPerYr, "#") + " tr/yr)" : "n/a", sharpeA > 1 ? cOk : sharpeA > 0 ? cWrn : cBad)
+    r := f_row(tPerf, r, "Sortino (per trade)",str.tostring(sortinoT, "#.###"), sortinoT > 0 ? cOk : cBad)
+    r := f_row(tPerf, r, "Max drawdown",       str.tostring(maxDDpct, "#.##") + "%  (limit " + str.tostring(i_maxDD, "#.#") + "%)", -maxDDpct < i_maxDD ? cWrn : cBad)
+    r := f_row(tPerf, r, "Recovery factor",    str.tostring(recFact, "#.##"), recFact > 1 ? cOk : cWrn)
+    r := f_row(tPerf, r, "Avg win / loss",     str.tostring(avgWinR, "#.##") + "R / " + str.tostring(avgLosR, "#.##") + "R", avgWinR > math.abs(avgLosR) ? cOk : cWrn)
+    r := f_row(tPerf, r, "Best / worst",       str.tostring(bestR, "#.##") + "R / " + str.tostring(worstR, "#.##") + "R", cDim)
+    r := f_row(tPerf, r, "Max streak W / L",   str.tostring(maxConsW) + " / " + str.tostring(maxConsL), maxConsL >= i_maxConsec ? cBad : cDim)
+    r := f_row(tPerf, r, "Avg MAE / MFE",      str.tostring(avgMae, "#.##") + "R / " + str.tostring(avgMfe, "#.##") + "R", avgMfe > avgMae ? cOk : cWrn)
+    r := f_row(tPerf, r, "Avg bars held",      str.tostring(avgBars, "#"), cDim)
+    r := f_row(tPerf, r, "Longs",              nLong  > 0 ? str.tostring(nLong)  + " · " + str.tostring(nLongW  * 100.0 / math.max(nLong, 1),  "#") + "% · " + str.tostring(rLong  / math.max(nLong, 1),  "#.##") + "R" : "—", rLong  > 0 ? cOk : cBad)
+    r := f_row(tPerf, r, "Shorts",             nShort > 0 ? str.tostring(nShort) + " · " + str.tostring(nShortW * 100.0 / math.max(nShort, 1), "#") + "% · " + str.tostring(rShort / math.max(nShort, 1), "#.##") + "R" : "—", rShort > 0 ? cOk : cBad)
+    r := f_row(tPerf, r, "Bars over threshold",str.tostring(cntSetup), cDim)
+    r := f_row(tPerf, r, "Blocked by filters", str.tostring(cntFilter), cDim)
+    r := f_row(tPerf, r, "Blocked risk / news",str.tostring(cntRisk) + " / " + str.tostring(cntNews), cDim)
+    r := f_row(tPerf, r, "Skipped: stop size", str.tostring(cntSize), cDim)
+    r := f_row(tPerf, r, "Costs applied",      str.tostring(i_feePct, "#.###") + "%/side + " + str.tostring(i_slipPct, "#.###") + "% slip", cWrn)
+
+if barstate.islast and i_showBuck
+    table.clear(tBuck, 0, 0, 3, 6)
+    table.cell(tBuck, 0, 0, "SCORE",  text_color = cHdr, text_size = i_txt)
+    table.cell(tBuck, 1, 0, "TRADES", text_color = cHdr, text_size = i_txt)
+    table.cell(tBuck, 2, 0, "WIN %",  text_color = cHdr, text_size = i_txt)
+    table.cell(tBuck, 3, 0, "AVG R",  text_color = cHdr, text_size = i_txt)
+    float bw = math.max(1.0, (100.0 - i_minScore) / 4.0)
+    for i = 0 to 3
+        lo = i_minScore + bw * i
+        hi = i == 3 ? 100.0 : i_minScore + bw * (i + 1)
+        n  = array.get(bkN, i)
+        w  = array.get(bkW, i)
+        rr = n > 0 ? array.get(bkR, i) / n : 0.0
+        wr = n > 0 ? w * 100.0 / n : 0.0
+        table.cell(tBuck, 0, i + 1, str.tostring(lo, "#") + "-" + str.tostring(hi, "#"), text_color = cDim, text_size = i_txt)
+        table.cell(tBuck, 1, i + 1, str.tostring(n), text_color = cDim, text_size = i_txt)
+        table.cell(tBuck, 2, i + 1, n > 0 ? str.tostring(wr, "#") + "%" : "—", text_color = n > 0 and wr >= 50 ? cOk : n > 0 ? cWrn : cDim, text_size = i_txt)
+        table.cell(tBuck, 3, i + 1, n > 0 ? str.tostring(rr, "#.##") : "—", text_color = n > 0 and rr > 0 ? cOk : n > 0 ? cBad : cDim, text_size = i_txt)
+    table.cell(tBuck, 0, 5, "bar-by-bar sim", text_color = cWrn, text_size = size.tiny)
+    table.cell(tBuck, 1, 5, "stop-first",     text_color = cWrn, text_size = size.tiny)
+    table.cell(tBuck, 2, 5, "costs on",       text_color = cWrn, text_size = size.tiny)
+    table.cell(tBuck, 3, 5, "not advice",     text_color = cWrn, text_size = size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LAYER 10 — MACHINE-READABLE OUTPUT
+//  Data Window shows these live; chart menu -> Export chart data gives you the CSV
+//  of every bar so you can analyse the journal outside TradingView.
+// ═══════════════════════════════════════════════════════════════════════════════
+plot(scoreL,               "Score long",  display = display.data_window)
+plot(scoreS,               "Score short", display = display.data_window)
+plot(eq,                   "Equity",      display = display.data_window)
+plot(ddNow,                "Drawdown %",  display = display.data_window)
+plot(atrRank,              "ATR pctile",  display = display.data_window)
+plot(adxV,                 "ADX",         display = display.data_window)
+plot(pOpen ? pDir : 0,     "Position",    display = display.data_window)
+plot(didExit ? exitR : na, "Closed R",    display = display.data_window)
+plot(nTrade,               "Trade count", display = display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(firedLong,  "Long setup",   "AI Confluence LONG {{ticker}} {{interval}} @ {{close}}")
+alertcondition(firedShort, "Short setup",  "AI Confluence SHORT {{ticker}} {{interval}} @ {{close}}")
+alertcondition(didExit,    "Trade closed", "AI Confluence closed a trade on {{ticker}} {{interval}}")
+
+if firedLong or firedShort
+    alert((firedLong ? "LONG " : "SHORT ") + syminfo.ticker + " " + timeframe.period +
+         " · score " + str.tostring(firedLong ? scoreL : scoreS, "#.#") +
+         " · entry " + str.tostring(pEntry, format.mintick) +
+         " · stop " + str.tostring(pStop, format.mintick) +
+         " · target " + str.tostring(pTp2, format.mintick) +
+         " · size " + str.tostring(pQty, "#.######"), alert.freq_once_per_bar_close)
