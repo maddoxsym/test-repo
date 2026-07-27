@@ -1,0 +1,715 @@
+//@version=6
+// =============================================================================
+// CRYPTO SMC ENGINE — Sweep + Displacement + Structure Shift
+// -----------------------------------------------------------------------------
+// A TradingView port of the adaptive SMC/ICT logic used in the XAUUSD bot in
+// this repo, re-tuned for 24/7 crypto markets.
+//
+// Trade thesis (unchanged from the bot):
+//   1. Higher-timeframe bias decides which side is allowed.
+//   2. Price must reach a meaningful location (order block / fair value gap,
+//      in discount for longs, premium for shorts).
+//   3. Liquidity must be taken (sweep of a swing high/low, closing back inside).
+//   4. Displacement must prove intent (large body vs ATR, dominant body).
+//   5. Structure must confirm (BOS / CHoCH / MSS).
+//   6. Only then: structural stop, liquidity-based target, graded risk.
+//
+// Every setup is scored 0-100 on the same weightings as the bot, graded
+// B / A / A+, and sized off that grade. Below the minimum score: no trade.
+//
+// NOTHING HERE CLAIMS PROFITABILITY. It is a hypothesis tester. Set realistic
+// commission and slippage in the Properties tab before believing any number.
+// =============================================================================
+
+strategy("Crypto SMC Engine — Sweep + Displacement + MSS",
+     shorttitle           = "CSMC",
+     overlay              = true,
+     initial_capital      = 10000,
+     currency             = currency.USD,
+     default_qty_type     = strategy.fixed,
+     pyramiding           = 0,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.05,
+     slippage             = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     max_labels_count     = 500,
+     max_lines_count      = 500,
+     max_boxes_count      = 500)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+g1 = "① Direction & risk"
+allowLong  = input.bool(true,  "Longs",  group = g1, inline = "dir")
+allowShort = input.bool(true,  "Shorts", group = g1, inline = "dir")
+riskB      = input.float(0.5, "Risk % — grade B (70-79)", minval = 0.05, maxval = 5.0, step = 0.05, group = g1)
+riskA      = input.float(1.0, "Risk % — grade A (80-89)", minval = 0.05, maxval = 5.0, step = 0.05, group = g1)
+riskAP     = input.float(2.0, "Risk % — grade A+ (90+)",  minval = 0.05, maxval = 5.0, step = 0.05, group = g1)
+maxLev     = input.float(5.0, "Max notional leverage",    minval = 0.1,  maxval = 50.0, step = 0.1, group = g1)
+
+g2 = "② Higher-timeframe bias"
+useHtf    = input.bool(true, "Require HTF alignment (blocks countertrend entirely)", group = g2)
+htfTf     = input.timeframe("1D", "HTF", group = g2)
+htfEmaLen = input.int(50, "HTF EMA length", minval = 10, group = g2)
+htfSlope  = input.int(3,  "HTF slope lookback (bars)", minval = 1, group = g2)
+
+g3 = "③ Market structure"
+swL        = input.int(2, "Swing left",  minval = 1, group = g3, inline = "sw")
+swR        = input.int(2, "Swing right", minval = 1, group = g3, inline = "sw")
+atrLen     = input.int(14, "ATR length", minval = 2, group = g3)
+dispAtrM   = input.float(1.2,  "Displacement — body ≥ ATR ×",  minval = 0.2, step = 0.1,  group = g3)
+dispBodyR  = input.float(0.55, "Displacement — body/range ≥",  minval = 0.1, maxval = 1.0, step = 0.05, group = g3)
+eqTolAtr   = input.float(0.12, "Equal high/low tolerance (ATR ×)", minval = 0.0, step = 0.01, group = g3)
+pdBuf      = input.float(0.05, "Premium/discount equilibrium buffer", minval = 0.0, maxval = 0.4, step = 0.01, group = g3)
+evMaxAge   = input.int(20, "Structure event valid for N bars", minval = 1, group = g3)
+
+g4 = "④ Liquidity, FVG & order blocks"
+sweepCloseBack = input.bool(true, "Sweep must close back inside the level", group = g4)
+sweepMaxAge    = input.int(10, "Sweep valid for N bars", minval = 1, group = g4)
+fvgMinAtr      = input.float(0.15, "FVG minimum size (ATR ×)", minval = 0.0, step = 0.05, group = g4)
+obLookback     = input.int(5, "Order block — scan N bars before displacement", minval = 1, maxval = 20, group = g4)
+obMaxAge       = input.int(60, "Order block / zone max age (bars)", minval = 5, group = g4)
+extMaxAtr      = input.float(3.0, "Don't chase — max distance from level (ATR ×)", minval = 0.5, step = 0.1, group = g4)
+
+g5 = "⑤ Stops, targets & management"
+stopBufAtr   = input.float(0.25, "Stop buffer beyond structure (ATR ×)", minval = 0.0, step = 0.05, group = g5)
+minStopAtr   = input.float(0.35, "Minimum stop (ATR ×)", minval = 0.05, step = 0.05, group = g5)
+maxStopAtr   = input.float(3.5,  "Maximum stop (ATR ×)", minval = 0.5,  step = 0.1,  group = g5)
+minRR        = input.float(2.0,  "Minimum reward:risk", minval = 0.5, step = 0.1, group = g5)
+minRRap      = input.float(1.5,  "Minimum R:R for A+ setups", minval = 0.5, step = 0.1, group = g5)
+rrCap        = input.float(4.0,  "Reward:risk cap", minval = 1.0, step = 0.5, group = g5)
+useBE        = input.bool(true,  "Breakeven at R", group = g5, inline = "be")
+beR          = input.float(1.0,  "", minval = 0.2, step = 0.1, group = g5, inline = "be")
+usePartial   = input.bool(true,  "Partial at R", group = g5, inline = "pt")
+partialR     = input.float(1.7,  "", minval = 0.3, step = 0.1, group = g5, inline = "pt")
+partialPct   = input.float(40.0, "Partial size %", minval = 5.0, maxval = 95.0, step = 5.0, group = g5)
+useTrail     = input.bool(true,  "ATR trail the runner", group = g5, inline = "tr")
+trailAtrM    = input.float(1.6,  "", minval = 0.3, step = 0.1, group = g5, inline = "tr")
+timeStopBars = input.int(60, "Time stop — bars under +0.2R (0 = off)", minval = 0, group = g5)
+
+g6 = "⑥ Setup scoring"
+minScore    = input.float(70.0, "Minimum score to trade", minval = 0.0, maxval = 100.0, step = 1.0, group = g6)
+ctMinScore  = input.float(80.0, "Minimum score for countertrend", minval = 0.0, maxval = 100.0, step = 1.0, group = g6)
+useSession  = input.bool(true,  "Score crypto session quality", group = g6)
+skipWeekend = input.bool(false, "No new entries on weekends (thin crypto liquidity)", group = g6)
+
+g7 = "⑦ Capital protection"
+maxDailyLoss  = input.float(5.0, "Daily loss lock %", minval = 0.5, step = 0.5, group = g7)
+maxConsecLoss = input.int(3, "Consecutive-loss lock", minval = 1, group = g7)
+maxTradesDay  = input.int(4, "Max trades per day", minval = 1, group = g7)
+dailyProfitHS = input.float(3.0, "Daily profit hard stop % (0 = off)", minval = 0.0, step = 0.5, group = g7)
+
+g8 = "⑧ Backtest window & visuals"
+startDate  = input.time(timestamp("01 Jan 2020 00:00 +0000"), "Start", group = g8)
+endDate    = input.time(timestamp("01 Jan 2099 00:00 +0000"), "End",   group = g8)
+showZones  = input.bool(true, "Draw FVG / order blocks", group = g8)
+showLevels = input.bool(true, "Draw swing liquidity levels", group = g8)
+showTable  = input.bool(true, "Show dashboard", group = g8)
+
+// =============================================================================
+// CORE SERIES
+// =============================================================================
+
+atr       = ta.atr(atrLen)
+bodySize  = math.abs(close - open)
+rangeSize = high - low
+bodyRatio = rangeSize > 0 ? bodySize / rangeSize : 0.0
+isDisp    = atr > 0 and bodySize >= dispAtrM * atr and bodyRatio >= dispBodyR
+dispUp    = isDisp and close > open
+dispDn    = isDisp and close < open
+
+inWindow  = time >= startDate and time <= endDate
+
+// ---- higher-timeframe bias (non-repainting: HTF values offset by one bar) ----
+htfEma = request.security(syminfo.tickerid, htfTf,
+     ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_off)
+htfUp = request.security(syminfo.tickerid, htfTf,
+     (ta.ema(close, htfEmaLen) > ta.ema(close, htfEmaLen)[htfSlope])[1],
+     lookahead = barmerge.lookahead_off)
+
+htfBull = not na(htfEma) and close > htfEma and htfUp
+htfBear = not na(htfEma) and close < htfEma and not htfUp
+htfBias = htfBull ? 1 : htfBear ? -1 : 0
+
+// =============================================================================
+// SWING STRUCTURE
+// =============================================================================
+
+ph = ta.pivothigh(high, swL, swR)
+pl = ta.pivotlow(low,  swL, swR)
+
+var float swHigh     = na
+var float swHighPrev = na
+var int   swHighBar  = na
+var float swLow      = na
+var float swLowPrev  = na
+var int   swLowBar   = na
+
+if not na(ph)
+    swHighPrev := swHigh
+    swHigh     := ph
+    swHighBar  := bar_index - swR
+
+if not na(pl)
+    swLowPrev := swLow
+    swLow     := pl
+    swLowBar  := bar_index - swR
+
+// equal highs / lows = stacked resting liquidity
+eqHighs = not na(swHigh) and not na(swHighPrev) and math.abs(swHigh - swHighPrev) <= eqTolAtr * atr
+eqLows  = not na(swLow)  and not na(swLowPrev)  and math.abs(swLow  - swLowPrev)  <= eqTolAtr * atr
+
+// ---- dealing range / premium-discount ----
+pdPos = not na(swHigh) and not na(swLow) and (swHigh - swLow) > 0
+     ? (close - swLow) / (swHigh - swLow) : 0.5
+pdPremium  = pdPos > 0.5 + pdBuf
+pdDiscount = pdPos < 0.5 - pdBuf
+
+// =============================================================================
+// STRUCTURE EVENTS — BOS / CHoCH / MSS (close-based breaks only)
+// =============================================================================
+// evKind: 1 = BOS (continuation), 2 = CHoCH (change of character),
+//         3 = MSS (change of character carried by displacement)
+
+var int   trendState  = 0
+var int   evKind      = 0
+var int   evDir       = 0
+var int   evBar       = na
+var float evLevel     = na
+var bool  evDisp      = false
+var float brokenHigh  = na
+var float brokenLow   = na
+var float protHigh    = na
+var float protLow     = na
+
+breakUp = not na(swHigh) and close > swHigh and (na(brokenHigh) or swHigh != brokenHigh)
+breakDn = not na(swLow)  and close < swLow  and (na(brokenLow)  or swLow  != brokenLow)
+
+if breakUp
+    evKind     := trendState >= 0 ? 1 : (isDisp ? 3 : 2)
+    evDir      := 1
+    evLevel    := swHigh
+    evBar      := bar_index
+    evDisp     := isDisp
+    brokenHigh := swHigh
+    protLow    := swLow
+    trendState := 1
+
+if breakDn
+    evKind     := trendState <= 0 ? 1 : (isDisp ? 3 : 2)
+    evDir      := -1
+    evLevel    := swLow
+    evBar      := bar_index
+    evDisp     := isDisp
+    brokenLow  := swLow
+    protHigh   := swHigh
+    trendState := -1
+
+evFresh = not na(evBar) and (bar_index - evBar) <= evMaxAge
+
+// =============================================================================
+// LIQUIDITY SWEEPS
+// =============================================================================
+// sweepDir: +1 = sell-side liquidity taken (bullish intent)
+//           -1 = buy-side liquidity taken (bearish intent)
+
+var float sweepExtreme = na
+var int   sweepBar     = na
+var int   sweepDir     = 0
+var bool  sweepBack    = false
+var bool  sweepDisp    = false
+var bool  sweepEq      = false
+
+tookHighs = not na(swHigh) and high > swHigh and (not sweepCloseBack or close < swHigh)
+tookLows  = not na(swLow)  and low  < swLow  and (not sweepCloseBack or close > swLow)
+
+if tookHighs
+    sweepExtreme := high
+    sweepBar     := bar_index
+    sweepDir     := -1
+    sweepBack    := close < swHigh
+    sweepDisp    := dispDn
+    sweepEq      := eqHighs
+
+if tookLows
+    sweepExtreme := low
+    sweepBar     := bar_index
+    sweepDir     := 1
+    sweepBack    := close > swLow
+    sweepDisp    := dispUp
+    sweepEq      := eqLows
+
+sweepFresh = not na(sweepBar) and (bar_index - sweepBar) <= sweepMaxAge
+
+// =============================================================================
+// FAIR VALUE GAPS (most recent unmitigated per side)
+// =============================================================================
+
+var float bullFvgTop = na
+var float bullFvgBot = na
+var int   bullFvgBar = na
+var float bearFvgTop = na
+var float bearFvgBot = na
+var int   bearFvgBar = na
+
+if low > high[2] and (low - high[2]) >= fvgMinAtr * atr
+    bullFvgBot := high[2]
+    bullFvgTop := low
+    bullFvgBar := bar_index
+
+if high < low[2] and (low[2] - high) >= fvgMinAtr * atr
+    bearFvgBot := high
+    bearFvgTop := low[2]
+    bearFvgBar := bar_index
+
+// mitigation — a close through the far edge kills the gap
+if not na(bullFvgBot) and close < bullFvgBot
+    bullFvgTop := na
+    bullFvgBot := na
+    bullFvgBar := na
+
+if not na(bearFvgTop) and close > bearFvgTop
+    bearFvgTop := na
+    bearFvgBot := na
+    bearFvgBar := na
+
+bullFvgOk  = not na(bullFvgBot)
+bearFvgOk  = not na(bearFvgTop)
+bullFvgMid = bullFvgOk ? (bullFvgTop + bullFvgBot) / 2.0 : na   // consequent encroachment
+bearFvgMid = bearFvgOk ? (bearFvgTop + bearFvgBot) / 2.0 : na
+
+// =============================================================================
+// ORDER BLOCKS — last opposite candle before displacement
+// =============================================================================
+
+var float bullObTop = na
+var float bullObBot = na
+var int   bullObBar = na
+var float bearObTop = na
+var float bearObBot = na
+var int   bearObBar = na
+
+if dispUp
+    for i = 1 to obLookback
+        if close[i] < open[i]
+            bullObTop := high[i]
+            bullObBot := low[i]
+            bullObBar := bar_index - i
+            break
+
+if dispDn
+    for i = 1 to obLookback
+        if close[i] > open[i]
+            bearObTop := high[i]
+            bearObBot := low[i]
+            bearObBar := bar_index - i
+            break
+
+// invalidation
+if not na(bullObBot) and close < bullObBot
+    bullObTop := na
+    bullObBot := na
+    bullObBar := na
+
+if not na(bearObTop) and close > bearObTop
+    bearObTop := na
+    bearObBot := na
+    bearObBar := na
+
+bullObOk = not na(bullObBar) and (bar_index - bullObBar) <= obMaxAge
+bearObOk = not na(bearObBar) and (bar_index - bearObBar) <= obMaxAge
+
+// =============================================================================
+// CONTEXT SCORES SHARED BY BOTH DIRECTIONS
+// =============================================================================
+
+// ---- session quality (crypto trades 24/7, so off-hours is thin, not closed)
+hUtc      = hour(time, "UTC")
+isLondon  = hUtc >= 7  and hUtc < 16
+isNy      = hUtc >= 12 and hUtc < 21
+isOverlap = isLondon and isNy
+isAsia    = hUtc >= 0  and hUtc < 7
+sessionScore = not useSession ? 3.0 :
+     isOverlap ? 5.0 :
+     (isLondon or isNy) ? 4.5 :
+     isAsia ? 2.0 : 1.0
+
+isWeekend = dayofweek(time, "UTC") == dayofweek.saturday or dayofweek(time, "UTC") == dayofweek.sunday
+
+// ---- volatility safety (replaces the bot's news filter — crypto has no bell)
+atrBase  = ta.sma(atr, 100)
+volSpike = atrBase > 0 and atr > 2.5 * atrBase     // blow-off, don't chase
+volDead  = atrBase > 0 and atr < 0.4 * atrBase     // no range, no target
+volScore = volSpike ? 0.0 : volDead ? 1.0 : 5.0
+volScoreAdj = (isWeekend and skipWeekend) ? 0.0 : volScore
+
+// ---- zone quality, mirroring Zone.quality() from the bot
+f_zoneQuality(_bar, _isBull, _hasFvg) =>
+    age   = bar_index - _bar
+    fresh = math.max(0.0, 1.0 - age / math.max(1.0, obMaxAge * 1.0))
+    q     = 0.35 * fresh + 0.35 * 1.0
+    q    += (evFresh and not na(evBar) and evBar > _bar and evDir == (_isBull ? 1 : -1)) ? 0.15 : 0.0
+    q    += _hasFvg ? 0.075 : 0.0
+    q    += htfBias == (_isBull ? 1 : -1) ? 0.075 : 0.0
+    math.min(1.0, math.max(0.0, q))
+
+// =============================================================================
+// STOPS, TARGETS AND R:R (computed before scoring — target quality feeds it)
+// =============================================================================
+
+// ---- LONG ----
+longAnchor = low
+longAnchor := sweepFresh and sweepDir == 1 and not na(sweepExtreme) ? math.min(longAnchor, sweepExtreme) : longAnchor
+longAnchor := bullObOk   ? math.min(longAnchor, bullObBot) : longAnchor
+longAnchor := not na(protLow) ? math.min(longAnchor, protLow) : longAnchor
+
+longStopRaw  = longAnchor - stopBufAtr * atr
+longRiskRaw  = close - longStopRaw
+longRisk     = math.max(longRiskRaw, minStopAtr * atr)
+longStop     = close - longRisk
+longStopOk   = longRiskRaw > 0 and longRisk <= maxStopAtr * atr
+
+longLiq      = not na(swHigh) and swHigh > close + 0.2 * atr ? swHigh : na
+longRrLiq    = not na(longLiq) and longRisk > 0 ? (longLiq - close) / longRisk : 0.0
+longLiqTgt   = longRrLiq >= minRR
+longRr       = math.min(rrCap, longLiqTgt ? longRrLiq : minRR)
+longTarget   = close + longRr * longRisk
+
+// ---- SHORT ----
+shortAnchor = high
+shortAnchor := sweepFresh and sweepDir == -1 and not na(sweepExtreme) ? math.max(shortAnchor, sweepExtreme) : shortAnchor
+shortAnchor := bearObOk    ? math.max(shortAnchor, bearObTop) : shortAnchor
+shortAnchor := not na(protHigh) ? math.max(shortAnchor, protHigh) : shortAnchor
+
+shortStopRaw = shortAnchor + stopBufAtr * atr
+shortRiskRaw = shortStopRaw - close
+shortRisk    = math.max(shortRiskRaw, minStopAtr * atr)
+shortStop    = close + shortRisk
+shortStopOk  = shortRiskRaw > 0 and shortRisk <= maxStopAtr * atr
+
+shortLiq     = not na(swLow) and swLow < close - 0.2 * atr ? swLow : na
+shortRrLiq   = not na(shortLiq) and shortRisk > 0 ? (close - shortLiq) / shortRisk : 0.0
+shortLiqTgt  = shortRrLiq >= minRR
+shortRr      = math.min(rrCap, shortLiqTgt ? shortRrLiq : minRR)
+shortTarget  = close - shortRr * shortRisk
+
+// =============================================================================
+// SETUP SCORING — same weightings as the bot's ScoreBreakdown
+// =============================================================================
+// htf 15 | zone 15 | sweep 15 | structure 15 | displacement 10
+// confluence 10 | premium-discount 5 | session 5 | volatility 5 | target 5
+
+f_score(_dir, _rr, _liqTarget) =>
+    isLong = _dir == 1
+
+    sHtf = htfBias == _dir ? 15.0 : htfBias == 0 ? 8.0 : 0.0
+
+    obOk    = isLong ? bullObOk : bearObOk
+    obBar   = isLong ? bullObBar : bearObBar
+    fvgOk   = isLong ? bullFvgOk : bearFvgOk
+    sZone   = obOk ? 15.0 * f_zoneQuality(obBar, isLong, fvgOk) : 0.0
+
+    sSweep = 0.0
+    if sweepFresh and sweepDir == _dir
+        sSweep := 9.0
+        sSweep += sweepBack ? 3.0 : 0.0
+        sSweep += (sweepDisp or sweepEq) ? 3.0 : 0.0
+
+    evOk    = evFresh and evDir == _dir
+    sStruct = evOk ? (evKind == 3 ? 15.0 : evKind == 2 ? 12.0 : 11.0) : 0.0
+
+    sDisp = ((isLong ? dispUp : dispDn) or (evOk and evDisp)) ? 10.0 : 0.0
+    sConf = (fvgOk ? 5.0 : 0.0) + (obOk ? 5.0 : 0.0)
+
+    sPd = (isLong and pdDiscount) or (not isLong and pdPremium) ? 5.0 :
+         (not pdPremium and not pdDiscount) ? 2.0 : 0.0
+
+    sTgt = _rr >= 3.0 ? 5.0 : _rr >= 2.0 ? 4.0 : _rr >= 1.5 ? 2.0 : 0.0
+    sTgt := _liqTarget and sTgt > 0 ? math.min(5.0, sTgt + 1.0) : sTgt
+
+    sHtf + sZone + sSweep + sStruct + sDisp + sConf + sPd + sessionScore + volScoreAdj + sTgt
+
+longScore  = f_score(1,  longRr,  longLiqTgt)
+shortScore = f_score(-1, shortRr, shortLiqTgt)
+
+f_grade(_s) => _s >= 90 ? 3 : _s >= 80 ? 2 : _s >= 70 ? 1 : 0
+f_risk(_g)  => _g == 3 ? riskAP : _g == 2 ? riskA : _g == 1 ? riskB : 0.0
+
+longGrade  = f_grade(longScore)
+shortGrade = f_grade(shortScore)
+
+// =============================================================================
+// CAPITAL PROTECTION LOCKS
+// =============================================================================
+
+var float dayStartEq  = na
+var int   tradesToday = 0
+var int   consecLoss  = 0
+
+newDay = ta.change(time("D")) != 0
+if newDay or na(dayStartEq)
+    dayStartEq  := strategy.equity
+    tradesToday := 0
+    consecLoss  := 0
+
+dayPnlPct = not na(dayStartEq) and dayStartEq > 0
+     ? (strategy.equity - dayStartEq) / dayStartEq * 100.0 : 0.0
+
+if strategy.closedtrades > nz(strategy.closedtrades[1])
+    lastPnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    consecLoss := lastPnl < 0 ? consecLoss + 1 : 0
+
+lockedDaily  = dayPnlPct <= -maxDailyLoss
+lockedStreak = consecLoss >= maxConsecLoss
+lockedCount  = tradesToday >= maxTradesDay
+lockedProfit = dailyProfitHS > 0 and dayPnlPct >= dailyProfitHS
+locked       = lockedDaily or lockedStreak or lockedCount or lockedProfit
+
+// =============================================================================
+// ENTRY GATES — all of the bot's hard requirements, none optional
+// =============================================================================
+
+flat = strategy.position_size == 0
+
+// location + structure + rejection evidence + not extended
+longCore = (bullObOk or bullFvgOk)
+     and evFresh and evDir == 1
+     and (dispUp or (sweepFresh and sweepDir == 1))
+     and (na(evLevel) or math.abs(close - evLevel) <= extMaxAtr * atr)
+
+shortCore = (bearObOk or bearFvgOk)
+     and evFresh and evDir == -1
+     and (dispDn or (sweepFresh and sweepDir == -1))
+     and (na(evLevel) or math.abs(close - evLevel) <= extMaxAtr * atr)
+
+longCt  = htfBias == -1
+shortCt = htfBias == 1
+
+longThresh  = longCt  ? math.max(minScore, ctMinScore) : minScore
+shortThresh = shortCt ? math.max(minScore, ctMinScore) : minScore
+
+longRrMin  = longGrade  == 3 ? minRRap : minRR
+shortRrMin = shortGrade == 3 ? minRRap : minRR
+
+longSignal = allowLong and inWindow and flat and not locked
+     and longCore and longStopOk
+     and not (useHtf and longCt)
+     and not (skipWeekend and isWeekend)
+     and longScore >= longThresh
+     and longGrade > 0
+     and longRr >= longRrMin
+
+shortSignal = allowShort and inWindow and flat and not locked
+     and shortCore and shortStopOk
+     and not (useHtf and shortCt)
+     and not (skipWeekend and isWeekend)
+     and shortScore >= shortThresh
+     and shortGrade > 0
+     and shortRr >= shortRrMin
+
+// resolve the rare both-fire bar in favour of the stronger score
+takeLong  = longSignal  and (not shortSignal or longScore >= shortScore)
+takeShort = shortSignal and (not longSignal  or shortScore >  longScore)
+
+// =============================================================================
+// POSITION SIZING — risk % of equity across the structural stop
+// =============================================================================
+
+f_qty(_riskPct, _stopDist) =>
+    q = _stopDist > 0 and _riskPct > 0 ? strategy.equity * _riskPct / 100.0 / _stopDist : 0.0
+    math.max(0.0, math.min(q, strategy.equity * maxLev / close))
+
+longQty  = f_qty(f_risk(longGrade),  longRisk)
+shortQty = f_qty(f_risk(shortGrade), shortRisk)
+
+// =============================================================================
+// EXECUTION
+// =============================================================================
+
+var float posEntry   = na
+var float posStop    = na
+var float posRisk    = na
+var float posTarget  = na
+var bool  partialOn  = false
+var int   barsIn     = 0
+var float bestR      = 0.0
+var float pendScore  = 0.0
+var int   pendGrade  = 0
+
+if takeLong and longQty > 0
+    strategy.entry("L", strategy.long, qty = longQty, comment = "L " + str.tostring(longScore, "#"))
+    pendScore := longScore
+    pendGrade := longGrade
+
+if takeShort and shortQty > 0
+    strategy.entry("S", strategy.short, qty = shortQty, comment = "S " + str.tostring(shortScore, "#"))
+    pendScore := shortScore
+    pendGrade := shortGrade
+
+justOpened = strategy.position_size != 0 and nz(strategy.position_size[1]) == 0
+
+if justOpened
+    posEntry  := strategy.position_avg_price
+    isLongPos = strategy.position_size > 0
+    posRisk   := isLongPos ? longRisk : shortRisk
+    posStop   := isLongPos ? posEntry - posRisk : posEntry + posRisk
+    posTarget := isLongPos ? posEntry + longRr * posRisk : posEntry - shortRr * posRisk
+    partialOn := false
+    barsIn    := 0
+    bestR     := 0.0
+    tradesToday := tradesToday + 1
+
+// ---- in-trade management ----
+if strategy.position_size > 0 and not na(posRisk) and posRisk > 0
+    barsIn := barsIn + 1
+    r      = (close - posEntry) / posRisk
+    bestR := math.max(bestR, r)
+
+    if useBE and r >= beR
+        posStop := math.max(posStop, posEntry)
+    if useTrail and r >= partialR
+        posStop := math.max(posStop, close - trailAtrM * atr)
+
+    strategy.exit("L-exit", from_entry = "L", stop = posStop, limit = posTarget)
+
+    if usePartial and not partialOn and r >= partialR
+        strategy.close("L", qty_percent = partialPct, comment = "Partial")
+        partialOn := true
+
+    if timeStopBars > 0 and barsIn >= timeStopBars and bestR < 0.2
+        strategy.close("L", comment = "Time stop")
+
+if strategy.position_size < 0 and not na(posRisk) and posRisk > 0
+    barsIn := barsIn + 1
+    r      = (posEntry - close) / posRisk
+    bestR := math.max(bestR, r)
+
+    if useBE and r >= beR
+        posStop := math.min(posStop, posEntry)
+    if useTrail and r >= partialR
+        posStop := math.min(posStop, close + trailAtrM * atr)
+
+    strategy.exit("S-exit", from_entry = "S", stop = posStop, limit = posTarget)
+
+    if usePartial and not partialOn and r >= partialR
+        strategy.close("S", qty_percent = partialPct, comment = "Partial")
+        partialOn := true
+
+    if timeStopBars > 0 and barsIn >= timeStopBars and bestR < 0.2
+        strategy.close("S", comment = "Time stop")
+
+if strategy.position_size == 0
+    posStop   := na
+    posTarget := na
+    posEntry  := na
+    posRisk   := na
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+
+if takeLong
+    alert("CSMC LONG " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+         " | score " + str.tostring(longScore, "#.#") +
+         " | stop " + str.tostring(longStop, format.mintick) +
+         " | target " + str.tostring(longTarget, format.mintick), alert.freq_once_per_bar_close)
+
+if takeShort
+    alert("CSMC SHORT " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+         " | score " + str.tostring(shortScore, "#.#") +
+         " | stop " + str.tostring(shortStop, format.mintick) +
+         " | target " + str.tostring(shortTarget, format.mintick), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// VISUALS
+// =============================================================================
+
+plot(useHtf ? htfEma : na, "HTF EMA", color = htfBias == 1 ? color.new(color.teal, 0) :
+     htfBias == -1 ? color.new(color.red, 0) : color.new(color.gray, 0), linewidth = 2)
+
+plot(showLevels ? swHigh : na, "Swing high (buy-side liquidity)",
+     color = color.new(color.red, 55), style = plot.style_linebr)
+plot(showLevels ? swLow : na, "Swing low (sell-side liquidity)",
+     color = color.new(color.teal, 55), style = plot.style_linebr)
+
+plot(strategy.position_size != 0 ? posStop : na, "Active stop",
+     color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? posTarget : na, "Active target",
+     color = color.new(color.lime, 0), style = plot.style_linebr, linewidth = 2)
+
+if showZones and bullFvgOk and not na(bullFvgBar) and bullFvgBar == bar_index
+    box.new(bar_index - 2, bullFvgTop, bar_index + 8, bullFvgBot,
+         border_color = color.new(color.teal, 60), bgcolor = color.new(color.teal, 88))
+if showZones and bearFvgOk and not na(bearFvgBar) and bearFvgBar == bar_index
+    box.new(bar_index - 2, bearFvgTop, bar_index + 8, bearFvgBot,
+         border_color = color.new(color.red, 60), bgcolor = color.new(color.red, 88))
+
+plotshape(takeLong,  "Long entry",  shape.triangleup,   location.belowbar,
+     color.new(color.teal, 0), size = size.small)
+plotshape(takeShort, "Short entry", shape.triangledown, location.abovebar,
+     color.new(color.red, 0),  size = size.small)
+
+// structure event markers
+plotchar(breakUp and evKind == 3, "MSS up",   "▲", location.belowbar, color.new(color.lime, 0), size = size.tiny)
+plotchar(breakDn and evKind == 3, "MSS down", "▼", location.abovebar, color.new(color.fuchsia, 0), size = size.tiny)
+
+// =============================================================================
+// DASHBOARD
+// =============================================================================
+
+var float eqPeak = na
+eqPeak := na(eqPeak) ? strategy.equity : math.max(eqPeak, strategy.equity)
+ddNow  = eqPeak > 0 ? (eqPeak - strategy.equity) / eqPeak * 100.0 : 0.0
+var float maxDD = 0.0
+maxDD := math.max(maxDD, ddNow)
+
+var float firstClose = na
+if na(firstClose) and inWindow
+    firstClose := close
+bhPct = not na(firstClose) and firstClose > 0 ? (close / firstClose - 1.0) * 100.0 : 0.0
+netPct = strategy.initial_capital > 0 ? strategy.netprofit / strategy.initial_capital * 100.0 : 0.0
+pf     = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+winPct = strategy.closedtrades > 0 ? strategy.wintrades * 100.0 / strategy.closedtrades : 0.0
+
+var table dash = table.new(position.top_right, 2, 12, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+
+f_row(_r, _k, _v, _c) =>
+    table.cell(dash, 0, _r, _k, text_color = color.new(color.gray, 0),
+         text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dash, 1, _r, _v, text_color = _c,
+         text_size = size.tiny, text_halign = text.align_right)
+
+if showTable and barstate.islast
+    lockTxt = lockedDaily ? "DAILY LOSS" : lockedStreak ? "LOSS STREAK" :
+         lockedProfit ? "PROFIT STOP" : lockedCount ? "TRADE CAP" : "clear"
+
+    table.cell(dash, 0, 0, "CRYPTO SMC", text_color = color.new(color.white, 0), text_size = size.small)
+    table.cell(dash, 1, 0, timeframe.period + " / " + htfTf,
+         text_color = color.new(color.gray, 0), text_size = size.small, text_halign = text.align_right)
+
+    f_row(1, "HTF bias", htfBias == 1 ? "BULLISH" : htfBias == -1 ? "BEARISH" : "undefined",
+         htfBias == 1 ? color.teal : htfBias == -1 ? color.red : color.gray)
+    f_row(2, "Location", pdDiscount ? "DISCOUNT" : pdPremium ? "PREMIUM" : "equilibrium",
+         pdDiscount ? color.teal : pdPremium ? color.red : color.gray)
+    f_row(3, "Long score",  str.tostring(longScore, "#.#") + "  " +
+         (longGrade == 3 ? "A+" : longGrade == 2 ? "A" : longGrade == 1 ? "B" : "—"),
+         longGrade > 0 ? color.teal : color.gray)
+    f_row(4, "Short score", str.tostring(shortScore, "#.#") + "  " +
+         (shortGrade == 3 ? "A+" : shortGrade == 2 ? "A" : shortGrade == 1 ? "B" : "—"),
+         shortGrade > 0 ? color.red : color.gray)
+    f_row(5, "Locks", lockTxt, locked ? color.orange : color.teal)
+    f_row(6, "Day P&L", str.tostring(dayPnlPct, "#.##") + "%",
+         dayPnlPct >= 0 ? color.teal : color.red)
+    f_row(7, "Net profit", str.tostring(netPct, "#.##") + "%",
+         netPct >= 0 ? color.teal : color.red)
+    f_row(8, "Buy & hold", str.tostring(bhPct, "#.##") + "%",
+         bhPct >= 0 ? color.teal : color.red)
+    f_row(9, "Profit factor", na(pf) ? "—" : str.tostring(pf, "#.##"),
+         na(pf) ? color.gray : pf >= 1.3 ? color.teal : color.red)
+    f_row(10, "Max drawdown", str.tostring(maxDD, "#.##") + "%",
+         maxDD <= 15 ? color.teal : color.red)
+    f_row(11, "Trades / win%", str.tostring(strategy.closedtrades) + " / " +
+         str.tostring(winPct, "#.#") + "%", color.new(color.gray, 0))
