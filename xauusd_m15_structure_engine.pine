@@ -1,0 +1,1047 @@
+//@version=6
+// =============================================================================
+// XAUUSD M15 STRUCTURE ENGINE
+// -----------------------------------------------------------------------------
+// A mechanical price-action indicator for the 15-minute chart.
+//
+//   H1  = optional higher-timeframe directional context (never required)
+//   M15 = main structure, setup and signal timeframe
+//   M5  = optional trigger confirmation (last completed M5 candle only)
+//
+// DESIGN RULES HONOURED THROUGHOUT:
+//   * Indicator, not a strategy.
+//   * No repainting: every higher-timeframe read uses lookahead_off and is
+//     offset by one bar; every level used in a sweep test is read as of the
+//     PREVIOUS bar so the current bar cannot redefine the level it is sweeping.
+//   * Signals are emitted only on confirmed candle closes (barstate.isconfirmed).
+//   * No future data, no probabilities, no win rates, no claims about
+//     institutions or hidden order flow. Every rule below is arithmetic on
+//     visible candles.
+//
+// VISUAL POLICY (the reason this rewrite exists):
+//   Levels are a FIXED set of line objects that are MOVED each bar, never
+//   redrawn. Nothing accumulates. Lines are anchored to the right-hand side of
+//   the chart only, so they do not streak across history. Labels are capped and
+//   recycled. Every visual group has its own toggle and several default to off.
+// =============================================================================
+
+indicator("XAUUSD M15 Structure Engine",
+     shorttitle       = "XAU M15 SE",
+     overlay          = true,
+     max_lines_count  = 100,
+     max_labels_count = 100,
+     max_boxes_count  = 60)
+
+// =============================================================================
+// 1. INPUTS
+// =============================================================================
+
+// ---- Timeframes -------------------------------------------------------------
+gTf = "Timeframes"
+preset    = input.string("XAUUSD", "Instrument preset", options = ["XAUUSD", "BTCUSD", "Custom"], group = gTf)
+useH1     = input.bool(true,  "Use H1 directional context (optional, never required)", group = gTf)
+h1Tf      = input.timeframe("60", "H1 context timeframe", group = gTf)
+h1EmaLen  = input.int(50, "H1 context EMA length", minval = 5, group = gTf)
+confMode  = input.string("M15 only", "Entry confirmation", options = ["M15 only", "M15 + M5"], group = gTf)
+m5Tf      = input.timeframe("5", "M5 confirmation timeframe", group = gTf)
+warnTf    = input.bool(true, "Warn when chart is not M15", group = gTf)
+
+// ---- Market structure -------------------------------------------------------
+gStr = "Market structure"
+pivL      = input.int(3, "Swing pivot left",  minval = 1, maxval = 20, group = gStr)
+pivR      = input.int(3, "Swing pivot right", minval = 1, maxval = 20, group = gStr)
+atrLen    = input.int(14, "ATR length", minval = 2, group = gStr)
+breakBuf  = input.float(0.05, "Structural break buffer (ATR x)", minval = 0.0, step = 0.01, group = gStr,
+     tooltip = "A close must clear the swing by this much before bias changes. Stops one-candle bias flips.")
+erLen     = input.int(20, "Efficiency-ratio lookback", minval = 5, group = gStr)
+erTrend   = input.float(0.40, "Efficiency ratio: trending above", minval = 0.05, maxval = 1.0, step = 0.05, group = gStr)
+erChop    = input.float(0.15, "Efficiency ratio: chop below", minval = 0.01, maxval = 1.0, step = 0.01, group = gStr)
+rangeLb   = input.int(96, "Active range lookback (bars)", minval = 20, group = gStr)
+edgeFrac  = input.float(0.25, "Range edge fraction", minval = 0.05, maxval = 0.45, step = 0.05, group = gStr)
+biasMaxAge= input.int(160, "Bias expires after N bars without continuation", minval = 20, group = gStr)
+
+// ---- Sessions ---------------------------------------------------------------
+gSess = "Sessions"
+sessTz   = input.string("UTC", "Session timezone", group = gSess,
+     tooltip = "IANA name, e.g. UTC, Europe/London, America/New_York")
+asiaSess = input.session("0000-0700", "Asia session",    group = gSess)
+lonSess  = input.session("0700-1600", "London session",  group = gSess)
+nySess   = input.session("1200-2100", "New York session", group = gSess)
+
+// ---- Displacement -----------------------------------------------------------
+gDisp = "Displacement"
+dispSens   = input.float(1.0, "Displacement sensitivity", minval = 0.3, maxval = 2.0, step = 0.05, group = gDisp,
+     tooltip = "Scales every displacement threshold. Below 1 = looser, above 1 = stricter.")
+dispAtrM   = input.float(1.20, "Body >= ATR x", minval = 0.2, step = 0.05, group = gDisp)
+dispAvgM   = input.float(1.60, "Body >= average body x", minval = 0.5, step = 0.1, group = gDisp)
+dispCloseL = input.float(0.65, "Close location within candle >=", minval = 0.4, maxval = 1.0, step = 0.05, group = gDisp)
+dispRngM   = input.float(1.30, "Range >= average range x", minval = 0.5, step = 0.1, group = gDisp)
+dispAvgLen = input.int(20, "Averaging length", minval = 5, group = gDisp)
+dispNeed   = input.int(4, "Criteria required for full displacement (of 5)", minval = 2, maxval = 5, group = gDisp)
+
+// ---- Sweep detection --------------------------------------------------------
+gSw = "Sweep detection"
+swMinPen   = input.float(0.10, "Minimum wick penetration (ATR x)", minval = 0.0, step = 0.01, group = gSw)
+swMaxPen   = input.float(1.50, "Maximum wick penetration (ATR x)", minval = 0.2, step = 0.1, group = gSw,
+     tooltip = "Beyond this the level is broken, not swept.")
+swNeedBack = input.bool(true, "Require close back inside the level", group = gSw)
+swConfBars = input.int(8, "Sweep must be confirmed within N bars", minval = 1, group = gSw)
+
+// ---- Stops and targets ------------------------------------------------------
+gSt = "Stops and targets"
+stopMode  = input.string("Structure + ATR buffer", "Stop method",
+     options = ["Structure", "ATR", "Structure + ATR buffer"], group = gSt)
+stopAtrM  = input.float(0.30, "ATR buffer / ATR stop multiple", minval = 0.05, step = 0.05, group = gSt)
+minStopA  = input.float(0.35, "Minimum stop distance (ATR x)", minval = 0.05, step = 0.05, group = gSt)
+maxStopA  = input.float(3.50, "Maximum stop distance (ATR x)", minval = 0.5, step = 0.1, group = gSt)
+pipCustom = input.float(0.01, "Pip size (Custom preset)", minval = 0.00001, step = 0.001, group = gSt)
+roomCustom= input.int(800, "Minimum target room in pips (Custom preset)", minval = 1, group = gSt)
+useRunner = input.bool(true, "Show optional runner target", group = gSt)
+
+// ---- Risk to reward ---------------------------------------------------------
+gRr = "Risk to reward"
+minRrTp1 = input.float(1.0, "Minimum R:R to TP1", minval = 0.1, step = 0.1, group = gRr)
+minRrTp2 = input.float(2.0, "Minimum R:R to TP2", minval = 0.1, step = 0.1, group = gRr)
+maxDistA = input.float(1.20, "Max distance from planned entry before MISSED (ATR x)", minval = 0.2, step = 0.1, group = gRr)
+
+// ---- Volatility -------------------------------------------------------------
+gVol = "Volatility"
+volPctLen  = input.int(100, "Volatility percentile lookback", minval = 20, group = gVol)
+volCompress= input.float(20.0, "Compression below percentile", minval = 1.0, maxval = 50.0, step = 1.0, group = gVol)
+volExpand  = input.float(80.0, "Expansion above percentile", minval = 50.0, maxval = 99.0, step = 1.0, group = gVol)
+volExtreme = input.float(95.0, "Extreme above percentile", minval = 60.0, maxval = 100.0, step = 1.0, group = gVol)
+volDisBars = input.int(10, "Post-expansion disorder window (bars)", minval = 1, group = gVol)
+blockDisorder = input.bool(true, "Block signals during extreme / disorder", group = gVol)
+
+// ---- Event blackout ---------------------------------------------------------
+gEv = "Event blackout (manual)"
+evNote  = input.bool(true, "Enable manual event blackout", group = gEv,
+     tooltip = "Pine Script cannot read an economic calendar. Enter events by hand.")
+evBefore= input.int(30, "Minutes blocked before event", minval = 0, group = gEv)
+evAfter = input.int(30, "Minutes blocked after event",  minval = 0, group = gEv)
+ev1On   = input.bool(false, "Event 1", group = gEv, inline = "e1")
+ev1     = input.time(timestamp("01 Jan 2020 00:00 +0000"), "", group = gEv, inline = "e1")
+ev2On   = input.bool(false, "Event 2", group = gEv, inline = "e2")
+ev2     = input.time(timestamp("01 Jan 2020 00:00 +0000"), "", group = gEv, inline = "e2")
+ev3On   = input.bool(false, "Event 3", group = gEv, inline = "e3")
+ev3     = input.time(timestamp("01 Jan 2020 00:00 +0000"), "", group = gEv, inline = "e3")
+ev4On   = input.bool(false, "Event 4", group = gEv, inline = "e4")
+ev4     = input.time(timestamp("01 Jan 2020 00:00 +0000"), "", group = gEv, inline = "e4")
+
+// ---- Dashboard --------------------------------------------------------------
+gDash = "Dashboard"
+showDash = input.bool(true, "Show dashboard", group = gDash)
+dashPos  = input.string("Top right", "Position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = gDash)
+dashSize = input.string("Tiny", "Text size", options = ["Tiny", "Small", "Normal"], group = gDash)
+dashComp = input.bool(false, "Compact mode (key rows only)", group = gDash)
+
+// ---- Visuals ----------------------------------------------------------------
+gVis = "Visuals"
+visLevels   = input.bool(true,  "Key levels (PDH/PDL/open/range)", group = gVis)
+visSessions = input.bool(false, "Session highs and lows", group = gVis)
+visSwings   = input.bool(false, "Confirmed swing points", group = gVis)
+visBos      = input.bool(true,  "Break-of-structure labels", group = gVis)
+visSweep    = input.bool(true,  "Sweep labels", group = gVis)
+visZones    = input.bool(true,  "Support / resistance zones", group = gVis)
+visPlan     = input.bool(true,  "Entry / stop / target plan", group = gVis)
+visSignals  = input.bool(true,  "Buy / sell signal markers", group = gVis)
+lineLen     = input.int(30, "Level line length (bars)", minval = 5, maxval = 200, group = gVis,
+     tooltip = "Levels are drawn only this many bars back from the right edge, so they never streak across the chart.")
+maxLabels   = input.int(6, "Maximum structure labels kept", minval = 1, maxval = 30, group = gVis)
+
+// =============================================================================
+// 2. PRESET RESOLUTION AND CORE SERIES
+// =============================================================================
+
+pipSize     = preset == "XAUUSD" ? 0.01 : preset == "BTCUSD" ? 1.0 : pipCustom
+minRoomPips = preset == "XAUUSD" ? 800  : preset == "BTCUSD" ? 800 : roomCustom
+minRoom     = pipSize * minRoomPips
+
+atr      = ta.atr(atrLen)
+bodyAbs  = math.abs(close - open)
+rng      = high - low
+avgBody  = ta.sma(bodyAbs, dispAvgLen)
+avgRange = ta.sma(rng, dispAvgLen)
+isConf   = barstate.isconfirmed
+
+// Kaufman efficiency ratio: directional travel divided by total travel.
+erNum = math.abs(close - close[erLen])
+erDen = math.sum(math.abs(close - close[1]), erLen)
+er    = erDen > 0 ? erNum / erDen : 0.0
+
+// Volatility percentile of ATR against its own recent history.
+atrPct = ta.percentrank(atr, volPctLen)
+
+// =============================================================================
+// 3. HIGHER-TIMEFRAME CONTEXT (H1)  — non-repainting
+// =============================================================================
+// Every request.security below uses lookahead_off and reads the PREVIOUS
+// completed higher-timeframe bar, so the value can never change after the fact.
+
+h1Ema = request.security(syminfo.tickerid, h1Tf, ta.ema(close, h1EmaLen)[1],
+     lookahead = barmerge.lookahead_off)
+h1Close = request.security(syminfo.tickerid, h1Tf, close[1],
+     lookahead = barmerge.lookahead_off)
+h1Rising = request.security(syminfo.tickerid, h1Tf,
+     (ta.ema(close, h1EmaLen) > ta.ema(close, h1EmaLen)[3])[1],
+     lookahead = barmerge.lookahead_off)
+
+h1Ctx = not useH1 or na(h1Ema) or na(h1Close) ? 0 :
+     h1Close > h1Ema and h1Rising ?  1 :
+     h1Close < h1Ema and not h1Rising ? -1 : 0
+
+// ---- M5 confirmation. Read at the M15 close, where the last M5 candle has
+// also closed, so the value is final on every confirmed bar.
+m5Up = request.security(syminfo.tickerid, m5Tf,
+     close > open and (high - low) > 0 and (close - low) / (high - low) >= 0.6,
+     lookahead = barmerge.lookahead_off)
+m5Dn = request.security(syminfo.tickerid, m5Tf,
+     close < open and (high - low) > 0 and (high - close) / (high - low) >= 0.6,
+     lookahead = barmerge.lookahead_off)
+
+useM5 = confMode == "M15 + M5"
+
+// =============================================================================
+// 4. DAILY AND SESSION LEVELS
+// =============================================================================
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off)
+dOp = request.security(syminfo.tickerid, "D", open,    lookahead = barmerge.lookahead_off)
+
+// Session tracker. `var` inside a function gives each call site its own state,
+// so one function serves all three sessions. The in-session flag is computed at
+// global scope and passed in, which keeps history-referencing safe.
+f_sessTrack(_inSess) =>
+    var float hi = na
+    var float lo = na
+    if _inSess and not _inSess[1]
+        hi := high
+        lo := low
+    else if _inSess
+        hi := math.max(nz(hi, high), high)
+        lo := math.min(nz(lo, low), low)
+    [hi, lo]
+
+inAsia = not na(time(timeframe.period, asiaSess, sessTz))
+inLon  = not na(time(timeframe.period, lonSess,  sessTz))
+inNy   = not na(time(timeframe.period, nySess,   sessTz))
+
+[asiaH, asiaL] = f_sessTrack(inAsia)
+[lonH,  lonL ] = f_sessTrack(inLon)
+[nyH,   nyL  ] = f_sessTrack(inNy)
+
+// =============================================================================
+// 5. SWING STRUCTURE AND BIAS
+// =============================================================================
+
+ph = ta.pivothigh(high, pivL, pivR)
+pl = ta.pivotlow(low,  pivL, pivR)
+
+var float sh1 = na    // most recent confirmed swing high
+var float sh2 = na    // the one before it
+var float sl1 = na    // most recent confirmed swing low
+var float sl2 = na
+var int   sh1Bar = na
+var int   sl1Bar = na
+
+if not na(ph)
+    sh2    := sh1
+    sh1    := ph
+    sh1Bar := bar_index - pivR
+if not na(pl)
+    sl2    := sl1
+    sl1    := pl
+    sl1Bar := bar_index - pivR
+
+hh = not na(sh1) and not na(sh2) and sh1 > sh2
+hl = not na(sl1) and not na(sl2) and sl1 > sl2
+lh = not na(sh1) and not na(sh2) and sh1 < sh2
+ll = not na(sl1) and not na(sl2) and sl1 < sl2
+
+// ---- active range -----------------------------------------------------------
+rangeHi = ta.highest(high, rangeLb)
+rangeLo = ta.lowest(low,  rangeLb)
+rangeW  = rangeHi - rangeLo
+rangePos= rangeW > 0 ? (close - rangeLo) / rangeW : 0.5
+
+// ---- structural breaks ------------------------------------------------------
+// A break requires a CLOSE beyond a CONFIRMED swing by a buffer. One wick, or
+// one candle poking through without closing clear, never changes bias.
+var float lastBrokenHi = na
+var float lastBrokenLo = na
+
+bosUp = not na(sh1) and close > sh1 + breakBuf * atr and (na(lastBrokenHi) or sh1 != lastBrokenHi)
+bosDn = not na(sl1) and close < sl1 - breakBuf * atr and (na(lastBrokenLo) or sl1 != lastBrokenLo)
+
+var int   bias        = 0     // 1 bullish, -1 bearish, 0 balanced
+var int   biasBar     = na
+var float preserveLvl = na    // level that must hold for the bias to survive
+var float flipLvl     = na    // level whose break flips the bias
+var int   bosKind     = 0     // 1 continuation BOS, 2 change of character
+var int   bosDir      = 0
+var int   bosBar      = na
+var float bosLevel    = na
+
+if bosUp
+    bosKind      := bias >= 0 ? 1 : 2
+    bosDir       := 1
+    bosBar       := bar_index
+    bosLevel     := sh1
+    lastBrokenHi := sh1
+    preserveLvl  := sl1          // the low that produced the break
+    flipLvl      := sl1
+    bias         := 1
+    biasBar      := bar_index
+
+if bosDn
+    bosKind      := bias <= 0 ? 1 : 2
+    bosDir       := -1
+    bosBar       := bar_index
+    bosLevel     := sl1
+    lastBrokenLo := sl1
+    preserveLvl  := sh1
+    flipLvl      := sh1
+    bias         := -1
+    biasBar      := bar_index
+
+// ---- bias expiry ------------------------------------------------------------
+// Bias lapses to balanced if the preserve level breaks on a close, or if the
+// market goes this many bars without extending the structure.
+biasStale = not na(biasBar) and (bar_index - biasBar) > biasMaxAge
+if bias == 1 and not na(preserveLvl) and close < preserveLvl
+    bias := 0
+if bias == -1 and not na(preserveLvl) and close > preserveLvl
+    bias := 0
+if biasStale
+    bias := 0
+
+biasExpiryTxt = bias == 1 and not na(flipLvl) ? "close < " + str.tostring(flipLvl, format.mintick) :
+     bias == -1 and not na(flipLvl) ? "close > " + str.tostring(flipLvl, format.mintick) :
+     "awaiting confirmed break"
+
+// =============================================================================
+// 6. DISPLACEMENT
+// =============================================================================
+// Five independent, visible criteria. Sensitivity scales all thresholds.
+
+closeLocUp = rng > 0 ? (close - low) / rng : 0.0
+closeLocDn = rng > 0 ? (high - close) / rng : 0.0
+
+c1 = atr > 0 and bodyAbs >= dispAtrM * dispSens * atr
+c2 = avgBody > 0 and bodyAbs >= dispAvgM * dispSens * avgBody
+c3up = closeLocUp >= dispCloseL
+c3dn = closeLocDn >= dispCloseL
+c4up = not na(sh1) and close > sh1
+c4dn = not na(sl1) and close < sl1
+c5 = avgRange > 0 and rng >= dispRngM * dispSens * avgRange
+
+scoreUp = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3up ? 1 : 0) + (c4up ? 1 : 0) + (c5 ? 1 : 0)
+scoreDn = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3dn ? 1 : 0) + (c4dn ? 1 : 0) + (c5 ? 1 : 0)
+
+dispUp   = close > open and scoreUp >= dispNeed
+dispDn   = close < open and scoreDn >= dispNeed
+weakUp   = close > open and scoreUp >= 2 and not dispUp
+weakDn   = close < open and scoreDn >= 2 and not dispDn
+
+dispState = dispUp ? "Bullish displacement" : dispDn ? "Bearish displacement" :
+     (weakUp or weakDn) ? "Weak move" : "No displacement"
+
+// =============================================================================
+// 7. NEAREST SUPPORT AND RESISTANCE
+// =============================================================================
+// Built by scanning every tracked level. Purely mechanical: the closest level
+// below price is support, the closest above is resistance.
+
+f_below(_cur, _lvl, _px) =>
+    not na(_lvl) and _lvl < _px and (na(_cur) or _lvl > _cur) ? _lvl : _cur
+f_above(_cur, _lvl, _px) =>
+    not na(_lvl) and _lvl > _px and (na(_cur) or _lvl < _cur) ? _lvl : _cur
+
+float sup = na
+sup := f_below(sup, pdh,     close)
+sup := f_below(sup, pdl,     close)
+sup := f_below(sup, dOp,     close)
+sup := f_below(sup, asiaH,   close)
+sup := f_below(sup, asiaL,   close)
+sup := f_below(sup, lonH,    close)
+sup := f_below(sup, lonL,    close)
+sup := f_below(sup, nyH,     close)
+sup := f_below(sup, nyL,     close)
+sup := f_below(sup, sh1,     close)
+sup := f_below(sup, sl1,     close)
+sup := f_below(sup, rangeLo, close)
+
+float res = na
+res := f_above(res, pdh,     close)
+res := f_above(res, pdl,     close)
+res := f_above(res, dOp,     close)
+res := f_above(res, asiaH,   close)
+res := f_above(res, asiaL,   close)
+res := f_above(res, lonH,    close)
+res := f_above(res, lonL,    close)
+res := f_above(res, nyH,     close)
+res := f_above(res, nyL,     close)
+res := f_above(res, sh1,     close)
+res := f_above(res, sl1,     close)
+res := f_above(res, rangeHi, close)
+
+// Second level out, used for TP2.
+f_aboveFrom(_cur, _lvl, _floor) =>
+    not na(_lvl) and _lvl > _floor and (na(_cur) or _lvl < _cur) ? _lvl : _cur
+f_belowFrom(_cur, _lvl, _ceil) =>
+    not na(_lvl) and _lvl < _ceil and (na(_cur) or _lvl > _cur) ? _lvl : _cur
+
+float res2 = na
+if not na(res)
+    res2 := f_aboveFrom(res2, pdh,     res)
+    res2 := f_aboveFrom(res2, dOp,     res)
+    res2 := f_aboveFrom(res2, asiaH,   res)
+    res2 := f_aboveFrom(res2, lonH,    res)
+    res2 := f_aboveFrom(res2, nyH,     res)
+    res2 := f_aboveFrom(res2, sh1,     res)
+    res2 := f_aboveFrom(res2, rangeHi, res)
+
+float sup2 = na
+if not na(sup)
+    sup2 := f_belowFrom(sup2, pdl,     sup)
+    sup2 := f_belowFrom(sup2, dOp,     sup)
+    sup2 := f_belowFrom(sup2, asiaL,   sup)
+    sup2 := f_belowFrom(sup2, lonL,    sup)
+    sup2 := f_belowFrom(sup2, nyL,     sup)
+    sup2 := f_belowFrom(sup2, sl1,     sup)
+    sup2 := f_belowFrom(sup2, rangeLo, sup)
+
+// =============================================================================
+// 8. RANGE LOCATION FILTER
+// =============================================================================
+
+locOutside = rangePos > 1.0 or rangePos < 0.0
+locUpper   = not locOutside and rangePos >= 1.0 - edgeFrac
+locLower   = not locOutside and rangePos <= edgeFrac
+locMiddle  = not locOutside and not locUpper and not locLower
+
+locTxt = locOutside ? "Outside range" : locUpper ? "Upper edge" :
+     locLower ? "Lower edge" : "Middle of range"
+
+// =============================================================================
+// 9. VOLATILITY STATE AND EVENT BLACKOUT
+// =============================================================================
+
+volCompressed = atrPct <= volCompress
+volExpanded   = atrPct >= volExpand and atrPct < volExtreme
+volIsExtreme  = atrPct >= volExtreme
+volDisorder   = not volIsExtreme and ta.highest(atrPct, volDisBars) >= volExtreme and er < erChop
+
+volTxt = volIsExtreme ? "Extreme volatility" : volDisorder ? "Post-expansion disorder" :
+     volExpanded ? "Expansion" : volCompressed ? "Compression" : "Normal"
+
+f_inBlackout(_on, _t) =>
+    _on and evNote and not na(_t) and
+     time >= _t - evBefore * 60000 and time <= _t + evAfter * 60000
+
+eventBlock = f_inBlackout(ev1On, ev1) or f_inBlackout(ev2On, ev2) or
+     f_inBlackout(ev3On, ev3) or f_inBlackout(ev4On, ev4)
+
+disorderBlock = blockDisorder and (volIsExtreme or volDisorder)
+
+// =============================================================================
+// 10. MARKET REGIME
+// =============================================================================
+// Evaluated as a priority chain so exactly one label always applies.
+
+bosRecent   = not na(bosBar) and (bar_index - bosBar) <= 10
+failedBreak = not na(bosBar) and (bar_index - bosBar) <= 10 and not na(bosLevel) and
+     ((bosDir == 1 and close < bosLevel) or (bosDir == -1 and close > bosLevel))
+
+extendedUp = not na(sl1) and atr > 0 and (close - sl1) / atr > 6.0
+extendedDn = not na(sh1) and atr > 0 and (sh1 - close) / atr > 6.0
+exhaustion = (extendedUp or extendedDn) and rng < avgRange and er < erTrend
+
+regime = eventBlock ? "Event risk" :
+     volIsExtreme ? "Volatility expansion" :
+     volDisorder ? "Unstructured chop" :
+     failedBreak ? "Failed breakout" :
+     exhaustion ? "Exhaustion" :
+     volCompressed ? "Compression" :
+     er < erChop ? "Unstructured chop" :
+     bosRecent and bias == 1 and close > nz(bosLevel, close) ? "Breakout continuation" :
+     bosRecent and bias == -1 and close < nz(bosLevel, close) ? "Breakout continuation" :
+     bias == 1 and hh and hl and er >= erTrend ? "Bullish trend" :
+     bias == -1 and lh and ll and er >= erTrend ? "Bearish trend" :
+     "Balanced range"
+
+// =============================================================================
+// 11. LIQUIDITY SWEEPS
+// =============================================================================
+// A sweep needs a MEANINGFUL level, a minimum wick penetration that is not so
+// deep the level is simply broken, and a close back inside. Levels are read as
+// of the PREVIOUS bar so the current candle cannot move the level it sweeps.
+
+f_sweepDown(_lvl) =>
+    // price trades below the level and closes back above it
+    not na(_lvl) and low < _lvl - swMinPen * atr and low >= _lvl - swMaxPen * atr and
+     (not swNeedBack or close > _lvl) and low[1] >= _lvl
+f_sweepUp(_lvl) =>
+    not na(_lvl) and high > _lvl + swMinPen * atr and high <= _lvl + swMaxPen * atr and
+     (not swNeedBack or close < _lvl) and high[1] <= _lvl
+
+// previous-bar values of every sweepable level
+pSl1 = sl1[1]
+pSh1 = sh1[1]
+pPdl = pdl[1]
+pPdh = pdh[1]
+pAsL = asiaL[1]
+pAsH = asiaH[1]
+pLoL = lonL[1]
+pLoH = lonH[1]
+pNyL = nyL[1]
+pNyH = nyH[1]
+pRgL = rangeLo[1]
+pRgH = rangeHi[1]
+
+swDn1 = f_sweepDown(pSl1)
+swDn2 = f_sweepDown(pPdl)
+swDn3 = f_sweepDown(pAsL)
+swDn4 = f_sweepDown(pLoL)
+swDn5 = f_sweepDown(pNyL)
+swDn6 = f_sweepDown(pRgL)
+
+swUp1 = f_sweepUp(pSh1)
+swUp2 = f_sweepUp(pPdh)
+swUp3 = f_sweepUp(pAsH)
+swUp4 = f_sweepUp(pLoH)
+swUp5 = f_sweepUp(pNyH)
+swUp6 = f_sweepUp(pRgH)
+
+sweepBull = swDn1 or swDn2 or swDn3 or swDn4 or swDn5 or swDn6   // swept lows, bullish
+sweepBear = swUp1 or swUp2 or swUp3 or swUp4 or swUp5 or swUp6   // swept highs, bearish
+
+sweepBullName = swDn2 ? "PDL" : swDn6 ? "range low" : swDn3 ? "Asia low" :
+     swDn4 ? "London low" : swDn5 ? "NY low" : swDn1 ? "swing low" : ""
+sweepBearName = swUp2 ? "PDH" : swUp6 ? "range high" : swUp3 ? "Asia high" :
+     swUp4 ? "London high" : swUp5 ? "NY high" : swUp1 ? "swing high" : ""
+
+var int   sweepDir  = 0
+var int   sweepBar  = na
+var float sweepWick = na
+var string sweepLvlName = ""
+
+if sweepBull
+    sweepDir  := 1
+    sweepBar  := bar_index
+    sweepWick := low
+    sweepLvlName := sweepBullName
+if sweepBear
+    sweepDir  := -1
+    sweepBar  := bar_index
+    sweepWick := high
+    sweepLvlName := sweepBearName
+
+sweepFresh = not na(sweepBar) and (bar_index - sweepBar) <= swConfBars
+
+// =============================================================================
+// 12. SETUP DETECTION AND STATE MACHINE
+// =============================================================================
+// States advance at most one step per bar, so the engine can never jump from
+// "approaching level" straight to "entry live".
+//
+//  0 No setup                 6 Retracement pending
+//  1 Approaching level        7 Entry live
+//  2 Sweep / rejection        8 Entry missed
+//  3 Displacement forming     9 Invalidated
+//  4 Confirmation pending    10 Trade active
+//  5 BOS confirmed           11 Disorderly / no trade
+
+var int   st        = 0
+var int   stDir     = 0
+var int   stType    = 0     // 1 trend pullback, 2 breakout+retest, 3 sweep+reversal
+var int   stBar     = na
+var float pEntry    = na
+var float pStop     = na
+var float pTp1      = na
+var float pTp2      = na
+var float pRunner   = na
+var float pRisk     = na
+var int   pGrade    = 0
+var float refLevel  = na    // the level the setup is built around
+var bool  tp1Hit    = false
+var bool  tp2Hit    = false
+
+// ---- proximity to a tradable level -----------------------------------------
+nearSup = not na(sup) and atr > 0 and math.abs(close - sup) <= 1.0 * atr
+nearRes = not na(res) and atr > 0 and math.abs(close - res) <= 1.0 * atr
+
+// ---- candidate direction ----------------------------------------------------
+// Longs are allowed on a bullish bias, or on a confirmed bullish reversal
+// (a fresh sweep of lows plus a change-of-character break).
+choBull = bosDir == 1 and bosKind == 2 and not na(bosBar) and (bar_index - bosBar) <= swConfBars
+choBear = bosDir == -1 and bosKind == 2 and not na(bosBar) and (bar_index - bosBar) <= swConfBars
+
+longAllowed  = bias == 1 or choBull or (sweepFresh and sweepDir == 1)
+shortAllowed = bias == -1 or choBear or (sweepFresh and sweepDir == -1)
+
+// ---- setup type detection ---------------------------------------------------
+// A. trend pullback: with bias, price returns to the edge of the range near a
+//    level and rejects.
+pullLong  = bias == 1 and (locLower or locOutside) and nearSup
+pullShort = bias == -1 and (locUpper or locOutside) and nearRes
+
+// B. breakout and retest: a confirmed displaced close beyond a level, then a
+//    return to that level which holds.
+var float brkLevel = na
+var int   brkBar   = na
+var int   brkDir   = 0
+if dispUp and not na(res) and close > res
+    brkLevel := res
+    brkBar   := bar_index
+    brkDir   := 1
+if dispDn and not na(sup) and close < sup
+    brkLevel := sup
+    brkBar   := bar_index
+    brkDir   := -1
+brkFresh   = not na(brkBar) and (bar_index - brkBar) <= 20
+retestLong = brkFresh and brkDir == 1 and not na(brkLevel) and low <= brkLevel + 0.3 * atr and close > brkLevel
+retestShort= brkFresh and brkDir == -1 and not na(brkLevel) and high >= brkLevel - 0.3 * atr and close < brkLevel
+
+// C. sweep and reversal
+revLong  = sweepFresh and sweepDir == 1 and dispUp
+revShort = sweepFresh and sweepDir == -1 and dispDn
+
+// ---- approach detection -----------------------------------------------------
+approachLong  = (pullLong or (brkFresh and brkDir == 1) or (sweepFresh and sweepDir == 1)) and longAllowed
+approachShort = (pullShort or (brkFresh and brkDir == -1) or (sweepFresh and sweepDir == -1)) and shortAllowed
+
+// ---- stop / target construction --------------------------------------------
+f_stopLong(_anchor) =>
+    float s = stopMode == "ATR" ? close - stopAtrM * atr :
+         stopMode == "Structure" ? _anchor :
+         _anchor - stopAtrM * atr
+    s
+f_stopShort(_anchor) =>
+    float s = stopMode == "ATR" ? close + stopAtrM * atr :
+         stopMode == "Structure" ? _anchor :
+         _anchor + stopAtrM * atr
+    s
+
+// ---- state machine ----------------------------------------------------------
+// Everything below only advances on a confirmed bar close.
+if isConf
+    // hard blocks take precedence and reset the machine
+    if eventBlock or disorderBlock
+        st := 11
+        stDir := 0
+        stType := 0
+    else
+        if st == 11
+            st := 0
+
+        // ---------------- invalidation checks (any active state) -------------
+        if st >= 1 and st <= 7
+            bool inval = false
+            if stDir == 1
+                inval := (not na(refLevel) and close < refLevel - 0.5 * atr) or bias == -1 or
+                     (not na(pStop) and close < pStop)
+            if stDir == -1
+                inval := (not na(refLevel) and close > refLevel + 0.5 * atr) or bias == 1 or
+                     (not na(pStop) and close > pStop)
+            if inval
+                st := 9
+                stBar := bar_index      // hold the label long enough to be seen
+
+        // ---------------- missed checks --------------------------------------
+        if (st == 5 or st == 6) and not na(pEntry) and atr > 0
+            bool missed = math.abs(close - pEntry) > maxDistA * atr
+            if stDir == 1 and not na(pTp1) and high >= pTp1
+                missed := true
+            if stDir == -1 and not na(pTp1) and low <= pTp1
+                missed := true
+            if missed
+                st := 8
+                stBar := bar_index
+
+        // ---------------- forward transitions, one step per bar --------------
+        if st == 0
+            if approachLong
+                st := 1
+                stDir := 1
+                stType := revLong ? 3 : retestLong or brkFresh ? 2 : 1
+                stBar := bar_index
+                refLevel := nz(sup, close)
+            else if approachShort
+                st := 1
+                stDir := -1
+                stType := revShort ? 3 : retestShort or brkFresh ? 2 : 1
+                stBar := bar_index
+                refLevel := nz(res, close)
+
+        else if st == 1
+            // sweep or rejection at the level
+            bool rej = stDir == 1 ? (sweepBull or (close > open and closeLocUp >= 0.6 and nearSup)) :
+                 (sweepBear or (close < open and closeLocDn >= 0.6 and nearRes))
+            if rej
+                st := 2
+                if stDir == 1 and sweepBull
+                    refLevel := nz(sweepWick, refLevel)
+                if stDir == -1 and sweepBear
+                    refLevel := nz(sweepWick, refLevel)
+
+        else if st == 2
+            if (stDir == 1 and (dispUp or weakUp)) or (stDir == -1 and (dispDn or weakDn))
+                st := 3
+
+        else if st == 3
+            if (stDir == 1 and dispUp) or (stDir == -1 and dispDn)
+                st := 4
+
+        else if st == 4
+            if (stDir == 1 and bosUp) or (stDir == -1 and bosDn)
+                st := 5
+                // build the plan the moment structure confirms
+                float anchor = stDir == 1 ?
+                     math.min(nz(sweepWick, low), low) : math.max(nz(sweepWick, high), high)
+                float rawStop = stDir == 1 ? f_stopLong(anchor) : f_stopShort(anchor)
+                float dist = math.abs(close - rawStop)
+                dist := math.max(dist, minStopA * atr)
+                dist := math.min(dist, maxStopA * atr)
+                pEntry := close
+                pStop  := stDir == 1 ? close - dist : close + dist
+                pRisk  := dist
+                pTp1   := stDir == 1 ? nz(res, close + 2 * dist) : nz(sup, close - 2 * dist)
+                pTp2   := stDir == 1 ? nz(res2, close + 4 * dist) : nz(sup2, close - 4 * dist)
+                pRunner := useRunner ? (stDir == 1 ? nz(pdh, na) : nz(pdl, na)) : na
+                tp1Hit := false
+                tp2Hit := false
+
+        else if st == 5
+            st := 6      // await the retracement / retest
+
+        else if st == 6
+            bool holds = stDir == 1 ?
+                 (close > nz(refLevel, close) and (close > open) and (not useM5 or m5Up)) :
+                 (close < nz(refLevel, close) and (close < open) and (not useM5 or m5Dn))
+            if holds
+                st := 7
+
+        else if st == 7
+            st := 10
+
+        else if st == 10
+            if stDir == 1
+                if not na(pTp1) and high >= pTp1
+                    tp1Hit := true
+                if not na(pTp2) and high >= pTp2
+                    tp2Hit := true
+                if (not na(pStop) and low <= pStop) or tp2Hit
+                    st := 0
+                    stDir := 0
+                    stType := 0
+            if stDir == -1
+                if not na(pTp1) and low <= pTp1
+                    tp1Hit := true
+                if not na(pTp2) and low <= pTp2
+                    tp2Hit := true
+                if (not na(pStop) and high >= pStop) or tp2Hit
+                    st := 0
+                    stDir := 0
+                    stType := 0
+
+        else if st == 8 or st == 9
+            // hold the label for one bar, then clear
+            if not na(stBar) and bar_index - stBar > 1
+                st := 0
+                stDir := 0
+                stType := 0
+                pEntry := na
+                pStop := na
+                pTp1 := na
+                pTp2 := na
+                pRunner := na
+
+stTxt = st == 0 ? "No setup" : st == 1 ? "Approaching level" : st == 2 ? "Sweep / rejection attempt" :
+     st == 3 ? "Displacement forming" : st == 4 ? "Structure confirmation pending" :
+     st == 5 ? "BOS confirmed" : st == 6 ? "Retracement pending" : st == 7 ? "Entry live" :
+     st == 8 ? "Entry missed" : st == 9 ? "Invalidated" : st == 10 ? "Trade active" :
+     "Disorderly / no trade"
+
+typeTxt = stType == 1 ? "Trend pullback" : stType == 2 ? "Breakout and retest" :
+     stType == 3 ? "Sweep and reversal" : "-"
+
+// =============================================================================
+// 13. RISK TO REWARD AND GRADING
+// =============================================================================
+
+rr1 = not na(pTp1) and not na(pEntry) and nz(pRisk) > 0 ? math.abs(pTp1 - pEntry) / pRisk : na
+rr2 = not na(pTp2) and not na(pEntry) and nz(pRisk) > 0 ? math.abs(pTp2 - pEntry) / pRisk : na
+
+roomToTgt = stDir == 1 and not na(res) ? res - close :
+     stDir == -1 and not na(sup) ? close - sup : na
+roomOk = not na(roomToTgt) and roomToTgt >= minRoom
+
+rrOk = not na(rr1) and not na(rr2) and rr1 >= minRrTp1 and rr2 >= minRrTp2
+
+// Grade is assessed while a plan exists. It never becomes a probability.
+goodLoc  = stDir == 1 ? (locLower or locOutside) : stDir == -1 ? (locUpper or locOutside) : false
+cleanMkt = er >= erChop and not volIsExtreme and not volDisorder and not eventBlock
+strongStruct = (stDir == 1 and bias == 1) or (stDir == -1 and bias == -1)
+hadDisp  = stType == 2 or stType == 3 or (stDir == 1 and dispUp) or (stDir == -1 and dispDn)
+
+int gradeRaw = 0
+if st >= 5 and st <= 10
+    weaknesses = (goodLoc ? 0 : 1) + (cleanMkt ? 0 : 1) + (strongStruct ? 0 : 1) +
+         (roomOk ? 0 : 1) + (rrOk ? 0 : 1) + (hadDisp ? 0 : 1)
+    gradeRaw := weaknesses == 0 ? 3 : weaknesses == 1 ? 2 : weaknesses <= 3 ? 1 : 0
+
+// Hard rejects, regardless of the count above.
+hardReject = (locMiddle and stType != 2) or st == 8 or st == 9 or st == 11 or
+     eventBlock or disorderBlock or not rrOk or not roomOk or er < erChop
+if hardReject
+    gradeRaw := 0
+
+pGrade := gradeRaw
+gradeTxt = gradeRaw == 3 ? "A" : gradeRaw == 2 ? "B" : gradeRaw == 1 ? "C" : "REJECT"
+
+// =============================================================================
+// 14. SIGNALS
+// =============================================================================
+// Only A and B grades produce a BUY or SELL marker. C shows as a weak setup.
+
+entryLive = st == 7 and isConf
+longSignal  = entryLive and stDir == 1  and gradeRaw >= 2
+shortSignal = entryLive and stDir == -1 and gradeRaw >= 2
+weakSignal  = entryLive and gradeRaw == 1
+
+decision = eventBlock ? "NO TRADE" : disorderBlock ? "NO TRADE" :
+     st == 8 ? "MISSED" : st == 9 ? "INVALIDATED" :
+     longSignal ? "LONG" : shortSignal ? "SHORT" :
+     st == 10 ? "WAIT" : st >= 1 and st <= 7 ? "WAIT" :
+     gradeRaw == 0 and st == 0 ? "NO TRADE" : "WAIT"
+
+// =============================================================================
+// 15. VISUALS — fixed objects that are MOVED, never accumulated
+// =============================================================================
+
+xL = bar_index - lineLen
+xR = bar_index + 5
+
+// Hidden objects are made fully transparent rather than moved to na
+// coordinates, because na is not a valid x for line/box/label setters.
+color INVIS = color.new(color.black, 100)
+
+C_PDH  = color.new(color.orange, 30)
+C_OPEN = color.new(color.silver, 40)
+C_RNG  = color.new(color.gray, 45)
+C_SWH  = color.new(color.red, 50)
+C_SWL  = color.new(color.teal, 50)
+C_ASIA = color.new(color.aqua, 60)
+C_LON  = color.new(color.blue, 60)
+C_NY   = color.new(color.purple, 60)
+
+// One line object per level, created once and repositioned every bar.
+f_mkline(_col, _style, _width) =>
+    line.new(bar_index, close, bar_index, close,
+         color = _col, style = _style, width = _width, extend = extend.none)
+
+var line lnPdh  = f_mkline(C_PDH,  line.style_solid,  1)
+var line lnPdl  = f_mkline(C_PDH,  line.style_solid,  1)
+var line lnOpen = f_mkline(C_OPEN, line.style_dotted, 1)
+var line lnRgH  = f_mkline(C_RNG,  line.style_dashed, 1)
+var line lnRgL  = f_mkline(C_RNG,  line.style_dashed, 1)
+var line lnSwH  = f_mkline(C_SWH,  line.style_dotted, 1)
+var line lnSwL  = f_mkline(C_SWL,  line.style_dotted, 1)
+var line lnAsH  = f_mkline(C_ASIA, line.style_dotted, 1)
+var line lnAsL  = f_mkline(C_ASIA, line.style_dotted, 1)
+var line lnLoH  = f_mkline(C_LON,  line.style_dotted, 1)
+var line lnLoL  = f_mkline(C_LON,  line.style_dotted, 1)
+var line lnNyH  = f_mkline(C_NY,   line.style_dotted, 1)
+var line lnNyL  = f_mkline(C_NY,   line.style_dotted, 1)
+
+f_place(_ln, _px, _on, _col) =>
+    bool ok = _on and not na(_px)
+    float y = ok ? _px : close
+    line.set_xy1(_ln, xL, y)
+    line.set_xy2(_ln, xR, y)
+    line.set_color(_ln, ok ? _col : INVIS)
+
+f_place(lnPdh,  pdh,     visLevels,   C_PDH)
+f_place(lnPdl,  pdl,     visLevels,   C_PDH)
+f_place(lnOpen, dOp,     visLevels,   C_OPEN)
+f_place(lnRgH,  rangeHi, visLevels,   C_RNG)
+f_place(lnRgL,  rangeLo, visLevels,   C_RNG)
+f_place(lnSwH,  sh1,     visLevels,   C_SWH)
+f_place(lnSwL,  sl1,     visLevels,   C_SWL)
+f_place(lnAsH,  asiaH,   visSessions, C_ASIA)
+f_place(lnAsL,  asiaL,   visSessions, C_ASIA)
+f_place(lnLoH,  lonH,    visSessions, C_LON)
+f_place(lnLoL,  lonL,    visSessions, C_LON)
+f_place(lnNyH,  nyH,     visSessions, C_NY)
+f_place(lnNyL,  nyL,     visSessions, C_NY)
+
+// ---- support / resistance zones (two boxes, repositioned) -------------------
+var box bxSup = box.new(bar_index, close, bar_index, close,
+     border_color = INVIS, bgcolor = INVIS)
+var box bxRes = box.new(bar_index, close, bar_index, close,
+     border_color = INVIS, bgcolor = INVIS)
+
+supZoneOn = visZones and not na(sup)
+box.set_lefttop(bxSup, xL, supZoneOn ? sup + 0.15 * atr : close)
+box.set_rightbottom(bxSup, xR, supZoneOn ? sup - 0.15 * atr : close)
+box.set_border_color(bxSup, supZoneOn ? color.new(color.teal, 70) : INVIS)
+box.set_bgcolor(bxSup, supZoneOn ? color.new(color.teal, 90) : INVIS)
+
+resZoneOn = visZones and not na(res)
+box.set_lefttop(bxRes, xL, resZoneOn ? res + 0.15 * atr : close)
+box.set_rightbottom(bxRes, xR, resZoneOn ? res - 0.15 * atr : close)
+box.set_border_color(bxRes, resZoneOn ? color.new(color.red, 70) : INVIS)
+box.set_bgcolor(bxRes, resZoneOn ? color.new(color.red, 90) : INVIS)
+
+// ---- trade plan (four lines + one label, repositioned) ----------------------
+C_ENT = color.new(color.white, 20)
+C_STP = color.new(color.red, 0)
+C_TP1 = color.new(color.lime, 35)
+C_TP2 = color.new(color.lime, 0)
+
+var line lnEnt = f_mkline(C_ENT, line.style_dashed, 1)
+var line lnStp = f_mkline(C_STP, line.style_solid,  2)
+var line lnT1  = f_mkline(C_TP1, line.style_dotted, 1)
+var line lnT2  = f_mkline(C_TP2, line.style_solid,  2)
+var label lbPlan = label.new(bar_index, close, "", style = label.style_label_left,
+     color = INVIS, textcolor = INVIS, size = size.small, textalign = text.align_left)
+
+planVisible = visPlan and st >= 5 and st <= 10 and not na(pEntry) and not na(pStop)
+
+f_place(lnEnt, pEntry, planVisible, C_ENT)
+f_place(lnStp, pStop,  planVisible, C_STP)
+f_place(lnT1,  pTp1,   planVisible, C_TP1)
+f_place(lnT2,  pTp2,   planVisible, C_TP2)
+
+label.set_xy(lbPlan, xR, planVisible ? pEntry : close)
+label.set_text(lbPlan, not planVisible ? "" :
+     (stDir == 1 ? "LONG " : "SHORT ") + typeTxt + "  [" + gradeTxt + "]" +
+     "\n" + stTxt +
+     "\nentry " + str.tostring(pEntry, format.mintick) +
+     "\nstop  " + str.tostring(pStop, format.mintick) +
+     "\nTP1   " + str.tostring(pTp1, format.mintick) + (na(rr1) ? "" : "  " + str.tostring(rr1, "#.##") + "R") +
+     "\nTP2   " + str.tostring(pTp2, format.mintick) + (na(rr2) ? "" : "  " + str.tostring(rr2, "#.##") + "R"))
+label.set_color(lbPlan, planVisible ? color.new(color.black, 25) : INVIS)
+label.set_textcolor(lbPlan, not planVisible ? INVIS : stDir == 1 ? color.teal : color.red)
+
+// ---- structure labels, capped and recycled ----------------------------------
+var array<label> lblPool = array.new<label>()
+
+f_pushLabel(_x, _y, _txt, _col, _style) =>
+    lb = label.new(_x, _y, _txt, style = _style, color = color.new(color.black, 100),
+         textcolor = _col, size = size.tiny)
+    array.push(lblPool, lb)
+    if array.size(lblPool) > maxLabels
+        label.delete(array.shift(lblPool))
+
+if visBos and isConf and (bosUp or bosDn)
+    f_pushLabel(bar_index, bosUp ? low : high,
+         bosKind == 2 ? "CHoCH" : "BOS",
+         bosUp ? color.teal : color.red,
+         bosUp ? label.style_label_up : label.style_label_down)
+
+if visSweep and isConf and (sweepBull or sweepBear)
+    f_pushLabel(bar_index, sweepBull ? low : high,
+         "sweep " + (sweepBull ? sweepBullName : sweepBearName),
+         color.new(color.yellow, 0),
+         sweepBull ? label.style_label_up : label.style_label_down)
+
+// ---- swing dots and signal markers ------------------------------------------
+plotshape(visSwings and not na(ph) ? high[pivR] : na, "Swing high", shape.circle,
+     location.absolute, color.new(color.red, 40), offset = -pivR, size = size.tiny)
+plotshape(visSwings and not na(pl) ? low[pivR] : na, "Swing low", shape.circle,
+     location.absolute, color.new(color.teal, 40), offset = -pivR, size = size.tiny)
+
+plotshape(visSignals and longSignal,  "BUY",  shape.labelup,   location.belowbar,
+     color.new(color.teal, 0), text = "BUY",  textcolor = color.white, size = size.small)
+plotshape(visSignals and shortSignal, "SELL", shape.labeldown, location.abovebar,
+     color.new(color.red, 0),  text = "SELL", textcolor = color.white, size = size.small)
+plotshape(visSignals and weakSignal,  "Weak setup", shape.diamond, location.belowbar,
+     color.new(color.gray, 30), size = size.tiny)
+
+// =============================================================================
+// 16. DASHBOARD
+// =============================================================================
+
+dPos = dashPos == "Top left" ? position.top_left :
+     dashPos == "Bottom right" ? position.bottom_right :
+     dashPos == "Bottom left" ? position.bottom_left :
+     dashPos == "Middle right" ? position.middle_right : position.top_right
+dSz  = dashSize == "Small" ? size.small : dashSize == "Normal" ? size.normal : size.tiny
+
+var table dash = table.new(dPos, 2, 23, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+
+f_cell(_r, _k, _v, _c) =>
+    table.cell(dash, 0, _r, _k, text_color = color.new(color.gray, 0),
+         text_size = dSz, text_halign = text.align_left)
+    table.cell(dash, 1, _r, _v, text_color = _c, text_size = dSz,
+         text_halign = text.align_right)
+
+f_num(_v) => na(_v) ? "-" : str.tostring(_v, format.mintick)
+
+wrongTf = warnTf and timeframe.period != "15"
+
+if showDash and barstate.islast
+    color decCol = decision == "LONG" ? color.teal : decision == "SHORT" ? color.red :
+         decision == "WAIT" ? color.new(color.yellow, 0) : color.new(color.gray, 0)
+    color grCol = gradeRaw == 3 ? color.teal : gradeRaw == 2 ? color.new(color.lime, 20) :
+         gradeRaw == 1 ? color.new(color.orange, 0) : color.new(color.gray, 20)
+
+    table.cell(dash, 0, 0, "XAU M15 SE", text_color = color.white, text_size = dSz)
+    table.cell(dash, 1, 0, syminfo.ticker + " " + timeframe.period,
+         text_color = wrongTf ? color.orange : color.new(color.gray, 0),
+         text_size = dSz, text_halign = text.align_right)
+
+    f_cell(1, "Chart timeframe", wrongTf ? timeframe.period + " (expects 15)" : timeframe.period,
+         wrongTf ? color.orange : color.new(color.gray, 0))
+    f_cell(2, "H1 context", not useH1 ? "off" : h1Ctx == 1 ? "Bullish" : h1Ctx == -1 ? "Bearish" : "Neutral",
+         h1Ctx == 1 ? color.teal : h1Ctx == -1 ? color.red : color.gray)
+    f_cell(3, "M15 bias", bias == 1 ? "Bullish" : bias == -1 ? "Bearish" : "Balanced",
+         bias == 1 ? color.teal : bias == -1 ? color.red : color.gray)
+    f_cell(4, "Market regime", regime, color.new(color.gray, 0))
+    f_cell(5, "Setup type", typeTxt, color.new(color.gray, 0))
+    f_cell(6, "Setup state", stTxt, st == 7 ? color.teal : st >= 8 and st <= 9 ? color.orange : color.new(color.gray, 0))
+    f_cell(7, "Setup grade", gradeTxt, grCol)
+    f_cell(8, "Price location", locTxt, locMiddle ? color.orange : color.teal)
+
+    if not dashComp
+        f_cell(9,  "Preserve level", f_num(preserveLvl), color.new(color.gray, 0))
+        f_cell(10, "Bias flip level", f_num(flipLvl), color.new(color.gray, 0))
+        f_cell(11, "Bias expiry", biasExpiryTxt, color.new(color.gray, 0))
+        f_cell(12, "Nearest support", f_num(sup), color.teal)
+        f_cell(13, "Nearest resistance", f_num(res), color.red)
+        f_cell(14, "Displacement", dispState,
+             dispUp ? color.teal : dispDn ? color.red : color.gray)
+        f_cell(15, "Last sweep", sweepFresh ? (sweepDir == 1 ? "low: " : "high: ") + sweepLvlName : "-",
+             sweepFresh ? color.new(color.yellow, 0) : color.gray)
+
+    f_cell(16, "Entry", f_num(pEntry), color.white)
+    f_cell(17, "Stop",  f_num(pStop),  color.red)
+    f_cell(18, "TP1",   f_num(pTp1) + (na(rr1) ? "" : "  " + str.tostring(rr1, "#.##") + "R"), color.teal)
+    f_cell(19, "TP2",   f_num(pTp2) + (na(rr2) ? "" : "  " + str.tostring(rr2, "#.##") + "R"), color.teal)
+    f_cell(20, "M5 confirmation", not useM5 ? "off" : m5Up ? "Bullish" : m5Dn ? "Bearish" : "none",
+         not useM5 ? color.gray : m5Up ? color.teal : m5Dn ? color.red : color.gray)
+    f_cell(21, "Volatility / event", volTxt + (eventBlock ? " | EVENT RISK" : ""),
+         eventBlock ? color.orange : volIsExtreme or volDisorder ? color.orange : color.teal)
+    f_cell(22, "DECISION", eventBlock ? "EVENT RISK — NO TRADE" : decision, decCol)
+
+// =============================================================================
+// 17. ALERTS
+// =============================================================================
+// Every alert except "approaching" is gated on a confirmed close.
+
+alertcondition(st == 1 and stDir == 1,  "Long setup approaching",  "Long setup approaching a level")
+alertcondition(st == 1 and stDir == -1, "Short setup approaching", "Short setup approaching a level")
+alertcondition(longSignal,  "Long entry live",  "XAU M15: long entry live")
+alertcondition(shortSignal, "Short entry live", "XAU M15: short entry live")
+alertcondition(st == 8 and isConf, "Setup missed",      "XAU M15: setup missed")
+alertcondition(st == 9 and isConf, "Setup invalidated", "XAU M15: setup invalidated")
+alertcondition(tp1Hit and not tp1Hit[1], "TP1 reached", "XAU M15: TP1 reached")
+alertcondition(tp2Hit and not tp2Hit[1], "TP2 reached", "XAU M15: TP2 reached")
+alertcondition(bias != bias[1] and isConf, "Bias flipped", "XAU M15: bias flipped")
+alertcondition(volIsExtreme and not volIsExtreme[1], "Extreme volatility", "XAU M15: extreme volatility")
+alertcondition(eventBlock and not eventBlock[1], "Event blackout active", "XAU M15: event blackout active")
