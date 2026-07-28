@@ -34,6 +34,7 @@ strategy("M15 SMC Strategy Tester",
      slippage                = 5,
      process_orders_on_close = true,
      calc_on_every_tick      = false,
+     max_bars_back           = 1000,
      max_labels_count        = 50,
      max_lines_count         = 20)
 
@@ -172,31 +173,28 @@ minRoom = roomMode == "ATR" ? roomAtr * atr : roomPips * pipSize
 // HIGHER-TIMEFRAME CONTEXT (non-repainting: previous completed HTF bar)
 // =============================================================================
 
-h1Ema = request.security(syminfo.tickerid, h1Tf, ta.ema(close, h1EmaLen)[1],
-     lookahead = barmerge.lookahead_off)
-h1Cl = request.security(syminfo.tickerid, h1Tf, close[1],
-     lookahead = barmerge.lookahead_off)
-h1Up = request.security(syminfo.tickerid, h1Tf,
-     (ta.ema(close, h1EmaLen) > ta.ema(close, h1EmaLen)[3])[1],
+// Each context is fetched in ONE call returning a tuple. Eight separate
+// request.security() calls is a common cause of a strategy failing to render.
+[h1Ema, h1Cl, h1Up] = request.security(syminfo.tickerid, h1Tf,
+     [ta.ema(close, h1EmaLen)[1],
+      close[1],
+      (ta.ema(close, h1EmaLen) > ta.ema(close, h1EmaLen)[3])[1]],
      lookahead = barmerge.lookahead_off)
 
 h1Ctx = na(h1Ema) or na(h1Cl) ? 0 : h1Cl > h1Ema and h1Up ? 1 :
      h1Cl < h1Ema and not h1Up ? -1 : 0
 
-m5Up = request.security(syminfo.tickerid, m5Tf,
-     close > open and (high - low) > 0 and (close - low) / (high - low) >= 0.6,
-     lookahead = barmerge.lookahead_off)
-m5Dn = request.security(syminfo.tickerid, m5Tf,
-     close < open and (high - low) > 0 and (high - close) / (high - low) >= 0.6,
+[m5Up, m5Dn] = request.security(syminfo.tickerid, m5Tf,
+     [close > open and (high - low) > 0 and (close - low) / (high - low) >= 0.6,
+      close < open and (high - low) > 0 and (high - close) / (high - low) >= 0.6],
      lookahead = barmerge.lookahead_off)
 
 // =============================================================================
 // LEVELS
 // =============================================================================
 
-pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
-pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off)
-dOp = request.security(syminfo.tickerid, "D", open,    lookahead = barmerge.lookahead_off)
+[pdh, pdl, dOp] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], open], lookahead = barmerge.lookahead_off)
 
 f_sessTrack(_in) =>
     var float hi = na
@@ -330,19 +328,35 @@ f_swUp(_l) =>
     not na(_l) and high > _l + swMinPen * atr and high <= _l + swMaxPen * atr and
      (not swNeedBack or close < _l) and high[1] <= _l
 
-sD1 = f_swDn(sl1[1])
-sD2 = f_swDn(pdl[1])
-sD3 = f_swDn(asiaL[1])
-sD4 = f_swDn(lonL[1])
-sD5 = f_swDn(nyL[1])
-sD6 = f_swDn(rangeLo[1])
+// Previous-bar level values are resolved into plain globals first. Passing
+// `someVar[1]` straight into a function call makes Pine unable to work out the
+// history buffer it needs, which surfaces as a runtime error and a blank chart.
+pSl1 = sl1[1]
+pSh1 = sh1[1]
+pPdl = pdl[1]
+pPdh = pdh[1]
+pAsL = asiaL[1]
+pAsH = asiaH[1]
+pLoL = lonL[1]
+pLoH = lonH[1]
+pNyL = nyL[1]
+pNyH = nyH[1]
+pRgL = rangeLo[1]
+pRgH = rangeHi[1]
 
-sU1 = f_swUp(sh1[1])
-sU2 = f_swUp(pdh[1])
-sU3 = f_swUp(asiaH[1])
-sU4 = f_swUp(lonH[1])
-sU5 = f_swUp(nyH[1])
-sU6 = f_swUp(rangeHi[1])
+sD1 = f_swDn(pSl1)
+sD2 = f_swDn(pPdl)
+sD3 = f_swDn(pAsL)
+sD4 = f_swDn(pLoL)
+sD5 = f_swDn(pNyL)
+sD6 = f_swDn(pRgL)
+
+sU1 = f_swUp(pSh1)
+sU2 = f_swUp(pPdh)
+sU3 = f_swUp(pAsH)
+sU4 = f_swUp(pLoH)
+sU5 = f_swUp(pNyH)
+sU6 = f_swUp(pRgH)
 
 sweepBull = sD1 or sD2 or sD3 or sD4 or sD5 or sD6
 sweepBear = sU1 or sU2 or sU3 or sU4 or sU5 or sU6
@@ -677,19 +691,15 @@ if strategy.position_size == 0
 // =============================================================================
 // Two line objects, repositioned each bar. Nothing accumulates.
 
-INVIS = color.new(color.black, 100)
+// plot() with style_linebr draws ONLY where the value is non-na, so these
+// appear during an open trade and nowhere else. No drawing objects, no
+// negative bar indices, nothing to accumulate.
 inTrade = strategy.position_size != 0 and not na(posStop) and not na(posTp2)
 
-var line lnStop = line.new(bar_index, close, bar_index, close, color = INVIS, width = 2)
-var line lnTp   = line.new(bar_index, close, bar_index, close, color = INVIS, width = 2)
-
-line.set_xy1(lnStop, bar_index - 10, inTrade ? posStop : close)
-line.set_xy2(lnStop, bar_index + 3,  inTrade ? posStop : close)
-line.set_color(lnStop, showPlan and inTrade ? color.new(color.red, 0) : INVIS)
-
-line.set_xy1(lnTp, bar_index - 10, inTrade ? posTp2 : close)
-line.set_xy2(lnTp, bar_index + 3,  inTrade ? posTp2 : close)
-line.set_color(lnTp, showPlan and inTrade ? color.new(color.lime, 0) : INVIS)
+plot(showPlan and inTrade ? posStop : na, "Open trade stop",
+     color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(showPlan and inTrade ? posTp2 : na, "Open trade target",
+     color = color.new(color.lime, 0), style = plot.style_linebr, linewidth = 2)
 
 bgcolor(showOos and isOos ? color.new(color.blue, 95) : na, title = "Out-of-sample")
 

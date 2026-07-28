@@ -1,0 +1,58 @@
+//@version=6
+// =============================================================================
+// SMOKE TEST — diagnostic only, not a trading strategy
+// -----------------------------------------------------------------------------
+// Deliberately trivial. Its only job is to answer one question:
+//   does a Pine v6 STRATEGY with a dashboard render on your chart at all?
+//
+// If THIS shows arrows and a table, your TradingView setup is fine and the
+// problem is inside the real script.
+// If this is also blank, the problem is your chart or account (data, symbol,
+// timeframe, or a strategy limit), not the code.
+//
+// The entry rule is a plain moving-average cross. It is NOT a strategy to
+// trade. Delete this once we know which side the fault is on.
+// =============================================================================
+
+strategy("SMOKE TEST — delete after use",
+     shorttitle              = "SMOKE",
+     overlay                 = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     process_orders_on_close = true)
+
+fastLen = input.int(10, "Fast MA")
+slowLen = input.int(30, "Slow MA")
+
+fast = ta.sma(close, fastLen)
+slow = ta.sma(close, slowLen)
+
+goLong  = ta.crossover(fast, slow)
+goShort = ta.crossunder(fast, slow)
+
+if goLong
+    strategy.entry("L", strategy.long, comment = "L")
+if goShort
+    strategy.entry("S", strategy.short, comment = "S")
+
+plot(fast, "Fast", color = color.teal)
+plot(slow, "Slow", color = color.orange)
+
+// ---- minimal dashboard, same construction as the real script ----------------
+var table t = table.new(position.top_right, 2, 5, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+
+if barstate.islast
+    table.cell(t, 0, 0, "SMOKE TEST", text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 0, syminfo.ticker + " " + timeframe.period,
+         text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 1, "Bars loaded", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 1, str.tostring(bar_index + 1), text_color = color.white, text_size = size.tiny)
+    table.cell(t, 0, 2, "Closed trades", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 2, str.tostring(strategy.closedtrades), text_color = color.white, text_size = size.tiny)
+    table.cell(t, 0, 3, "Net profit", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 3, str.tostring(strategy.netprofit, "#.##"),
+         text_color = strategy.netprofit >= 0 ? color.teal : color.red, text_size = size.tiny)
+    table.cell(t, 0, 4, "Status", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 4, "RENDERING OK", text_color = color.teal, text_size = size.tiny)
