@@ -14,11 +14,10 @@ from __future__ import annotations
 import math
 
 import pytest
+from conftest import make_perp_instrument
 
 from btcbot.risk.position_sizing import PositionSizer, SizingInputs
 from btcbot.strategies.base import Direction
-
-from conftest import make_perp_instrument
 
 
 def _inputs(**overrides) -> SizingInputs:

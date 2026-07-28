@@ -361,10 +361,101 @@ def _ema_bias(features: FeatureSet) -> int:
     return 0
 
 
+class ShallowPullbackContinuation(Strategy):
+    """22. Shallow-pullback continuation — strength that barely retraces.
+
+    Distinct from a moving-average pullback: the signal here is the *shallowness*
+    itself. After a measured impulse, a retracement that stays inside a small
+    fraction of that impulse says buyers never let price back — which is a
+    different observation from price touching an average.
+    """
+
+    id = "shallow_pullback_15m"
+    name = "Shallow-Pullback Continuation"
+    version = "1.0"
+    category = StrategyCategory.MOMENTUM
+    hypothesis = (
+        "An impulse that retraces only shallowly before resuming indicates "
+        "demand so persistent that patient buyers never get filled lower."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60",)
+    default_rr = 2.2
+    atr_stop_mult = 1.4
+    exit_mechanisms = frozenset(
+        {ExitMechanism.FIXED_RR, ExitMechanism.ATR_STOP, ExitMechanism.TRAILING_STOP,
+         ExitMechanism.BREAK_EVEN, ExitMechanism.PARTIAL_EXIT}
+    )
+    preferred_regimes = frozenset(
+        {Regime.TREND_UP, Regime.TREND_DOWN, Regime.STRONG_TREND_UP,
+         Regime.STRONG_TREND_DOWN, Regime.BREAKOUT}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"impulse_bars": 6, "min_impulse_atr": 2.0, "max_retrace": 0.382,
+                "rr_target": 2.2, "atr_stop_mult": 1.4, "break_even_at_r": 1.0,
+                "partial_at_r": 1.0, "partial_fraction": 0.5}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"impulse_bars": [4, 6, 8], "min_impulse_atr": [1.5, 2.0, 3.0],
+                "max_retrace": [0.236, 0.382, 0.5]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        bars = int(self.param("impulse_bars"))
+        highs, lows = features.series("high"), features.series("low")
+        closes = features.series("close")
+        atr = features.last("atr14")
+        close = features.close
+        if closes.size < bars + 3 or not np.isfinite(atr) or atr <= 0:
+            return None
+
+        # The impulse is measured over bars that closed *before* the pullback.
+        impulse_start = closes.size - bars - 1
+        leg_low = float(np.min(lows[impulse_start:-1]))
+        leg_high = float(np.max(highs[impulse_start:-1]))
+        leg_size = leg_high - leg_low
+        if leg_size < atr * float(self.param("min_impulse_atr")):
+            return None
+
+        max_retrace = float(self.param("max_retrace"))
+        up_leg = closes[-2] > closes[impulse_start]
+        if up_leg:
+            retrace = (leg_high - float(np.min(lows[-2:]))) / leg_size
+            direction = Direction.LONG
+            resumed = close > closes[-2]
+        else:
+            retrace = (float(np.max(highs[-2:])) - leg_low) / leg_size
+            direction = Direction.SHORT
+            resumed = close < closes[-2]
+
+        if retrace > max_retrace or retrace <= 0 or not resumed:
+            return None
+
+        htf = trend_alignment(ctx.tf("60"), direction)
+        if htf < 0:
+            return None
+
+        confidence = 0.6 + clamp((max_retrace - retrace) * 0.4, 0.0, 0.15)
+        return SetupProposal(
+            direction=direction,
+            entry_reference=close,
+            setup_key=f"shallowpb_{int(features.bar_open_ms)}_{direction.value}",
+            rationale=(
+                f"{leg_size / atr:.1f} ATR impulse retraced only "
+                f"{retrace * 100:.0f}% before resuming — demand never let price back."
+            ),
+            raw_confidence=confidence,
+            stop_hint=float(leg_low if direction is Direction.LONG else leg_high),
+        )
+
+
 MOMENTUM_STRATEGIES: tuple[type[Strategy], ...] = (
     RsiMomentum,
     MacdHistogramMomentum,
     RocMomentum,
     VolumeConfirmedMomentum,
     MultiTimeframeContinuation,
+    ShallowPullbackContinuation,
 )

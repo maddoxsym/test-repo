@@ -31,6 +31,7 @@ Perpetual-swap specifics handled here:
 
 from __future__ import annotations
 
+import contextlib
 from decimal import Decimal
 from typing import Any
 
@@ -384,10 +385,8 @@ class DemoExecutor:
             )
             if not confirmed:
                 return reject(8, "leverage_confirmation", detail, sizing=sizing)
-            try:
+            with contextlib.suppress(Exception):
                 self.leverage_decisions.mark_confirmed(setup_id)
-            except Exception:  # noqa: BLE001
-                pass
             self.last_confirmed_leverage = leverage_decision.leverage
 
         # --- gate 9: reserve the database row before any network call -----

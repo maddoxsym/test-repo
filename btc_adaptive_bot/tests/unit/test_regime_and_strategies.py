@@ -249,7 +249,7 @@ class TestStrategyLibrary:
                 for value in options:
                     cls(**{name: value})
 
-    def test_timeframes_are_valid_bybit_intervals(self):
+    def test_timeframes_are_valid_intervals(self):
         from btcbot.utils.timeutil import SUPPORTED_INTERVALS
 
         for cls in ALL_STRATEGY_CLASSES:

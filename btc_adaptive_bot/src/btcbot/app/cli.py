@@ -80,6 +80,27 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if report.passed else 1
 
 
+async def cmd_smoke_test(args: argparse.Namespace) -> int:
+    """Minimum-size demo round trip. Does NOT start the 14-day timer."""
+    from .smoke_test import print_report, run_smoke_test
+
+    if not args.confirm_demo:
+        log.error(
+            "SMOKE",
+            "This command submits a real (demo) order. Re-run it with --confirm-demo.",
+        )
+        return 2
+
+    loaded = load_config(args.config)
+    _configure_logging(loaded, override_level=args.log_level)
+    credentials = load_credentials(required=True)
+    assert credentials is not None
+
+    report = await run_smoke_test(loaded, credentials)
+    print_report(report)
+    return 0 if report.passed else 1
+
+
 async def _run_engine(args: argparse.Namespace, *, mode: str, dry_run: bool) -> int:
     loaded = load_config(args.config)
     _configure_logging(loaded, override_level=args.log_level)
@@ -265,11 +286,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("export", help="export all research data to CSV")
     sub.add_parser("backup", help="back up the database")
 
+    smoke = sub.add_parser(
+        "smoke-test",
+        help="minimum-size demo round trip (places ONE order; no 14-day timer)",
+    )
+    smoke.add_argument(
+        "--confirm-demo",
+        action="store_true",
+        dest="confirm_demo",
+        help="required: acknowledges that a real demo order will be submitted",
+    )
+
     return parser
 
 
 COMMANDS = {
     "verify": cmd_verify,
+    "smoke-test": cmd_smoke_test,
     "research": cmd_research,
     "champion": cmd_champion,
     "dry-run": cmd_dry_run,

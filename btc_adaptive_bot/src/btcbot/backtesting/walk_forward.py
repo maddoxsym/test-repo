@@ -103,6 +103,7 @@ class WalkForwardAnalyzer:
             spread_bps=config.spread_bps,
             latency_ms=config.latency_ms,
             partial_fill_probability=config.partial_fill_probability,
+            funding_rate_8h=config.funding_rate_8h,
         )
 
     def _backtester(self) -> Backtester:
@@ -273,6 +274,7 @@ def evaluate_segments(
         spread_bps=config.spread_bps,
         latency_ms=config.latency_ms,
         partial_fill_probability=config.partial_fill_probability,
+        funding_rate_8h=config.funding_rate_8h,
     )
     backtester = Backtester(costs=costs, regime_config=regime_config)
 

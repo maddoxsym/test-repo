@@ -17,11 +17,11 @@ import pytest
 
 from btcbot.config.schema import (
     AllocatorConfig,
+    LeverageConfig,
     RiskConfig,
     SafetyConfig,
     ShadowConfig,
 )
-from btcbot.config.schema import LeverageConfig
 from btcbot.exchange.demo_guard import DemoGuard, DemoVerification, SignalResult
 from btcbot.exchange.instruments import ExchangeCapabilities
 from btcbot.exchange.models import (
@@ -106,9 +106,6 @@ class MockOkxClient:
         return {"cancelled": 0, "failed": []}
 
 
-# Backwards-friendly alias used throughout this module.
-MockBybitClient = MockOkxClient
-
 
 def _verified_guard() -> DemoGuard:
     guard = DemoGuard(OkxDemoClient(), run_mainnet_negative_control=False)
@@ -164,9 +161,9 @@ def long_only_capabilities() -> ExchangeCapabilities:
     """A hypothetical long-only product — proves capability is discovered."""
     from dataclasses import replace
 
-    from btcbot.exchange.models import Capability
-
     from conftest import make_perp_instrument
+
+    from btcbot.exchange.models import Capability
 
     crippled = replace(
         make_perp_instrument(),
@@ -232,7 +229,7 @@ async def _submit(executor, signal, capabilities, **overrides):
 
 class TestHappyPath:
     async def test_full_entry_records_everything(self, repos, capabilities):
-        client = MockBybitClient()
+        client = MockOkxClient()
         executor, ledger = _executor(repos, client, _verified_guard())
 
         result = await _submit(executor, _signal(), capabilities)
@@ -277,7 +274,7 @@ class TestHappyPath:
         assert result.sizing.risk_pct_of_equity <= RiskConfig().max_risk_pct
 
     async def test_exit_closes_the_position_and_books_pnl(self, repos, capabilities):
-        client = MockBybitClient()
+        client = MockOkxClient()
         executor, ledger = _executor(repos, client, _verified_guard())
         await _submit(executor, _signal(), capabilities)
         position = ledger.current()
@@ -300,7 +297,7 @@ class TestHappyPath:
         assert not ledger.has_open_position
 
     async def test_fill_is_recorded_and_idempotent(self, repos, capabilities):
-        client = MockBybitClient()
+        client = MockOkxClient()
         executor, _ = _executor(repos, client, _verified_guard())
         result = await _submit(executor, _signal(), capabilities)
 
@@ -320,7 +317,7 @@ class TestHappyPath:
 
 class TestGatesBlockBeforeAnyRequest:
     async def test_unverified_demo_blocks_without_a_request(self, repos, capabilities):
-        client = MockBybitClient()
+        client = MockOkxClient()
         executor, ledger = _executor(repos, client, _unverified_guard())
 
         result = await _submit(executor, _signal(), capabilities)
@@ -398,7 +395,7 @@ class TestGatesBlockBeforeAnyRequest:
         assert any(r["layer_name"] == "leverage_confirmation" for r in rejected)
 
     async def test_duplicate_setup_sends_only_one_order(self, repos, capabilities):
-        client = MockBybitClient()
+        client = MockOkxClient()
         executor, ledger = _executor(repos, client, _verified_guard())
 
         first = await _submit(executor, _signal(), capabilities)
@@ -410,7 +407,7 @@ class TestGatesBlockBeforeAnyRequest:
         assert len(client.orders) == 1, "a duplicate order reached the exchange"
 
     async def test_safe_mode_blocks_without_a_request(self, repos, capabilities):
-        client = MockBybitClient()
+        client = MockOkxClient()
         executor, _ = _executor(repos, client, _verified_guard())
         executor.breakers.check_price(0.0)   # trip a breaker
 
@@ -420,7 +417,7 @@ class TestGatesBlockBeforeAnyRequest:
         assert client.orders == []
 
     async def test_impossible_sizing_blocks_without_a_request(self, repos, capabilities):
-        client = MockBybitClient()
+        client = MockOkxClient()
         executor, _ = _executor(repos, client, _verified_guard())
 
         # A $10 stop on a $50,000 price is 0.02% — below both the percentage
@@ -433,7 +430,7 @@ class TestGatesBlockBeforeAnyRequest:
         assert client.orders == []
 
     async def test_dry_run_validates_but_never_submits(self, repos, capabilities):
-        client = MockBybitClient()
+        client = MockOkxClient()
         executor, ledger = _executor(repos, client, _verified_guard(), dry_run=True)
 
         result = await _submit(executor, _signal(), capabilities)

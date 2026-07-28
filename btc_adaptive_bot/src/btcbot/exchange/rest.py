@@ -23,6 +23,7 @@ cannot omit the demo header.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 import httpx
@@ -250,10 +251,8 @@ class OkxDemoClient:
                     # Our timestamp was rejected: re-measure the drift once and
                     # retry. Persistent drift is caught by clock_drift_exceeds.
                     log.warning("OKX", "Timestamp rejected (50102) — re-syncing clock and retrying")
-                    try:
+                    with contextlib.suppress(ApiError, TransportError, RateLimitError):
                         await self.sync_clock()
-                    except (ApiError, TransportError, RateLimitError):
-                        pass
                     last_error = ApiError(code, str(payload.get("msg", "")), path)
                 elif code in RETRYABLE_CODES and attempt < self._max_retries:
                     last_error = ApiError(code, str(payload.get("msg", "")), path)

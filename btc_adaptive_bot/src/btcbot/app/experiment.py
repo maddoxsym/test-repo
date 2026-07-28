@@ -3,7 +3,7 @@
 The timer starts **only** after all five preconditions hold:
 
 1. configuration passes validation
-2. Bybit demo authenticates
+2. OKX demo authenticates
 3. demo status is positively verified
 4. BTC market data is functioning
 5. database migrations succeed
@@ -157,7 +157,7 @@ class Preconditions:
     def unmet(self) -> list[str]:
         names = {
             "configuration validation": self.config_valid,
-            "Bybit demo authentication": self.demo_authenticated,
+            "OKX demo authentication": self.demo_authenticated,
             "demo environment verification": self.demo_verified,
             "BTC market data": self.market_data_ready,
             "database migrations": self.migrations_applied,
@@ -169,7 +169,7 @@ class Preconditions:
             f"  [{'x' if ok else ' '}] {name}"
             for name, ok in (
                 ("configuration validated", self.config_valid),
-                ("Bybit demo authenticated", self.demo_authenticated),
+                ("OKX demo authenticated", self.demo_authenticated),
                 ("demo environment verified", self.demo_verified),
                 ("BTC market data functioning", self.market_data_ready),
                 ("database migrations applied", self.migrations_applied),

@@ -79,11 +79,16 @@ else
   ok "Created .env from the template (permissions 600)"
 fi
 
-if grep -qE '^BYBIT_DEMO_API_KEY=.+' .env 2>/dev/null; then
-  ok "BYBIT_DEMO_API_KEY looks populated"
-else
-  warn "BYBIT_DEMO_API_KEY is empty — you must add your demo credentials next"
-fi
+missing_creds=0
+for var in OKX_DEMO_API_KEY OKX_DEMO_API_SECRET OKX_DEMO_PASSPHRASE; do
+  if grep -qE "^${var}=.+" .env 2>/dev/null; then
+    ok "$var looks populated"
+  else
+    warn "$var is empty — you must add your demo credentials next"
+    missing_creds=1
+  fi
+done
+[ "$missing_creds" -eq 0 ] && ok "all three OKX demo credentials are present"
 
 # --- self-test ---------------------------------------------------
 bold "6. Running the test suite"
@@ -99,23 +104,28 @@ cat <<'NEXT'
 
 Next steps:
 
-  1. Create Bybit DEMO API credentials:
-       - Log in at bybit.com
-       - Switch to "Demo Trading" (top-right account menu)
-       - Hover your avatar -> API -> create a new key
+  1. Create OKX Europe DEMO API credentials:
+       - Log in to your OKX Europe account
+       - Switch to "Demo Trading"
+       - Profile -> API -> create a new DEMO key
+       - Give it Read + Trade permissions (no withdrawal needed or used)
        - The key MUST be created inside Demo Trading
 
-  2. Put them in .env:
-       BYBIT_DEMO_API_KEY=...
-       BYBIT_DEMO_API_SECRET=...
+  2. Put all THREE values in .env (OKX keys have a passphrase):
+       OKX_DEMO_API_KEY=...
+       OKX_DEMO_API_SECRET=...
+       OKX_DEMO_PASSPHRASE=...
 
-  3. Verify the connection (places no orders):
-       ./scripts/verify_demo_connection.sh
+  3. Verify the connection (17 checks, places no orders):
+       ./scripts/verify_okx_demo_connection.sh
 
-  4. Start the 14-day research experiment:
+  4. Prove the order path with one minimum-size round trip:
+       ./scripts/smoke_test_okx_demo.sh --confirm-demo
+
+  5. Start the 14-day research experiment:
        ./scripts/run_research.sh
 
-  5. Open the dashboard:
+  6. Open the dashboard:
        http://127.0.0.1:8787
 
 NEXT

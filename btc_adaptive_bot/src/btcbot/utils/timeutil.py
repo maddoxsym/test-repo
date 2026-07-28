@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-# Bybit V5 kline intervals (verified against docs/v5/market/kline.mdx) mapped to seconds.
+# Internal timeframe notation mapped to seconds. Exchange-independent: the
+# OKX `bar` translation lives in exchange/endpoints.py.
 # Minute intervals are numeric strings; D/W/M are letters.
 INTERVAL_SECONDS: dict[str, int] = {
     "1": 60,
@@ -30,7 +31,7 @@ SUPPORTED_INTERVALS: tuple[str, ...] = tuple(INTERVAL_SECONDS)
 
 
 class TimeframeError(ValueError):
-    """Raised when an interval string is not a Bybit-supported kline interval."""
+    """Raised when an interval string is not a supported timeframe."""
 
 
 def interval_seconds(interval: str) -> int:
@@ -39,7 +40,7 @@ def interval_seconds(interval: str) -> int:
         return INTERVAL_SECONDS[interval]
     except KeyError:
         raise TimeframeError(
-            f"unsupported timeframe {interval!r}; Bybit supports {', '.join(SUPPORTED_INTERVALS)}"
+            f"unsupported timeframe {interval!r}; supported: {', '.join(SUPPORTED_INTERVALS)}"
         ) from None
 
 

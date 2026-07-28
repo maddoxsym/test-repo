@@ -600,6 +600,705 @@ class FairValueGapRetracement(Strategy):
         return None
 
 
+# --------------------------------------------------------------------------
+#  Session levels — previous-day and previous-week high/low
+#
+#  These are the most-watched liquidity references in the market, and they are
+#  computed strictly from *completed* periods. The current, still-forming day or
+#  week is excluded: including it would let a level move as the session
+#  progresses, which is exactly the repainting the brief forbids.
+# --------------------------------------------------------------------------
+
+_MS_PER_DAY = 86_400_000
+_MS_PER_WEEK = 7 * _MS_PER_DAY
+
+
+@dataclass(frozen=True, slots=True)
+class SessionLevels:
+    """High/low of the last *completed* UTC day and week."""
+
+    prev_day_high: float | None = None
+    prev_day_low: float | None = None
+    prev_week_high: float | None = None
+    prev_week_low: float | None = None
+
+    def levels(self) -> list[tuple[str, float]]:
+        out: list[tuple[str, float]] = []
+        for label, value in (
+            ("previous-day high", self.prev_day_high),
+            ("previous-day low", self.prev_day_low),
+            ("previous-week high", self.prev_week_high),
+            ("previous-week low", self.prev_week_low),
+        ):
+            if value is not None:
+                out.append((label, value))
+        return out
+
+
+def _period_extremes(
+    features: FeatureSet, *, period_ms: int, epoch_offset_ms: int = 0
+) -> tuple[float | None, float | None]:
+    """High/low of the most recently *completed* period of ``period_ms``."""
+    candles = features.candles
+    if not candles:
+        return (None, None)
+    current_bucket = (candles[-1].open_ms - epoch_offset_ms) // period_ms
+    target_bucket = current_bucket - 1
+    highs = [
+        c.high for c in candles if (c.open_ms - epoch_offset_ms) // period_ms == target_bucket
+    ]
+    lows = [
+        c.low for c in candles if (c.open_ms - epoch_offset_ms) // period_ms == target_bucket
+    ]
+    if not highs or not lows:
+        return (None, None)
+    return (max(highs), min(lows))
+
+
+def session_levels(features: FeatureSet) -> SessionLevels:
+    """Previous completed UTC day and week extremes from a candle series."""
+    day_high, day_low = _period_extremes(features, period_ms=_MS_PER_DAY)
+    # Unix epoch was a Thursday; offset by 4 days so weeks break on Monday 00:00 UTC.
+    week_high, week_low = _period_extremes(
+        features, period_ms=_MS_PER_WEEK, epoch_offset_ms=4 * _MS_PER_DAY
+    )
+    return SessionLevels(day_high, day_low, week_high, week_low)
+
+
+def premium_discount(features: FeatureSet, *, lookback: int = 100) -> float | None:
+    """Where price sits inside the recent dealing range: 0 = low, 1 = high.
+
+    Above 0.5 is "premium" (expensive), below 0.5 is "discount" (cheap) — the
+    standard objective definition, computed from completed bars only.
+    """
+    highs, lows = features.series("high"), features.series("low")
+    if highs.size < 10:
+        return None
+    window = min(lookback, highs.size)
+    range_high = float(np.max(highs[-window:]))
+    range_low = float(np.min(lows[-window:]))
+    span = range_high - range_low
+    if span <= 0:
+        return None
+    return float((features.close - range_low) / span)
+
+
+class MultiTimeframeSmcContinuation(Strategy):
+    """29. Multi-timeframe SMC continuation.
+
+    The full stack the brief describes: 4H sets bias, price must be in the
+    favourable half of the dealing range (discount for longs, premium for
+    shorts), the entry timeframe must show a break of structure in the bias
+    direction, and the entry bar must show displacement.
+    """
+
+    id = "mtf_smc_continuation_15m"
+    name = "Multi-Timeframe SMC Continuation"
+    version = "1.0"
+    category = StrategyCategory.STRUCTURE
+    hypothesis = (
+        "Continuation entries are best taken in the direction of the higher "
+        "timeframe, from the favourable half of the dealing range, after the "
+        "entry timeframe confirms with a structural break and displacement."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60", "240")
+    default_rr = 2.5
+    atr_stop_mult = 1.5
+    exit_mechanisms = frozenset(
+        {ExitMechanism.STRUCTURE_STOP, ExitMechanism.STRUCTURE_TARGET,
+         ExitMechanism.FIXED_RR, ExitMechanism.BREAK_EVEN, ExitMechanism.PARTIAL_EXIT}
+    )
+    preferred_regimes = frozenset(
+        {Regime.TREND_UP, Regime.TREND_DOWN, Regime.STRONG_TREND_UP,
+         Regime.STRONG_TREND_DOWN, Regime.BREAKOUT}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"max_premium_for_long": 0.5, "min_premium_for_short": 0.5,
+                "displacement_atr": 0.8, "range_lookback": 100, "rr_target": 2.5,
+                "atr_stop_mult": 1.5, "break_even_at_r": 1.0, "partial_at_r": 1.5,
+                "partial_fraction": 0.5}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"displacement_atr": [0.6, 0.8, 1.2], "range_lookback": [60, 100, 150],
+                "rr_target": [2.0, 2.5, 3.0]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        htf = ctx.tf("240")
+        if htf is None:
+            return None
+        if trend_alignment(htf, Direction.LONG) > 0:
+            direction = Direction.LONG
+        elif trend_alignment(htf, Direction.SHORT) > 0:
+            direction = Direction.SHORT
+        else:
+            return None
+
+        position = premium_discount(features, lookback=int(self.param("range_lookback")))
+        if position is None:
+            return None
+        # Longs only from discount, shorts only from premium.
+        if direction is Direction.LONG and position > float(self.param("max_premium_for_long")):
+            return None
+        if direction is Direction.SHORT and position < float(self.param("min_premium_for_short")):
+            return None
+
+        atr = features.last("atr14")
+        close = features.close
+        if not np.isfinite(atr) or atr <= 0:
+            return None
+
+        # Structural break on the entry timeframe, from confirmed pivots only.
+        swings = extract_swings(features)
+        highs = last_pivots(swings, is_high=True, count=1)
+        lows = last_pivots(swings, is_high=False, count=1)
+        if not highs or not lows:
+            return None
+        if direction is Direction.LONG and close <= highs[-1].price:
+            return None
+        if direction is Direction.SHORT and close >= lows[-1].price:
+            return None
+
+        # Displacement: the entry bar must be a decisive move, not a drift.
+        body = abs(close - features.open)
+        if body < atr * float(self.param("displacement_atr")):
+            return None
+
+        confidence = 0.62 + clamp(body / atr * 0.08, 0.0, 0.14)
+        stop_hint = lows[-1].price if direction is Direction.LONG else highs[-1].price
+
+        return SetupProposal(
+            direction=direction,
+            entry_reference=close,
+            setup_key=f"mtfsmc_{int(features.bar_open_ms)}_{direction.value}",
+            rationale=(
+                f"4H bias {direction.value}; price in "
+                f"{'discount' if position < 0.5 else 'premium'} ({position:.2f}); "
+                f"15m BOS with {body / atr:.2f} ATR displacement."
+            ),
+            raw_confidence=confidence,
+            stop_hint=float(stop_hint),
+        )
+
+
+class OrderBlockMitigation(Strategy):
+    """33. Order-block mitigation.
+
+    An order block is defined arithmetically: the last opposite-direction candle
+    immediately preceding a displacement move that breaks structure. The trade
+    is taken when price returns to that candle's range and rejects it.
+    """
+
+    id = "order_block_mitigation_15m"
+    name = "Order-Block Mitigation"
+    version = "1.0"
+    category = StrategyCategory.STRUCTURE
+    hypothesis = (
+        "The last opposite candle before a displacement leg marks where the "
+        "move originated; price returning there often resumes the original move."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60",)
+    default_rr = 2.5
+    atr_stop_mult = 1.0
+    exit_mechanisms = frozenset(
+        {ExitMechanism.STRUCTURE_STOP, ExitMechanism.FIXED_RR,
+         ExitMechanism.STRUCTURE_TARGET, ExitMechanism.BREAK_EVEN}
+    )
+    preferred_regimes = frozenset(
+        {Regime.TREND_UP, Regime.TREND_DOWN, Regime.STRONG_TREND_UP,
+         Regime.STRONG_TREND_DOWN, Regime.RANGING}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"lookback": 40, "displacement_atr": 1.2, "max_age_bars": 25,
+                "rr_target": 2.5, "atr_stop_mult": 1.0, "break_even_at_r": 1.0}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"displacement_atr": [0.8, 1.2, 1.8], "max_age_bars": [15, 25, 40],
+                "rr_target": [2.0, 2.5, 3.0]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        atr = features.last("atr14")
+        close = features.close
+        if not np.isfinite(atr) or atr <= 0:
+            return None
+
+        candles = features.candles
+        lookback = min(int(self.param("lookback")), len(candles) - 2)
+        if lookback < 5:
+            return None
+        max_age = int(self.param("max_age_bars"))
+        displacement = atr * float(self.param("displacement_atr"))
+
+        # Scan backwards for the most recent displacement leg and the opposite
+        # candle that preceded it. Everything examined is a completed bar.
+        for offset in range(2, lookback):
+            index = len(candles) - offset
+            leg = candles[index]
+            leg_body = leg.close - leg.open
+            if abs(leg_body) < displacement:
+                continue
+            origin = candles[index - 1]
+            bullish_leg = leg_body > 0
+            # The order block is the last *opposite* candle before the leg.
+            if bullish_leg and origin.close >= origin.open:
+                continue
+            if not bullish_leg and origin.close <= origin.open:
+                continue
+            age = len(candles) - 1 - (index - 1)
+            if age > max_age:
+                break
+
+            block_high, block_low = origin.high, origin.low
+            if bullish_leg:
+                # Long: price returned into the block and closed back above it.
+                if features.low <= block_high and close > block_low:
+                    direction = Direction.LONG
+                    stop_hint = block_low - atr * float(self.param("atr_stop_mult"))
+                else:
+                    continue
+            else:
+                if features.high >= block_low and close < block_high:
+                    direction = Direction.SHORT
+                    stop_hint = block_high + atr * float(self.param("atr_stop_mult"))
+                else:
+                    continue
+
+            htf = trend_alignment(ctx.tf("60"), direction)
+            confidence = 0.58 + clamp(abs(leg_body) / atr * 0.05, 0.0, 0.12)
+            confidence += 0.06 if htf > 0 else -0.05
+            return SetupProposal(
+                direction=direction,
+                entry_reference=close,
+                setup_key=f"ob_{int(block_low)}_{int(block_high)}_{direction.value}",
+                rationale=(
+                    f"Price mitigated the order block {block_low:,.2f}–{block_high:,.2f} "
+                    f"({age} bars old) that preceded a {abs(leg_body) / atr:.1f} ATR "
+                    f"{'bullish' if bullish_leg else 'bearish'} displacement."
+                ),
+                raw_confidence=confidence,
+                stop_hint=float(stop_hint),
+            )
+        return None
+
+
+class BreakerBlock(Strategy):
+    """35. Breaker block — a failed order block that flips polarity.
+
+    When an order block fails (price closes decisively through it), that same
+    zone frequently acts as support/resistance in the opposite direction. The
+    definition here is strict: a specific block, a specific failing close, and a
+    specific retest from the other side.
+    """
+
+    id = "breaker_block_15m"
+    name = "Breaker Block"
+    version = "1.0"
+    category = StrategyCategory.STRUCTURE
+    hypothesis = (
+        "A demand zone that fails becomes supply (and vice versa); the retest of "
+        "a broken block from the other side is a defined entry."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60",)
+    default_rr = 2.2
+    atr_stop_mult = 1.0
+    exit_mechanisms = frozenset(
+        {ExitMechanism.STRUCTURE_STOP, ExitMechanism.FIXED_RR, ExitMechanism.BREAK_EVEN}
+    )
+    preferred_regimes = frozenset(
+        {Regime.TREND_UP, Regime.TREND_DOWN, Regime.STRONG_TREND_UP,
+         Regime.STRONG_TREND_DOWN, Regime.BREAKOUT, Regime.HIGH_VOLATILITY}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"lookback": 50, "break_atr": 0.5, "max_age_bars": 30,
+                "rr_target": 2.2, "atr_stop_mult": 1.0, "break_even_at_r": 1.0}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"break_atr": [0.3, 0.5, 0.8], "max_age_bars": [20, 30, 45]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        atr = features.last("atr14")
+        close = features.close
+        if not np.isfinite(atr) or atr <= 0:
+            return None
+
+        swings = extract_swings(features)
+        candles = features.candles
+        if len(swings) < 2 or len(candles) < 10:
+            return None
+
+        break_distance = atr * float(self.param("break_atr"))
+        max_age = int(self.param("max_age_bars"))
+
+        # A prior swing low that price closed decisively below becomes a breaker
+        # for shorts; a prior swing high closed decisively above becomes support.
+        for pivot in reversed(swings):
+            age = len(candles) - 1 - pivot.index
+            if age > max_age:
+                break
+            if age < 2:
+                continue
+
+            after = candles[pivot.index + 1 :]
+            if not after:
+                continue
+            broke_below = any(c.close < pivot.price - break_distance for c in after)
+            broke_above = any(c.close > pivot.price + break_distance for c in after)
+
+            if not pivot.is_high and broke_below:
+                # Broken demand → now supply. Retest from below, rejected.
+                if features.high >= pivot.price and close < pivot.price:
+                    return SetupProposal(
+                        direction=Direction.SHORT,
+                        entry_reference=close,
+                        setup_key=f"breaker_{int(pivot.price)}_short",
+                        rationale=(
+                            f"Swing low {pivot.price:,.2f} was broken and retested "
+                            "from below — demand flipped to supply."
+                        ),
+                        raw_confidence=0.58,
+                        stop_hint=float(pivot.price + atr * float(self.param("atr_stop_mult"))),
+                    )
+            if pivot.is_high and broke_above:
+                # Broken supply → now demand. Retest from above, held.
+                if features.low <= pivot.price and close > pivot.price:
+                    return SetupProposal(
+                        direction=Direction.LONG,
+                        entry_reference=close,
+                        setup_key=f"breaker_{int(pivot.price)}_long",
+                        rationale=(
+                            f"Swing high {pivot.price:,.2f} was broken and retested "
+                            "from above — supply flipped to demand."
+                        ),
+                        raw_confidence=0.58,
+                        stop_hint=float(pivot.price - atr * float(self.param("atr_stop_mult"))),
+                    )
+        return None
+
+
+class _SessionLevelSweep(Strategy):
+    """Shared implementation for previous-day and previous-week sweep entries.
+
+    The pattern is identical; only the reference level and timeframe differ, so
+    the logic lives once and the two concrete strategies below differ in which
+    levels they consider. They remain genuinely distinct hypotheses: daily
+    liquidity and weekly liquidity behave differently.
+    """
+
+    level_kinds: tuple[str, ...] = ()
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"sweep_atr": 0.15, "rr_target": 2.5, "atr_stop_mult": 0.8,
+                "break_even_at_r": 1.0, "time_stop_bars": 30}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"sweep_atr": [0.05, 0.15, 0.3], "rr_target": [2.0, 2.5, 3.0]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        atr = features.last("atr14")
+        close = features.close
+        if not np.isfinite(atr) or atr <= 0:
+            return None
+
+        levels = session_levels(features)
+        margin = atr * float(self.param("sweep_atr"))
+        stop_pad = atr * float(self.param("atr_stop_mult"))
+
+        for label, level in levels.levels():
+            if not any(kind in label for kind in self.level_kinds):
+                continue
+            is_high_level = "high" in label
+
+            if is_high_level:
+                # Swept above the level, then closed back below it → short.
+                if features.high > level + margin and close < level:
+                    return SetupProposal(
+                        direction=Direction.SHORT,
+                        entry_reference=close,
+                        setup_key=f"sweep_{label.replace(' ', '_')}_{int(level)}_short",
+                        rationale=(
+                            f"Swept the {label} {level:,.2f} by "
+                            f"{(features.high - level) / atr:.2f} ATR and closed back below — "
+                            "buy-side liquidity taken."
+                        ),
+                        raw_confidence=0.6,
+                        stop_hint=float(features.high + stop_pad),
+                    )
+            else:
+                if features.low < level - margin and close > level:
+                    return SetupProposal(
+                        direction=Direction.LONG,
+                        entry_reference=close,
+                        setup_key=f"sweep_{label.replace(' ', '_')}_{int(level)}_long",
+                        rationale=(
+                            f"Swept the {label} {level:,.2f} by "
+                            f"{(level - features.low) / atr:.2f} ATR and closed back above — "
+                            "sell-side liquidity taken."
+                        ),
+                        raw_confidence=0.6,
+                        stop_hint=float(features.low - stop_pad),
+                    )
+        return None
+
+
+class PreviousDayLevelSweep(_SessionLevelSweep):
+    """36. Previous-day high/low sweep and reclaim."""
+
+    id = "prev_day_sweep_15m"
+    name = "Previous-Day High/Low Sweep"
+    version = "1.0"
+    category = StrategyCategory.STRUCTURE
+    hypothesis = (
+        "Stops cluster beyond the previous day's high and low; a sweep that "
+        "closes back inside signals the liquidity grab is complete."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60",)
+    level_kinds = ("previous-day",)
+    default_rr = 2.5
+    atr_stop_mult = 0.8
+    exit_mechanisms = frozenset(
+        {ExitMechanism.STRUCTURE_STOP, ExitMechanism.FIXED_RR,
+         ExitMechanism.BREAK_EVEN, ExitMechanism.TIME_STOP}
+    )
+    preferred_regimes = frozenset(
+        {Regime.RANGING, Regime.HIGH_VOLATILITY, Regime.VOLATILITY_EXPANSION,
+         Regime.UNCERTAIN, Regime.BREAKOUT}
+    )
+
+
+class WeeklyLevelSweep(_SessionLevelSweep):
+    """37. Weekly high/low sweep and reclaim."""
+
+    id = "weekly_level_sweep_1h"
+    name = "Weekly High/Low Sweep"
+    version = "1.0"
+    category = StrategyCategory.STRUCTURE
+    hypothesis = (
+        "Weekly extremes hold the market's largest resting stop clusters; a "
+        "sweep and reclaim of one is a higher-conviction reversal reference "
+        "than a daily sweep."
+    )
+    primary_timeframe = "60"
+    context_timeframes = ("240",)
+    level_kinds = ("previous-week",)
+    default_rr = 3.0
+    atr_stop_mult = 0.8
+    exit_mechanisms = frozenset(
+        {ExitMechanism.STRUCTURE_STOP, ExitMechanism.FIXED_RR,
+         ExitMechanism.BREAK_EVEN, ExitMechanism.PARTIAL_EXIT}
+    )
+    preferred_regimes = frozenset(
+        {Regime.RANGING, Regime.HIGH_VOLATILITY, Regime.VOLATILITY_EXPANSION,
+         Regime.UNCERTAIN, Regime.BREAKOUT}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"sweep_atr": 0.15, "rr_target": 3.0, "atr_stop_mult": 0.8,
+                "break_even_at_r": 1.0, "partial_at_r": 1.5, "partial_fraction": 0.5}
+
+
+class PremiumDiscountContinuation(Strategy):
+    """38. Premium/discount continuation.
+
+    Pure location logic: in an established trend, only continue from the
+    favourable half of the dealing range. Buying an uptrend at a premium is the
+    single most common way continuation entries produce poor risk/reward.
+    """
+
+    id = "premium_discount_continuation_1h"
+    name = "Premium/Discount Continuation"
+    version = "1.0"
+    category = StrategyCategory.STRUCTURE
+    hypothesis = (
+        "Trend continuation entries taken from the favourable half of the "
+        "dealing range give materially better risk/reward than the same entry "
+        "taken from the unfavourable half."
+    )
+    primary_timeframe = "60"
+    context_timeframes = ("240",)
+    default_rr = 2.5
+    atr_stop_mult = 1.5
+    exit_mechanisms = frozenset(
+        {ExitMechanism.FIXED_RR, ExitMechanism.ATR_STOP, ExitMechanism.STRUCTURE_TARGET,
+         ExitMechanism.TRAILING_STOP, ExitMechanism.BREAK_EVEN}
+    )
+    preferred_regimes = frozenset(
+        {Regime.TREND_UP, Regime.TREND_DOWN, Regime.STRONG_TREND_UP, Regime.STRONG_TREND_DOWN}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"range_lookback": 120, "discount_max": 0.4, "premium_min": 0.6,
+                "rr_target": 2.5, "atr_stop_mult": 1.5, "break_even_at_r": 1.0}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"range_lookback": [80, 120, 180], "discount_max": [0.3, 0.4, 0.5],
+                "premium_min": [0.5, 0.6, 0.7]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        htf = ctx.tf("240")
+        if htf is None:
+            return None
+        if trend_alignment(htf, Direction.LONG) > 0:
+            direction = Direction.LONG
+        elif trend_alignment(htf, Direction.SHORT) > 0:
+            direction = Direction.SHORT
+        else:
+            return None
+
+        position = premium_discount(features, lookback=int(self.param("range_lookback")))
+        atr = features.last("atr14")
+        close = features.close
+        if position is None or not np.isfinite(atr) or atr <= 0:
+            return None
+
+        if direction is Direction.LONG:
+            if position > float(self.param("discount_max")):
+                return None
+            # Confirmation: the discount must be being defended, not sliced.
+            if close <= features.open:
+                return None
+            edge = float(self.param("discount_max")) - position
+        else:
+            if position < float(self.param("premium_min")):
+                return None
+            if close >= features.open:
+                return None
+            edge = position - float(self.param("premium_min"))
+
+        confidence = 0.58 + clamp(edge * 0.4, 0.0, 0.14)
+        return SetupProposal(
+            direction=direction,
+            entry_reference=close,
+            setup_key=f"premdisc_{int(features.bar_open_ms)}_{direction.value}",
+            rationale=(
+                f"4H trend {direction.value} with price at range position "
+                f"{position:.2f} "
+                f"({'discount' if direction is Direction.LONG else 'premium'}), "
+                "and the bar closed in the trend direction."
+            ),
+            raw_confidence=confidence,
+        )
+
+
+class MultiConfirmationReversal(Strategy):
+    """39. Multi-confirmation reversal — several independent signals must agree.
+
+    Reversal trading is where single-signal systems lose the most, so this one
+    requires a stack: a sweep of a confirmed pivot, a change of character, a
+    displacement close, and a momentum extreme. Fewer trades, higher bar.
+    """
+
+    id = "multi_confirmation_reversal_15m"
+    name = "Multi-Confirmation Reversal"
+    version = "1.0"
+    category = StrategyCategory.STRUCTURE
+    hypothesis = (
+        "Reversals are only worth taking when several independent conditions "
+        "agree at once; any single reversal signal alone is unreliable."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60",)
+    default_rr = 3.0
+    atr_stop_mult = 1.0
+    # Countertrend by construction — held to a higher confidence bar.
+    min_confidence = 0.6
+    exit_mechanisms = frozenset(
+        {ExitMechanism.STRUCTURE_STOP, ExitMechanism.FIXED_RR, ExitMechanism.PARTIAL_EXIT,
+         ExitMechanism.BREAK_EVEN, ExitMechanism.TIME_STOP}
+    )
+    preferred_regimes = frozenset(
+        {Regime.RANGING, Regime.HIGH_VOLATILITY, Regime.VOLATILITY_EXPANSION,
+         Regime.UNCERTAIN}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"sweep_atr": 0.1, "displacement_atr": 0.7, "rsi_extreme": 28.0,
+                "rr_target": 3.0, "atr_stop_mult": 1.0, "break_even_at_r": 1.0,
+                "partial_at_r": 1.5, "partial_fraction": 0.5, "time_stop_bars": 32}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"displacement_atr": [0.5, 0.7, 1.0], "rsi_extreme": [22.0, 28.0, 34.0]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        atr = features.last("atr14")
+        rsi = features.last("rsi14")
+        close = features.close
+        if not all(np.isfinite(v) for v in (atr, rsi, close)) or atr <= 0:
+            return None
+
+        swings = extract_swings(features)
+        highs = last_pivots(swings, is_high=True, count=1)
+        lows = last_pivots(swings, is_high=False, count=1)
+        if not highs or not lows:
+            return None
+
+        margin = atr * float(self.param("sweep_atr"))
+        displacement = atr * float(self.param("displacement_atr"))
+        rsi_extreme = float(self.param("rsi_extreme"))
+        body = close - features.open
+        confirmations: list[str] = []
+
+        # Bullish reversal stack.
+        swept_low = features.low < lows[-1].price - margin and close > lows[-1].price
+        if swept_low:
+            confirmations.append("swept a confirmed swing low and reclaimed it")
+            if body > displacement:
+                confirmations.append(f"bullish displacement {body / atr:.2f} ATR")
+            if rsi <= rsi_extreme:
+                confirmations.append(f"RSI {rsi:.0f} oversold")
+            if close > features.prev("close"):
+                confirmations.append("closed above the prior bar")
+            if len(confirmations) >= 3:
+                return SetupProposal(
+                    direction=Direction.LONG,
+                    entry_reference=close,
+                    setup_key=f"multirev_{int(features.bar_open_ms)}_long",
+                    rationale="Reversal confirmed by: " + "; ".join(confirmations) + ".",
+                    raw_confidence=0.6 + 0.05 * (len(confirmations) - 3),
+                    stop_hint=float(features.low - atr * float(self.param("atr_stop_mult"))),
+                )
+
+        # Bearish reversal stack.
+        confirmations = []
+        swept_high = features.high > highs[-1].price + margin and close < highs[-1].price
+        if swept_high:
+            confirmations.append("swept a confirmed swing high and rejected it")
+            if body < -displacement:
+                confirmations.append(f"bearish displacement {abs(body) / atr:.2f} ATR")
+            if rsi >= 100.0 - rsi_extreme:
+                confirmations.append(f"RSI {rsi:.0f} overbought")
+            if close < features.prev("close"):
+                confirmations.append("closed below the prior bar")
+            if len(confirmations) >= 3:
+                return SetupProposal(
+                    direction=Direction.SHORT,
+                    entry_reference=close,
+                    setup_key=f"multirev_{int(features.bar_open_ms)}_short",
+                    rationale="Reversal confirmed by: " + "; ".join(confirmations) + ".",
+                    raw_confidence=0.6 + 0.05 * (len(confirmations) - 3),
+                    stop_hint=float(features.high + atr * float(self.param("atr_stop_mult"))),
+                )
+        return None
+
+
 STRUCTURE_STRATEGIES: tuple[type[Strategy], ...] = (
     SwingStructureTrend,
     BreakOfStructure,
@@ -608,4 +1307,11 @@ STRUCTURE_STRATEGIES: tuple[type[Strategy], ...] = (
     SupportResistanceRejection,
     StructureBreakoutRetest,
     FairValueGapRetracement,
+    MultiTimeframeSmcContinuation,
+    OrderBlockMitigation,
+    BreakerBlock,
+    PreviousDayLevelSweep,
+    WeeklyLevelSweep,
+    PremiumDiscountContinuation,
+    MultiConfirmationReversal,
 )

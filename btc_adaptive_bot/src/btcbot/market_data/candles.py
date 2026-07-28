@@ -307,7 +307,7 @@ def candles_are_closed(candles: Sequence[Candle], *, now_ms_value: int | None = 
 def build_closed_only(candles: Sequence[Candle], *, now_ms_value: int | None = None) -> list[Candle]:
     """Filter to closed candles.
 
-    Applied to every REST kline response, because Bybit's newest element may be
+    Applied to every REST candle response, because OKX's newest element may be
     the still-forming candle.
     """
     return [c for c in candles if c.is_closed(now_ms_value=now_ms_value)]

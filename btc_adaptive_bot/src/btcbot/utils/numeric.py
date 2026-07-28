@@ -84,7 +84,7 @@ def format_qty(qty: float | Decimal, step: float | Decimal) -> str:
     """Render a quantity exactly as the exchange expects it in JSON.
 
     Fixed-point, correct number of decimals, never scientific notation — a
-    quantity of ``1e-05`` in an order body is rejected by Bybit.
+    quantity of ``1e-05`` in an order body is rejected by the exchange.
     """
     places = decimals_for_step(step)
     quantum = Decimal(1).scaleb(-places)

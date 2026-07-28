@@ -41,6 +41,7 @@ ZERO_COSTS = ExecutionCosts(
     spread_bps=0.0,
     latency_ms=0,
     partial_fill_probability=0.0,   # deterministic: no partial fills
+    funding_rate_8h=0.0,            # hand-computed PnL excludes funding
 )
 
 
@@ -418,3 +419,54 @@ class TestBacktesterEndToEnd:
         ).run(strategy, {"5": candles}, symbol="BTCUSDT")
         assert result.trade_count == 1
         assert result.trades[0].exit_reason == ExitReason.END_OF_DATA.value
+
+
+class TestFundingArithmetic:
+    """Perp funding — hand-checked, exactly like the fee arithmetic above."""
+
+    def test_pro_rata_funding_for_one_interval(self):
+        from btcbot.backtesting.execution_model import funding_cost
+
+        # 0.1 BTC at $50,000 = $5,000 notional; 0.01%/8h over a full 8h.
+        cost = funding_cost(
+            quantity=0.1, price=50_000.0, direction_sign=1,
+            funding_rate_8h=0.0001, elapsed_seconds=8 * 3600,
+        )
+        assert math.isclose(cost, 0.50)
+
+    def test_shorts_receive_when_longs_pay(self):
+        from btcbot.backtesting.execution_model import funding_cost
+
+        long_cost = funding_cost(
+            quantity=0.1, price=50_000.0, direction_sign=1,
+            funding_rate_8h=0.0001, elapsed_seconds=3600,
+        )
+        short_cost = funding_cost(
+            quantity=0.1, price=50_000.0, direction_sign=-1,
+            funding_rate_8h=0.0001, elapsed_seconds=3600,
+        )
+        assert long_cost > 0
+        assert math.isclose(short_cost, -long_cost)
+
+    def test_negative_rate_flips_the_sign(self):
+        from btcbot.backtesting.execution_model import funding_cost
+
+        cost = funding_cost(
+            quantity=0.1, price=50_000.0, direction_sign=1,
+            funding_rate_8h=-0.0001, elapsed_seconds=8 * 3600,
+        )
+        assert cost < 0  # the long is paid during negative funding
+
+    def test_degenerate_inputs_cost_nothing(self):
+        from btcbot.backtesting.execution_model import funding_cost
+
+        assert funding_cost(quantity=0.0, price=50_000.0, direction_sign=1,
+                            funding_rate_8h=0.0001, elapsed_seconds=3600) == 0.0
+        assert funding_cost(quantity=0.1, price=0.0, direction_sign=1,
+                            funding_rate_8h=0.0001, elapsed_seconds=3600) == 0.0
+        assert funding_cost(quantity=0.1, price=50_000.0, direction_sign=1,
+                            funding_rate_8h=0.0001, elapsed_seconds=0) == 0.0
+
+    def test_stress_multiplier_scales_funding(self):
+        base = ExecutionCosts(funding_rate_8h=0.0001)
+        assert math.isclose(base.stressed(4.0).funding_rate_8h, 0.0004)

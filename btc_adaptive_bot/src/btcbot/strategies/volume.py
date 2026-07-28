@@ -350,10 +350,179 @@ class VwapVolumeConfirmation(Strategy):
         )
 
 
+class OpenInterestBreakout(Strategy):
+    """44. Open-interest-confirmed breakout — new positions, not just churn.
+
+    Perp-native: a breakout accompanied by *rising open interest* is new money
+    taking risk, whereas a breakout on falling open interest is existing
+    positions closing. That distinction does not exist on spot.
+
+    **Data honesty:** open interest comes from the exchange's ``open-interest``
+    channel. When the feed has not delivered two comparable readings this
+    strategy stands down. It never infers or fabricates open interest.
+    """
+
+    id = "open_interest_breakout_15m"
+    name = "Open-Interest Confirmed Breakout"
+    version = "1.0"
+    category = StrategyCategory.VOLUME
+    hypothesis = (
+        "A breakout accompanied by rising open interest reflects new positioning "
+        "and continues more often than one where open interest is falling."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60",)
+    default_rr = 2.2
+    atr_stop_mult = 1.5
+    exit_mechanisms = frozenset(
+        {ExitMechanism.FIXED_RR, ExitMechanism.ATR_STOP, ExitMechanism.TRAILING_STOP,
+         ExitMechanism.BREAK_EVEN}
+    )
+    preferred_regimes = frozenset(
+        {Regime.BREAKOUT, Regime.VOLATILITY_EXPANSION, Regime.TREND_UP, Regime.TREND_DOWN,
+         Regime.STRONG_TREND_UP, Regime.STRONG_TREND_DOWN}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"lookback": 20, "min_oi_change": 0.004, "rr_target": 2.2,
+                "atr_stop_mult": 1.5, "break_even_at_r": 1.0}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"lookback": [14, 20, 30], "min_oi_change": [0.002, 0.004, 0.008]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        # Stand down entirely when the exchange has not supplied open interest.
+        if not ctx.features.has_open_interest:
+            return None
+        oi_change = ctx.features.open_interest_change_pct
+        if oi_change is None or oi_change < float(self.param("min_oi_change")):
+            return None
+
+        lookback = int(self.param("lookback"))
+        highs, lows = features.series("high"), features.series("low")
+        atr = features.last("atr14")
+        close = features.close
+        if highs.size < lookback + 2 or not np.isfinite(atr) or atr <= 0:
+            return None
+
+        prior_high = float(np.max(highs[-lookback - 1 : -1]))
+        prior_low = float(np.min(lows[-lookback - 1 : -1]))
+        if close > prior_high:
+            direction, level = Direction.LONG, prior_high
+        elif close < prior_low:
+            direction, level = Direction.SHORT, prior_low
+        else:
+            return None
+
+        confidence = 0.56 + clamp(oi_change * 12.0, 0.0, 0.18)
+        return SetupProposal(
+            direction=direction,
+            entry_reference=close,
+            setup_key=f"oibreak_{int(features.bar_open_ms)}_{direction.value}",
+            rationale=(
+                f"Broke {level:,.2f} with open interest up {oi_change * 100:.2f}% — "
+                "new positioning, not position closing."
+            ),
+            raw_confidence=confidence,
+            stop_hint=float(level - atr * 0.5 if direction is Direction.LONG else level + atr * 0.5),
+        )
+
+
+class FundingPositioningDivergence(Strategy):
+    """45. Funding/positioning divergence — crowded side pays to be wrong.
+
+    Perp-native: funding is the price of holding the crowded side. When funding
+    is extreme *and* price fails to reward that crowd (stalling or reversing),
+    the crowded side is vulnerable to being squeezed out.
+
+    **Data honesty:** funding comes from the exchange's ``funding-rate`` channel.
+    Without a delivered rate this strategy stands down.
+    """
+
+    id = "funding_divergence_1h"
+    name = "Funding / Positioning Divergence"
+    version = "1.0"
+    category = StrategyCategory.VOLUME
+    hypothesis = (
+        "When funding is extreme but price stops rewarding the crowded side, "
+        "that side is paying to hold a position it is being squeezed out of."
+    )
+    primary_timeframe = "60"
+    context_timeframes = ("240",)
+    default_rr = 2.0
+    atr_stop_mult = 1.5
+    exit_mechanisms = frozenset(
+        {ExitMechanism.FIXED_RR, ExitMechanism.ATR_STOP, ExitMechanism.STRUCTURE_TARGET,
+         ExitMechanism.TIME_STOP, ExitMechanism.BREAK_EVEN}
+    )
+    preferred_regimes = frozenset(
+        {Regime.RANGING, Regime.HIGH_VOLATILITY, Regime.VOLATILITY_EXPANSION,
+         Regime.UNCERTAIN, Regime.LOW_VOLATILITY}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        # 0.05%/8h is roughly 5x the long-run average — genuinely crowded.
+        return {"extreme_funding": 0.0005, "stall_bars": 3, "rr_target": 2.0,
+                "atr_stop_mult": 1.5, "time_stop_bars": 24, "break_even_at_r": 1.0}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"extreme_funding": [0.0003, 0.0005, 0.001], "stall_bars": [2, 3, 5]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        # Stand down entirely when the exchange has not supplied funding.
+        if not ctx.features.has_funding:
+            return None
+        funding = ctx.features.funding_rate
+        if funding is None:
+            return None
+
+        threshold = float(self.param("extreme_funding"))
+        if abs(funding) < threshold:
+            return None
+
+        stall_bars = int(self.param("stall_bars"))
+        closes = features.series("close")
+        atr = features.last("atr14")
+        close = features.close
+        if closes.size < stall_bars + 2 or not np.isfinite(atr) or atr <= 0:
+            return None
+
+        # The crowded side pays funding: positive funding ⇒ longs are crowded.
+        crowded_long = funding > 0
+        move = float(closes[-1] - closes[-1 - stall_bars])
+
+        # Divergence: the crowd is paying, but price is not going their way.
+        if crowded_long and move < atr * 0.25:
+            direction = Direction.SHORT
+        elif not crowded_long and move > -atr * 0.25:
+            direction = Direction.LONG
+        else:
+            return None
+
+        confidence = 0.52 + clamp((abs(funding) / threshold - 1.0) * 0.08, 0.0, 0.15)
+        return SetupProposal(
+            direction=direction,
+            entry_reference=close,
+            setup_key=f"fundingdiv_{int(features.bar_open_ms)}_{direction.value}",
+            rationale=(
+                f"Funding {funding * 100:+.4f}%/interval means "
+                f"{'longs' if crowded_long else 'shorts'} are crowded, but price "
+                f"moved only {move:+,.2f} over {stall_bars} bars — the paying side is stuck."
+            ),
+            raw_confidence=confidence,
+        )
+
+
 VOLUME_STRATEGIES: tuple[type[Strategy], ...] = (
     AbnormalVolumeContinuation,
     AbnormalVolumeExhaustion,
     OrderBookImbalance,
     TradeFlowImbalance,
     VwapVolumeConfirmation,
+    OpenInterestBreakout,
+    FundingPositioningDivergence,
 )

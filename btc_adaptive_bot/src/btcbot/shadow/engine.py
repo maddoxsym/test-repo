@@ -1,9 +1,13 @@
 """Shadow trading engine (Layer 2).
 
 Every enabled strategy trades continuously in its own isolated $10,000 account,
-driven by live Bybit market data. Because the accounts are independent, dozens
+driven by live OKX market data. Because the accounts are independent, dozens
 of strategies accumulate evidence simultaneously even though only one at a time
 can control the real demo account.
+
+Perp economics are modelled: funding accrues on held positions (using the
+exchange's discovered rate once the stream delivers one) and flows into fees,
+so shadow PnL is comparable with real demo PnL.
 
 The engine reuses :class:`~btcbot.backtesting.execution_model.PositionManager`,
 so a strategy's exits behave identically in shadow trading and in backtests —
@@ -21,6 +25,7 @@ from ..backtesting.execution_model import (
     ExitReason,
     PositionManager,
     SimulatedPosition,
+    funding_cost,
 )
 from ..config.schema import ShadowConfig
 from ..database.repositories import ShadowRepository
@@ -29,7 +34,7 @@ from ..strategies.base import Direction, Strategy, StrategySignal
 from ..utils.ids import new_uuid
 from ..utils.logging import get_logger
 from ..utils.numeric import safe_div
-from ..utils.timeutil import hour_bucket, iso, ms_to_dt, now_utc, weekday_bucket
+from ..utils.timeutil import hour_bucket, interval_seconds, iso, ms_to_dt, now_utc, weekday_bucket
 from .account import ShadowAccount
 
 log = get_logger(__name__)
@@ -56,10 +61,19 @@ class ShadowEngine:
             fee_rate_maker=config.fee_rate_maker,
             slippage_bps=config.slippage_bps,
             spread_bps=0.0,  # live spread is measured, not assumed
+            funding_rate_8h=config.funding_rate_8h,
         )
         self.execution = ExecutionModel(costs)
         self.manager = PositionManager(self.execution)
         self._trade_ids: dict[str, str] = {}
+        # Live funding: starts from the configured model rate; overwritten with
+        # the exchange's *discovered* rate the moment the stream delivers one.
+        self._funding_rate_8h = config.funding_rate_8h
+        self.funding_charged_total = 0.0
+
+    def set_funding_rate(self, rate_8h: float) -> None:
+        """Adopt the exchange's current funding rate for shadow accrual."""
+        self._funding_rate_8h = rate_8h
 
     # --- lifecycle --------------------------------------------------------
 
@@ -136,7 +150,9 @@ class ShadowEngine:
 
         quantity = risk_budget / stop_distance
         notional = quantity * signal.entry_reference
-        # Shadow accounts are unleveraged, matching the spot demo reality.
+        # Shadow accounts cap notional at 1x equity. Leverage changes margin,
+        # not stop-out risk, so unleveraged shadow PnL remains directly
+        # comparable with the leveraged demo account's risk-based PnL.
         if notional > account.equity:
             quantity = account.equity / signal.entry_reference
             notional = account.equity
@@ -238,6 +254,19 @@ class ShadowEngine:
             position = account.open_position
             if position is None or position.timeframe != candle.timeframe:
                 continue
+
+            # Perp funding accrues while the position is held. Charged into the
+            # position's fees so every shadow PnL figure and score includes it.
+            accrued = funding_cost(
+                quantity=position.remaining_quantity,
+                price=candle.close,
+                direction_sign=position.direction.sign,
+                funding_rate_8h=self._funding_rate_8h,
+                elapsed_seconds=interval_seconds(candle.timeframe),
+            )
+            if accrued != 0.0:
+                position.fees_paid += accrued
+                self.funding_charged_total += accrued
 
             events = self.manager.process_bar(
                 position,

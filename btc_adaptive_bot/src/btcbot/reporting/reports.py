@@ -98,7 +98,7 @@ class ReportGenerator:
             f"- **Remaining:** {humanize_duration(state.remaining)}",
             f"- **Scheduled end:** {iso(state.scheduled_end)}",
             "",
-            "## Bybit Demo (Layer 3)",
+            "## OKX Demo (Layer 3)",
             "",
             f"- **Current equity:** ${float(balance['total_equity']):,.2f}" if balance else "- Balance unavailable",
             f"- **Starting equity:** ${state.starting_demo_equity:,.2f}",
@@ -410,7 +410,7 @@ class ReportGenerator:
                     "historical_score": round(breakdown.historical_score, 2),
                     "walk_forward_score": round(breakdown.walk_forward_score, 2),
                     "shadow_score": round(breakdown.shadow_score, 2),
-                    "bybit_demo_score": round(breakdown.demo_score, 2),
+                    "demo_score": round(breakdown.demo_score, 2),
                     "robustness_score": round(breakdown.robustness_score, 2),
                     "final_score": round(breakdown.final_score, 2),
                     "confidence": breakdown.confidence,
@@ -425,7 +425,7 @@ class ReportGenerator:
         self, state: ExperimentState, rows: list[dict[str, Any]], selection: ChampionSelection
     ) -> str:
         lines = [
-            "# 14-Day Bybit Demo Research — Final Report",
+            "# 14-Day OKX Demo Research — Final Report",
             "",
             f"*Generated {iso(now_utc())}*",
             "",
@@ -471,7 +471,7 @@ class ReportGenerator:
                 f"{row['sortino']:.2f} | {row['max_drawdown_pct']:.1f} | {row['best_regime']} | "
                 f"{row['worst_regime']} | {row['best_timeframe']} | {row['historical_score']:.1f} | "
                 f"{row['walk_forward_score']:.1f} | {row['shadow_score']:.1f} | "
-                f"{row['bybit_demo_score']:.1f} | {row['robustness_score']:.1f} | "
+                f"{row['demo_score']:.1f} | {row['robustness_score']:.1f} | "
                 f"**{row['final_score']:.1f}** | {row['confidence']} |"
             )
 
@@ -492,13 +492,13 @@ class ReportGenerator:
                 "  strategies below the minimum sample threshold receive **zero** credit for",
                 "  expectancy regardless of how good their returns look.",
                 "- `SHORT`-only strategies could not trade the real demo layer when the account is",
-                "  spot-only. Their shadow and historical evidence is still complete; their",
+                "  allocated to the real demo account. Their shadow and historical evidence is still complete; their",
                 "  `Demo` score is zero because that layer was unavailable to them, not because",
                 "  they failed.",
                 "",
                 "## What happens next",
                 "",
-                "The system has transitioned to **BYBIT_DEMO_CHAMPION** on the same demo account.",
+                "The system has transitioned to **OKX_DEMO_CHAMPION** on the same demo account.",
                 "The champion controls real demo execution; every challenger keeps running in",
                 "shadow mode and can be promoted later, but only on statistically meaningful",
                 "out-of-sample evidence. No real money is involved at any point.",

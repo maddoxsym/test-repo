@@ -181,9 +181,12 @@ class ShadowConfig(StrictModel):
         "volatility_target",
         "confidence_scaled",
     ]
-    fee_rate_taker: float = Field(0.00055, ge=0, le=0.01)
+    fee_rate_taker: float = Field(0.0005, ge=0, le=0.01)
     fee_rate_maker: float = Field(0.0002, ge=0, le=0.01)
     slippage_bps: float = Field(2.0, ge=0, le=500)
+    # Modelled perp funding per 8h interval (longs pay when positive). The live
+    # discovered rate overrides this at runtime.
+    funding_rate_8h: float = Field(0.0001, ge=-0.01, le=0.01)
 
 
 class AllocatorConfig(StrictModel):
@@ -201,10 +204,11 @@ class AllocatorConfig(StrictModel):
 
 
 class BacktestingConfig(StrictModel):
-    fee_rate_taker: float = Field(0.00055, ge=0, le=0.01)
+    fee_rate_taker: float = Field(0.0005, ge=0, le=0.01)
     fee_rate_maker: float = Field(0.0002, ge=0, le=0.01)
     slippage_bps: float = Field(2.0, ge=0, le=500)
     spread_bps: float = Field(1.0, ge=0, le=500)
+    funding_rate_8h: float = Field(0.0001, ge=-0.01, le=0.01)
     latency_ms: int = Field(250, ge=0, le=10_000)
     partial_fill_probability: float = Field(0.15, ge=0, le=1)
     stress_multipliers: list[float] = [1.0, 2.0, 4.0]

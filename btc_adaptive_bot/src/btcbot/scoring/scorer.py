@@ -140,7 +140,7 @@ class StrategyScorer:
         )
         # 3. Live shadow expectancy.
         components["shadow_expectancy"] = self._expectancy_component(shadow)
-        # 4. Actual Bybit demo performance.
+        # 4. Actual OKX demo performance.
         components["demo_performance"] = self._expectancy_component(demo)
         # 5. Profit factor (blended across available layers).
         components["profit_factor"] = self._profit_factor_component(historical, shadow, demo)

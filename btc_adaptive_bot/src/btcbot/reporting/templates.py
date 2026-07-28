@@ -126,7 +126,7 @@ def render_final_report_html(
             f'<td>{row["historical_score"]:.1f}</td>'
             f'<td>{row["walk_forward_score"]:.1f}</td>'
             f'<td>{row["shadow_score"]:.1f}</td>'
-            f'<td>{row["bybit_demo_score"]:.1f}</td>'
+            f'<td>{row["demo_score"]:.1f}</td>'
             f'<td>{row["robustness_score"]:.1f}</td>'
             f'<td><strong>{row["final_score"]:.1f}</strong></td>'
             f'<td><span class="pill {escape(str(row["confidence"]))}">'
@@ -139,12 +139,12 @@ def render_final_report_html(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>14-Day Bybit Demo Research — Final Report</title>
+<title>14-Day OKX Demo Research — Final Report</title>
 <style>{_STYLES}</style>
 </head>
 <body>
 <div class="wrap">
-  <h1>14-Day Bybit Demo Research — Final Report</h1>
+  <h1>14-Day OKX Demo Research — Final Report</h1>
   <div class="sub">Generated {escape(iso(now_utc()))} ·
     <span class="banner">REAL MONEY: DISABLED</span></div>
 
@@ -179,14 +179,14 @@ def render_final_report_html(
           interval clear of zero, and no penalties applied.</li>
       <li>A high win rate alone does not win, and neither does a large return on very few trades —
           strategies below the minimum sample threshold earn zero expectancy credit.</li>
-      <li>Short-only strategies show a zero <em>Demo</em> score when the demo account is spot-only.
+      <li>A zero <em>Demo</em> score means the strategy never won an allocation to the real demo account; its shadow and historical evidence is still complete.
           That layer was unavailable to them; their shadow and historical evidence still counts.</li>
     </ul>
   </div>
 
   <div class="card">
     <h2 style="margin-top:0">What happens next</h2>
-    <p class="note">The system has transitioned to <strong>BYBIT_DEMO_CHAMPION</strong> on the same
+    <p class="note">The system has transitioned to <strong>OKX_DEMO_CHAMPION</strong> on the same
     demo account. The champion controls real demo execution while every challenger continues in
     shadow mode, eligible for promotion only on statistically meaningful out-of-sample evidence.
     No real money is involved at any stage.</p>

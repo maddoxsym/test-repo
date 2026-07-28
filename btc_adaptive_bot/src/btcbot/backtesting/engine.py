@@ -29,13 +29,14 @@ from ..regime.classifier import RegimeClassifier
 from ..strategies.base import Strategy, StrategyContext
 from ..utils.logging import get_logger
 from ..utils.numeric import safe_div
-from ..utils.timeutil import hour_bucket, iso, ms_to_dt, weekday_bucket
+from ..utils.timeutil import hour_bucket, interval_seconds, iso, ms_to_dt, weekday_bucket
 from .execution_model import (
     ExecutionCosts,
     ExecutionModel,
     ExitReason,
     PositionManager,
     SimulatedPosition,
+    funding_cost,
 )
 
 log = get_logger(__name__)
@@ -229,6 +230,18 @@ class Backtester:
 
             # --- manage an open position on this bar ---------------------
             if position is not None:
+                # Perp funding accrues while the position is held. Charged into
+                # fees so every PnL figure and score includes it.
+                accrued = funding_cost(
+                    quantity=position.remaining_quantity,
+                    price=bar.close,
+                    direction_sign=position.direction.sign,
+                    funding_rate_8h=execution.costs.funding_rate_8h,
+                    elapsed_seconds=interval_seconds(timeframe),
+                )
+                if accrued != 0.0:
+                    position.fees_paid += accrued
+                    equity -= accrued
                 window = primary[max(0, index - self.feature_window) : index + 1]
                 current_atr = _atr_from(window)
                 events = manager.process_bar(position, bar, current_atr=current_atr)

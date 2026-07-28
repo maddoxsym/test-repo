@@ -270,6 +270,29 @@ class MultiTimeframeFeatures:
     trade_flow_imbalance: float = 0.0
     spread_bps: float = 0.0
     orderbook_valid: bool = False
+    # --- perpetual-swap context (None when the exchange has not delivered it) ---
+    # These are deliberately Optional rather than defaulting to 0.0: a strategy
+    # that trades on funding or open interest must be able to tell "flat" from
+    # "unknown", and must stand down rather than invent a value.
+    funding_rate: float | None = None
+    next_funding_ms: int | None = None
+    open_interest: float | None = None
+    open_interest_prev: float | None = None
+
+    @property
+    def has_funding(self) -> bool:
+        return self.funding_rate is not None
+
+    @property
+    def has_open_interest(self) -> bool:
+        return self.open_interest is not None and self.open_interest_prev is not None
+
+    @property
+    def open_interest_change_pct(self) -> float | None:
+        """Fractional change in open interest, or None when unavailable."""
+        if not self.has_open_interest or not self.open_interest_prev:
+            return None
+        return (self.open_interest - self.open_interest_prev) / self.open_interest_prev
 
     def get(self, timeframe: str) -> FeatureSet | None:
         return self.by_timeframe.get(timeframe)

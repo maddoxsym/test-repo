@@ -121,6 +121,10 @@ class Orchestrator:
         self._latest_margin_ratio: float | None = None
         self._latest_funding_rate: float | None = None
         self._next_funding_ms: int | None = None
+        # Open interest: None until the exchange delivers it. Strategies that
+        # need it stand down rather than assume a value.
+        self._latest_open_interest: float | None = None
+        self._prev_open_interest: float | None = None
 
         self._running = False
         self._tasks: list[asyncio.Task[Any]] = []
@@ -649,13 +653,25 @@ class Orchestrator:
         self.store.update_trades(trades)
 
     async def _on_funding(self, item: dict[str, Any]) -> None:
-        """Track the live funding rate and next funding time for the X-Perp."""
-        if item.get("channel") == "funding-rate":
+        """Track live funding, next funding time, and open interest."""
+        channel = item.get("channel")
+        if channel == "funding-rate":
             with contextlib.suppress(TypeError, ValueError):
                 self._latest_funding_rate = float(item.get("fundingRate") or 0.0)
                 next_ms = item.get("nextFundingTime") or item.get("fundingTime")
                 if next_ms:
                     self._next_funding_ms = int(next_ms)
+                # Shadow accounts accrue funding at the exchange's real rate
+                # rather than the modelled default.
+                if self.shadow is not None and self._latest_funding_rate is not None:
+                    self.shadow.set_funding_rate(self._latest_funding_rate)
+        elif channel == "open-interest":
+            with contextlib.suppress(TypeError, ValueError):
+                value = float(item.get("oi") or 0.0)
+                if value > 0:
+                    # Keep exactly one prior reading so a change can be measured.
+                    self._prev_open_interest = self._latest_open_interest
+                    self._latest_open_interest = value
 
     async def _on_execution(self, data: list[dict[str, Any]]) -> None:
         if self.executor is None:
@@ -1040,6 +1056,10 @@ class Orchestrator:
                 trade_flow_imbalance=self.store.trade_flow.imbalance(),
                 spread_bps=self.store.spread_bps,
                 orderbook_valid=self.store.orderbook.valid,
+                funding_rate=self._latest_funding_rate,
+                next_funding_ms=self._next_funding_ms,
+                open_interest=self._latest_open_interest,
+                open_interest_prev=self._prev_open_interest,
             ),
             regime=self._current_regime,
             news_risk=news_state.risk_level if news_state else 0.0,

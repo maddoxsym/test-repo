@@ -26,6 +26,7 @@ from .base import (
     Strategy,
     StrategyCategory,
     StrategyContext,
+    trend_alignment,
 )
 
 
@@ -550,6 +551,187 @@ def find_sr_levels(
     return levels
 
 
+class VolumeConfirmedBreakout(Strategy):
+    """15. Volume-confirmed breakout — participation is the filter.
+
+    A breakout on ordinary volume is usually noise. This strategy requires the
+    breakout bar itself to carry statistically abnormal volume *and* a decisive
+    body, which is what distinguishes real participation from a wick through a
+    level.
+    """
+
+    id = "volume_breakout_15m"
+    name = "Volume-Confirmed Breakout"
+    version = "1.0"
+    category = StrategyCategory.BREAKOUT
+    hypothesis = (
+        "Breakouts that carry abnormal volume represent genuine repositioning; "
+        "breakouts on average volume are mostly liquidity probes."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60",)
+    default_rr = 2.2
+    atr_stop_mult = 1.6
+    exit_mechanisms = frozenset(
+        {ExitMechanism.FIXED_RR, ExitMechanism.ATR_STOP, ExitMechanism.TRAILING_STOP,
+         ExitMechanism.BREAK_EVEN, ExitMechanism.VOLATILITY_EXIT}
+    )
+    preferred_regimes = frozenset(
+        {Regime.BREAKOUT, Regime.VOLATILITY_EXPANSION, Regime.TREND_UP, Regime.TREND_DOWN,
+         Regime.STRONG_TREND_UP, Regime.STRONG_TREND_DOWN}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"lookback": 20, "volume_z_min": 1.5, "min_body_ratio": 0.55,
+                "rr_target": 2.2, "atr_stop_mult": 1.6, "break_even_at_r": 1.0}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"lookback": [14, 20, 30], "volume_z_min": [1.0, 1.5, 2.0, 2.5],
+                "min_body_ratio": [0.45, 0.55, 0.65]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        volume_z = features.last("volume_z")
+        body_ratio = features.last("body_ratio")
+        atr = features.last("atr14")
+        close = features.close
+        if not all(np.isfinite(v) for v in (volume_z, body_ratio, atr, close)) or atr <= 0:
+            return None
+        if volume_z < float(self.param("volume_z_min")):
+            return None
+        if body_ratio < float(self.param("min_body_ratio")):
+            return None
+
+        lookback = int(self.param("lookback"))
+        highs, lows = features.series("high"), features.series("low")
+        if highs.size < lookback + 2:
+            return None
+        # Prior range excludes the breakout bar itself — no look-ahead.
+        prior_high = float(np.max(highs[-lookback - 1 : -1]))
+        prior_low = float(np.min(lows[-lookback - 1 : -1]))
+
+        if close > prior_high:
+            direction = Direction.LONG
+            level = prior_high
+        elif close < prior_low:
+            direction = Direction.SHORT
+            level = prior_low
+        else:
+            return None
+
+        htf = trend_alignment(ctx.tf("60"), direction)
+        confidence = 0.55 + clamp((volume_z - 1.5) * 0.06, 0.0, 0.18) + (0.06 if htf > 0 else -0.04)
+
+        return SetupProposal(
+            direction=direction,
+            entry_reference=close,
+            setup_key=f"volbreak_{int(features.bar_open_ms)}_{direction.value}",
+            rationale=(
+                f"Closed {'above' if direction is Direction.LONG else 'below'} the "
+                f"{lookback}-bar extreme {level:,.2f} on volume z={volume_z:.2f} "
+                f"with a {body_ratio * 100:.0f}% body."
+            ),
+            raw_confidence=confidence,
+        )
+
+
+class FailedBreakoutTrap(Strategy):
+    """16. Failed-breakout trap — fade the break that could not hold.
+
+    The mirror image of the breakout strategies: price closed beyond a level,
+    then closed back inside within a bounded number of bars. Those trapped
+    breakout entries become fuel for the move in the opposite direction.
+    """
+
+    id = "failed_breakout_trap_15m"
+    name = "Failed-Breakout Trap"
+    version = "1.0"
+    category = StrategyCategory.BREAKOUT
+    hypothesis = (
+        "A breakout that closes back inside its range within a few bars has "
+        "trapped participants whose forced exits drive the opposite move."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60",)
+    supports_short = True
+    default_rr = 2.0
+    atr_stop_mult = 1.2
+    exit_mechanisms = frozenset(
+        {ExitMechanism.FIXED_RR, ExitMechanism.ATR_STOP, ExitMechanism.STRUCTURE_TARGET,
+         ExitMechanism.BREAK_EVEN, ExitMechanism.TIME_STOP}
+    )
+    preferred_regimes = frozenset(
+        {Regime.RANGING, Regime.HIGH_VOLATILITY, Regime.VOLATILITY_EXPANSION, Regime.UNCERTAIN}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"lookback": 20, "max_bars_outside": 3, "rr_target": 2.0,
+                "atr_stop_mult": 1.2, "time_stop_bars": 24}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"lookback": [14, 20, 30], "max_bars_outside": [2, 3, 5],
+                "rr_target": [1.5, 2.0, 2.5]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        lookback = int(self.param("lookback"))
+        max_outside = int(self.param("max_bars_outside"))
+        highs, lows = features.series("high"), features.series("low")
+        closes = features.series("close")
+        atr = features.last("atr14")
+        close = features.close
+        if closes.size < lookback + max_outside + 2 or not np.isfinite(atr) or atr <= 0:
+            return None
+
+        # The range is measured strictly before the breakout attempt.
+        base_end = closes.size - max_outside - 1
+        range_high = float(np.max(highs[base_end - lookback : base_end]))
+        range_low = float(np.min(lows[base_end - lookback : base_end]))
+
+        recent_closes = closes[-max_outside - 1 : -1]
+        broke_up = bool(np.any(recent_closes > range_high))
+        broke_down = bool(np.any(recent_closes < range_low))
+
+        # The trap: broke out, then closed back inside on this bar.
+        if broke_up and close < range_high:
+            direction = Direction.SHORT
+            level = range_high
+        elif broke_down and close > range_low:
+            direction = Direction.LONG
+            level = range_low
+        else:
+            return None
+
+        excursion = (
+            float(np.max(recent_closes)) - range_high
+            if direction is Direction.SHORT
+            else range_low - float(np.min(recent_closes))
+        )
+        confidence = 0.56 + clamp(excursion / atr * 0.12, 0.0, 0.16)
+        # Stop goes just beyond the failed extreme — the level that invalidates it.
+        stop_hint = (
+            float(np.max(highs[-max_outside - 1 :])) + atr * 0.25
+            if direction is Direction.SHORT
+            else float(np.min(lows[-max_outside - 1 :])) - atr * 0.25
+        )
+
+        return SetupProposal(
+            direction=direction,
+            entry_reference=close,
+            setup_key=f"failbreak_{int(features.bar_open_ms)}_{direction.value}",
+            rationale=(
+                f"Break {'above' if direction is Direction.SHORT else 'below'} "
+                f"{level:,.2f} failed and closed back inside the range within "
+                f"{max_outside} bars — trapped breakout entries."
+            ),
+            raw_confidence=confidence,
+            stop_hint=stop_hint,
+            target_hint=range_low if direction is Direction.SHORT else range_high,
+        )
+
+
 BREAKOUT_STRATEGIES: tuple[type[Strategy], ...] = (
     DonchianBreakout,
     PreviousRangeBreakout,
@@ -558,4 +740,6 @@ BREAKOUT_STRATEGIES: tuple[type[Strategy], ...] = (
     SupportResistanceBreakout,
     BreakoutRetest,
     DailyRangeExpansion,
+    VolumeConfirmedBreakout,
+    FailedBreakoutTrap,
 )

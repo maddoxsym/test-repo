@@ -160,7 +160,7 @@ function render(d){
   }
 
   const a=d.demo_account||{};
-  cards.push(card('Bybit Demo',
+  cards.push(card('OKX Demo',
     row('Equity', money(a.equity))+
     row('Available', money(a.available))+
     row('Starting', money(a.starting_equity))+

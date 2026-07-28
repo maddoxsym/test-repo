@@ -3,7 +3,7 @@
 Console lines use the tag vocabulary from the project brief so an operator can
 follow what the system is doing at a glance::
 
-    [BYBIT]  Demo environment VERIFIED
+    [OKX]    Demo environment VERIFIED
     [REGIME] VOLATILITY_EXPANSION (confidence 0.71)
     [DEMO]   BREAKOUT_RETEST allocated actual Demo trade
 
@@ -25,10 +25,10 @@ from .timeutil import iso, now_utc
 
 # Tags used across the system. Kept central so the console stays consistent.
 TAGS = (
-    "START", "STOP", "BYBIT", "BALANCE", "MARKET", "REGIME", "STRATEGY", "SHADOW",
+    "START", "STOP", "OKX", "BALANCE", "MARKET", "REGIME", "STRATEGY", "SHADOW",
     "DEMO", "ORDER", "FILL", "EXIT", "NEWS", "LEARNING", "VALIDATION", "RANK",
     "SAFETY", "RECOVERY", "DATA", "EXPERIMENT", "CHAMPION", "REPORT", "DASHBOARD",
-    "CONFIG", "DB", "ALLOC", "BACKTEST", "RISK",
+    "CONFIG", "DB", "ALLOC", "BACKTEST", "RISK", "DECISION", "SMOKE", "LEVERAGE",
 )
 
 _MASK = "***REDACTED***"

@@ -5,7 +5,7 @@ exhaustive. Two rules under test:
 
 * quantity always rounds **down** (never over-risk or over-spend)
 * prices round to the nearest tick, and nothing is ever emitted in scientific
-  notation, which Bybit rejects
+  notation, which the exchange rejects
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ class TestFormatting:
         assert decimals_for_step(step) == places
 
     def test_qty_never_uses_scientific_notation(self):
-        """`1e-05` in an order body is rejected by Bybit."""
+        """`1e-05` in an order body is rejected by the exchange."""
         for value in (0.00001, 0.000001, 1e-8, 0.0):
             text = format_qty(value, "0.00000001")
             assert "e" not in text.lower(), f"{text} used scientific notation"

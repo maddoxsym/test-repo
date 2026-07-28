@@ -479,7 +479,7 @@ class TestFinalReportRendering:
         html = next(p for p in paths if p.suffix == ".html").read_text(encoding="utf-8")
         assert "<!doctype html>" in html.lower()
         assert "REAL MONEY: DISABLED" in html
-        assert "14-Day Bybit Demo Research" in html
+        assert "14-Day OKX Demo Research" in html
         # No external asset may be referenced.
         assert "http://" not in html.replace("http://www.w3.org", "")
         for column in ("Sortino", "Max DD %", "Robust", "Final", "Confidence"):
@@ -496,7 +496,7 @@ class TestFinalReportRendering:
             "strategy", "version", "trades", "wins", "losses", "win_rate_pct", "return_pct",
             "net_pnl", "profit_factor", "expectancy", "avg_r", "sharpe", "sortino",
             "max_drawdown_pct", "best_regime", "worst_regime", "best_timeframe",
-            "historical_score", "walk_forward_score", "shadow_score", "bybit_demo_score",
+            "historical_score", "walk_forward_score", "shadow_score", "demo_score",
             "robustness_score", "final_score",
         ):
             assert column in header, f"the metrics CSV is missing '{column}'"

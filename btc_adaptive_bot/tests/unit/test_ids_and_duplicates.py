@@ -109,7 +109,7 @@ class TestOtherIds:
     def test_experiment_id_is_unique_even_within_one_millisecond(self):
         """Two experiments started in the same millisecond must not collide."""
         ids = {
-            experiment_id("BYBIT_DEMO_RESEARCH", 1_700_000_000_000, "abc123")
+            experiment_id("OKX_DEMO_RESEARCH", 1_700_000_000_000, "abc123")
             for _ in range(500)
         }
         assert len(ids) == 500

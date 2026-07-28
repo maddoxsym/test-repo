@@ -182,7 +182,7 @@ class TestCandleCompletion:
         assert series.forming().open_ms == base
 
     def test_build_closed_only_filters_rest_response(self):
-        """Bybit's newest kline element may be the still-forming candle."""
+        """The newest candle element may be the still-forming candle."""
         step = interval_ms("5")
         base = (now_ms() // step) * step
         candles = [

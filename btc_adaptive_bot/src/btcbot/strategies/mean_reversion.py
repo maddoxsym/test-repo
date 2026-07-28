@@ -350,10 +350,109 @@ class ExtremeDeviationReversion(Strategy):
         )
 
 
+class StableRangeValueReversion(Strategy):
+    """28. Stable-range value reversion — fade the edges of a *proven* range.
+
+    The other reversion strategies fade a statistical extreme wherever it
+    appears. This one first requires the market to demonstrate a range: a
+    containment area that has held for many bars with low directional slope.
+    Only then are its edges treated as value.
+    """
+
+    id = "range_value_reversion_1h"
+    name = "Stable-Range Value Reversion"
+    version = "1.0"
+    category = StrategyCategory.MEAN_REVERSION
+    hypothesis = (
+        "Once a range has repeatedly contained price with no directional slope, "
+        "its edges are value rather than breakout risk, and the midpoint is a "
+        "reasonable target."
+    )
+    primary_timeframe = "60"
+    context_timeframes = ("240",)
+    default_rr = 1.6
+    atr_stop_mult = 1.1
+    exit_mechanisms = frozenset(
+        {ExitMechanism.FIXED_RR, ExitMechanism.STRUCTURE_TARGET, ExitMechanism.ATR_STOP,
+         ExitMechanism.TIME_STOP, ExitMechanism.OPPOSITE_SIGNAL}
+    )
+    # Deliberately excludes every trending regime: this must never fade a trend.
+    preferred_regimes = frozenset(
+        {Regime.RANGING, Regime.LOW_VOLATILITY, Regime.VOLATILITY_CONTRACTION}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"range_bars": 48, "max_slope": 0.0004, "edge_fraction": 0.15,
+                "min_range_atr": 2.5, "rr_target": 1.6, "atr_stop_mult": 1.1,
+                "time_stop_bars": 36}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"range_bars": [36, 48, 72], "edge_fraction": [0.1, 0.15, 0.25],
+                "min_range_atr": [2.0, 2.5, 3.5]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        bars = int(self.param("range_bars"))
+        highs, lows = features.series("high"), features.series("low")
+        atr = features.last("atr14")
+        slope = features.last("ma_slope")
+        close = features.close
+        if highs.size < bars + 2 or not all(np.isfinite(v) for v in (atr, slope, close)):
+            return None
+        if atr <= 0:
+            return None
+
+        # Directional slope disqualifies the range outright.
+        if abs(slope) > float(self.param("max_slope")):
+            return None
+
+        range_high = float(np.max(highs[-bars - 1 : -1]))
+        range_low = float(np.min(lows[-bars - 1 : -1]))
+        span = range_high - range_low
+        if span < atr * float(self.param("min_range_atr")):
+            return None
+
+        edge = span * float(self.param("edge_fraction"))
+        midpoint = (range_high + range_low) / 2.0
+
+        if close <= range_low + edge:
+            direction = Direction.LONG
+            stop_hint = range_low - atr * float(self.param("atr_stop_mult"))
+        elif close >= range_high - edge:
+            direction = Direction.SHORT
+            stop_hint = range_high + atr * float(self.param("atr_stop_mult"))
+        else:
+            return None
+
+        # Proximity to the edge scales confidence: deeper into the edge is better.
+        depth = (
+            (range_low + edge - close) / edge
+            if direction is Direction.LONG
+            else (close - (range_high - edge)) / edge
+        )
+        confidence = 0.55 + clamp(depth * 0.15, 0.0, 0.15)
+
+        return SetupProposal(
+            direction=direction,
+            entry_reference=close,
+            setup_key=f"rangeval_{int(range_low)}_{int(range_high)}_{direction.value}",
+            rationale=(
+                f"{bars}-bar range {range_low:,.2f}–{range_high:,.2f} "
+                f"({span / atr:.1f} ATR, slope {slope:.5f}); price at the "
+                f"{'lower' if direction is Direction.LONG else 'upper'} edge."
+            ),
+            raw_confidence=confidence,
+            stop_hint=float(stop_hint),
+            target_hint=float(midpoint),
+        )
+
+
 MEAN_REVERSION_STRATEGIES: tuple[type[Strategy], ...] = (
     BollingerRsiReversion,
     ZScoreReversion,
     VwapReversion,
     KeltnerReversion,
     ExtremeDeviationReversion,
+    StableRangeValueReversion,
 )

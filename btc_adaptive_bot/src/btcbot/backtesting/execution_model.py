@@ -42,20 +42,29 @@ class ExitReason(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class ExecutionCosts:
-    """Cost assumptions. Multiplied by a stress factor for robustness testing."""
+    """Cost assumptions. Multiplied by a stress factor for robustness testing.
 
-    fee_rate_taker: float = 0.00055
+    ``funding_rate_8h`` models the perpetual-swap funding a position pays (or
+    receives) per 8-hour interval while it is held — longs pay when positive,
+    shorts receive. The default is a modelling assumption (a typical long-run
+    BTC perp average); the live layers use the *discovered* rate instead.
+    """
+
+    fee_rate_taker: float = 0.0005
     fee_rate_maker: float = 0.0002
     slippage_bps: float = 2.0
     spread_bps: float = 1.0
     latency_ms: int = 250
     partial_fill_probability: float = 0.15
+    funding_rate_8h: float = 0.0001
 
     def stressed(self, multiplier: float) -> ExecutionCosts:
         """Scale the *frictions* (not latency) by ``multiplier``.
 
         Used to check whether an edge survives worse conditions than the base
-        assumptions — a strategy that dies at 2x costs is fragile.
+        assumptions — a strategy that dies at 2x costs is fragile. Funding is
+        stressed too: a strategy that only wins when funding is benign is
+        equally fragile.
         """
         return ExecutionCosts(
             fee_rate_taker=self.fee_rate_taker * multiplier,
@@ -64,7 +73,30 @@ class ExecutionCosts:
             spread_bps=self.spread_bps * multiplier,
             latency_ms=self.latency_ms,
             partial_fill_probability=self.partial_fill_probability,
+            funding_rate_8h=self.funding_rate_8h * multiplier,
         )
+
+
+FUNDING_INTERVAL_SECONDS = 8 * 3600
+
+
+def funding_cost(
+    *,
+    quantity: float,
+    price: float,
+    direction_sign: int,
+    funding_rate_8h: float,
+    elapsed_seconds: float,
+) -> float:
+    """Pro-rata funding for a held perp position over ``elapsed_seconds``.
+
+    Positive result = cost to the position (long pays positive funding);
+    negative = the position *receives* funding (short during positive rates).
+    """
+    if quantity <= 0 or price <= 0 or elapsed_seconds <= 0:
+        return 0.0
+    notional = quantity * price
+    return notional * funding_rate_8h * (elapsed_seconds / FUNDING_INTERVAL_SECONDS) * direction_sign
 
 
 @dataclass(slots=True)

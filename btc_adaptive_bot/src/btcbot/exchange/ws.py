@@ -341,6 +341,9 @@ class PublicMarketStream:
             {"channel": "trades", "instId": self.inst_id},
             {"channel": "funding-rate", "instId": self.inst_id},
             {"channel": "mark-price", "instId": self.inst_id},
+            # Perp-only: open interest distinguishes new positioning from
+            # position closing. Strategies stand down when it is absent.
+            {"channel": "open-interest", "instId": self.inst_id},
         ]
 
     def business_channels(self) -> list[dict[str, str]]:
@@ -390,7 +393,7 @@ class PublicMarketStream:
         elif channel == "trades":
             for handler in self._trade_handlers:
                 await handler(data)
-        elif channel in {"funding-rate", "mark-price"}:
+        elif channel in {"funding-rate", "mark-price", "open-interest"}:
             for item in data:
                 for handler in self._funding_handlers:
                     await handler({"channel": channel, **item})

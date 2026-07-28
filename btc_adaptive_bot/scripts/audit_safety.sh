@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Safety audit — fails loudly if real-money capability, leaked
-#  credentials, or a non-allow-listed host appears in the source.
-#  Run it any time; it is also part of the test suite.
+#  credentials, a non-allow-listed host, or a missing demo
+#  header appears in the source. Run it any time; the same
+#  guarantees are also asserted by tests/unit/test_safety_lock.py.
 # ============================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -15,14 +16,14 @@ pass()    { printf "  %s✓%s %s\n" "$GREEN" "$OFF" "$1"; }
 failure() { printf "  %s✗%s %s\n" "$RED" "$OFF" "$1"; FAILURES=$((FAILURES + 1)); }
 note()    { printf "  %s·%s %s\n" "$YELLOW" "$OFF" "$1"; }
 
-printf "%sSAFETY AUDIT%s\n" "$BOLD" "$OFF"
+printf "%sSAFETY AUDIT — OKX EUROPE DEMO%s\n" "$BOLD" "$OFF"
 
 # ---------------------------------------------------------------
 section "1. No withdrawal / transfer / deposit endpoints"
 FORBIDDEN_PATHS=(
-  "/v5/asset/withdraw" "/v5/asset/transfer" "/v5/asset/deposit"
-  "create-internal-transfer" "create-universal-transfer"
-  "withdraw/create" "deposit/query-address"
+  "/api/v5/asset/withdrawal" "/api/v5/asset/transfer" "/api/v5/asset/deposit-address"
+  "/api/v5/asset/convert" "/api/v5/users/subaccount" "/api/v5/account/borrow-repay"
+  "/api/v5/finance/"
 )
 found_paths=0
 for path in "${FORBIDDEN_PATHS[@]}"; do
@@ -32,44 +33,99 @@ for path in "${FORBIDDEN_PATHS[@]}"; do
     found_paths=1
   fi
 done
-[ "$found_paths" -eq 0 ] && pass "no withdrawal, transfer, or deposit endpoints in src/"
+[ "$found_paths" -eq 0 ] && pass "no withdrawal, transfer, deposit, or lending endpoints in src/"
 
 # ---------------------------------------------------------------
-section "2. Authenticated hosts are confined to endpoints.py"
-host_hits="$(grep -rn --include='*.py' -E 'https://api(-testnet)?\.bybit\.(com|nl|eu|tr|kz|ae|id)' src/ 2>/dev/null \
+section "2. Hosts are confined to endpoints.py"
+host_hits="$(grep -rn --include='*.py' -F 'okx.com' src/ 2>/dev/null \
              | grep -v 'src/btcbot/exchange/endpoints.py' || true)"
 if [ -n "$host_hits" ]; then
   echo "$host_hits"
-  failure "a Bybit host literal appears outside endpoints.py"
+  failure "an OKX host literal appears outside endpoints.py"
 else
-  pass "every Bybit host literal lives in exchange/endpoints.py"
+  pass "every OKX host literal lives in exchange/endpoints.py"
 fi
 
-if grep -q 'DEMO_REST_HOST = "https://api-demo.bybit.com"' src/btcbot/exchange/endpoints.py; then
-  pass "demo host pinned to api-demo.bybit.com"
+if grep -q 'DEMO_REST_HOST = "https://eea.okx.com"' src/btcbot/exchange/endpoints.py; then
+  pass "REST host pinned to the EEA entity (eea.okx.com)"
 else
-  failure "the demo host constant is missing or altered"
+  failure "the EEA demo host constant is missing or altered"
 fi
 
-if grep -q 'ALLOWED_DEMO_HOSTS: frozenset\[str\] = frozenset' src/btcbot/exchange/endpoints.py; then
-  pass "ALLOWED_DEMO_HOSTS is an immutable frozenset"
+if grep -q 'ALLOWED_DEMO_HOSTS: frozenset\[str\] = frozenset' src/btcbot/exchange/endpoints.py &&
+   grep -q 'ALLOWED_WS_URLS: frozenset\[str\] = frozenset' src/btcbot/exchange/endpoints.py; then
+  pass "REST and WebSocket allow-lists are immutable frozensets"
 else
-  failure "ALLOWED_DEMO_HOSTS is not a frozenset"
+  failure "an allow-list is not a frozenset"
 fi
 
-# The mainnet host may only be used by the read-only negative control.
-nc_uses="$(grep -rn --include='*.py' 'NEGATIVE_CONTROL_HOST' src/ | grep -v 'endpoints.py' || true)"
-nc_files="$(echo "$nc_uses" | grep -c 'rest.py' || true)"
-if [ -z "$nc_uses" ] || [ "$(echo "$nc_uses" | grep -vc 'rest.py')" -eq 0 ]; then
-  pass "mainnet host referenced only by the read-only negative control"
+# The EEA *live* WS host differs from demo by one dropped infix. It must be
+# present in the forbidden list and must never be connected to.
+if grep -q 'wss://wseea.okx.com:8443/ws/v5/private' src/btcbot/exchange/endpoints.py &&
+   grep -q 'FORBIDDEN_HOSTS' src/btcbot/exchange/endpoints.py; then
+  pass "EEA live WebSocket hosts are explicitly listed as forbidden"
 else
-  echo "$nc_uses"
-  failure "mainnet host referenced outside the negative-control probe"
+  failure "the EEA live WebSocket hosts are not in the forbidden list"
+fi
+
+if grep -q 'wseeapap.okx.com' src/btcbot/exchange/endpoints.py; then
+  pass "demo WebSocket hosts pinned to the EEA demo entity (wseeapap)"
+else
+  failure "the EEA demo WebSocket constants are missing"
 fi
 
 # ---------------------------------------------------------------
-section "3. No real-money mode"
-if grep -rniE --include='*.py' '\b(live_trading|real_money|enable_live|is_live|mainnet_mode|trading_mode *= *.live.)\b' src/ 2>/dev/null; then
+section "3. Demo header is centrally enforced"
+if grep -q 'SIMULATED_TRADING_HEADER = "x-simulated-trading"' src/btcbot/exchange/endpoints.py &&
+   grep -q 'SIMULATED_TRADING_VALUE = "1"' src/btcbot/exchange/endpoints.py; then
+  pass "the demo switch constants are defined once, in endpoints.py"
+else
+  failure "the x-simulated-trading constants are missing or altered"
+fi
+
+# Exactly one module may build headers: the transport layer.
+header_users="$(grep -rln --include='*.py' 'SIMULATED_TRADING_HEADER' src/ 2>/dev/null \
+                | grep -v 'endpoints.py' || true)"
+if [ "$header_users" = "src/btcbot/exchange/rest.py" ]; then
+  pass "only the transport layer (rest.py) injects the demo header"
+else
+  echo "$header_users"
+  failure "the demo header is referenced outside the single transport choke point"
+fi
+
+if grep -q '_finalize_headers' src/btcbot/exchange/rest.py &&
+   grep -q 'final\[SIMULATED_TRADING_HEADER\] = SIMULATED_TRADING_VALUE' src/btcbot/exchange/rest.py; then
+  pass "_finalize_headers unconditionally sets x-simulated-trading: 1"
+else
+  failure "the central header injection is missing from rest.py"
+fi
+
+# Every request must route through the choke point. Count the request calls
+# that pass headers and make sure each one is finalized.
+raw_header_calls="$(grep -n 'headers=' src/btcbot/exchange/rest.py \
+                    | grep -v '_finalize_headers' \
+                    | grep -v 'headers={"User-Agent"' \
+                    | grep -v 'headers=signed.headers' || true)"
+if [ -z "$raw_header_calls" ]; then
+  pass "no request builds headers outside _finalize_headers"
+else
+  echo "$raw_header_calls"
+  note "review: a header set above must be the negative-control probe only"
+fi
+
+# The negative control is the ONE deliberate no-header request.
+nc_uses="$(grep -rln --include='*.py' 'NEGATIVE_CONTROL_PATH' src/ 2>/dev/null \
+           | grep -v 'endpoints.py' || true)"
+if [ "$nc_uses" = "src/btcbot/exchange/rest.py" ]; then
+  pass "the live-environment negative control lives only in rest.py"
+else
+  echo "$nc_uses"
+  failure "the negative-control path is referenced outside the probe"
+fi
+
+# ---------------------------------------------------------------
+section "4. No real-money mode"
+if grep -rniE --include='*.py' '\b(live_trading|real_money|enable_live|is_live|mainnet_mode|disable_simulated|trading_mode *= *.live.)\b' src/ 2>/dev/null; then
   failure "a real-money/live-mode flag was found"
 else
   pass "no live/real-money mode flag exists"
@@ -81,16 +137,32 @@ else
   failure "the config guard on require_demo_verification_for_orders is missing"
 fi
 
+if grep -q 'margin_mode: Literal\["isolated"\]' src/btcbot/config/schema.py; then
+  pass "margin mode is isolated-only — no silent cross fallback is configurable"
+else
+  failure "the isolated-margin constraint is missing from the schema"
+fi
+
 # ---------------------------------------------------------------
-section "4. No hardcoded credentials"
+section "5. No hardcoded credentials or instrument IDs"
 cred_hits="$(grep -rnE --include='*.py' \
-  "(api_key|api_secret|apikey|secret)[[:space:]]*=[[:space:]]*[\"'][A-Za-z0-9_-]{16,}[\"']" \
+  "(api_key|api_secret|apikey|secret|passphrase)[[:space:]]*=[[:space:]]*[\"'][A-Za-z0-9_-]{16,}[\"']" \
   src/ 2>/dev/null || true)"
 if [ -n "$cred_hits" ]; then
   echo "$cred_hits"
   failure "a hardcoded credential-like literal was found"
 else
   pass "no hardcoded credentials in src/"
+fi
+
+# The X-Perp instId must be discovered at runtime, never written into source.
+inst_hits="$(grep -rn --include='*.py' -E "[\"']BTC-USD[TC]?-SWAP[\"']" src/ 2>/dev/null \
+             | grep -v '^\s*#' || true)"
+if [ -n "$inst_hits" ]; then
+  echo "$inst_hits"
+  failure "a hardcoded instrument ID was found — it must be discovered at runtime"
+else
+  pass "no hardcoded instId in src/ (the X-Perp is discovered)"
 fi
 
 if grep -q '^\.env$' .gitignore && grep -q '^data/$' .gitignore && grep -q '^logs/$' .gitignore; then
@@ -101,6 +173,12 @@ fi
 
 if [ -f .env ] && git check-ignore -q .env 2>/dev/null; then
   pass ".env exists and git is ignoring it"
+  perms="$(stat -f '%Lp' .env 2>/dev/null || stat -c '%a' .env 2>/dev/null || echo '')"
+  if [ "$perms" = "600" ] || [ "$perms" = "400" ]; then
+    pass ".env permissions are owner-only ($perms)"
+  elif [ -n "$perms" ]; then
+    note ".env permissions are $perms — consider: chmod 600 .env"
+  fi
 elif [ -f .env ]; then
   failure ".env exists but git is NOT ignoring it"
 else
@@ -114,8 +192,14 @@ else
   failure "credential redaction is missing from the logging setup"
 fi
 
+if grep -q 'register_secret(passphrase)' src/btcbot/config/loader.py; then
+  pass "the API passphrase is registered for log redaction"
+else
+  failure "the passphrase is not registered with the redaction filter"
+fi
+
 # ---------------------------------------------------------------
-section "5. Order-path guards"
+section "6. Order-path guards"
 if grep -q 'UNIQUE (setup_id, intent)' src/btcbot/database/migrations.py; then
   pass "database uniqueness constraint blocks duplicate orders"
 else
@@ -135,8 +219,28 @@ else
   failure "the position-size clamp is missing"
 fi
 
+if grep -q '_set_and_confirm_leverage' src/btcbot/execution/demo_executor.py &&
+   grep -q 'get_leverage_info' src/btcbot/execution/demo_executor.py; then
+  pass "leverage is set AND confirmed before every entry"
+else
+  failure "the set-and-confirm leverage step is missing"
+fi
+
+if grep -q 'liq_buffer_stop_ratio' src/btcbot/risk/leverage_engine.py; then
+  pass "liquidation buffer is enforced by the leverage engine"
+else
+  failure "the liquidation-buffer check is missing"
+fi
+
+if grep -q 'TdMode.ISOLATED' src/btcbot/execution/demo_executor.py &&
+   ! grep -q 'TdMode.CROSS' src/btcbot/execution/demo_executor.py; then
+  pass "the executor submits isolated-margin orders only"
+else
+  failure "the executor references cross margin"
+fi
+
 # ---------------------------------------------------------------
-section "6. Look-ahead protection"
+section "7. Look-ahead protection"
 if grep -q 'def is_closed' src/btcbot/exchange/models.py && \
    grep -q 'LookAheadError' src/btcbot/market_data/candles.py; then
   pass "closed-candle guard and LookAheadError are present"
@@ -151,7 +255,7 @@ else
 fi
 
 # ---------------------------------------------------------------
-section "7. Bare except / silent failures"
+section "8. Bare except / silent failures"
 bare="$(grep -rn --include='*.py' -E '^\s*except\s*:' src/ 2>/dev/null || true)"
 if [ -n "$bare" ]; then
   echo "$bare"
@@ -163,7 +267,7 @@ fi
 # ---------------------------------------------------------------
 printf "\n%s" "$BOLD"
 if [ "$FAILURES" -eq 0 ]; then
-  printf "%sAUDIT PASSED — no real-money capability, no leaked credentials.%s\n" "$GREEN" "$OFF"
+  printf "%sAUDIT PASSED — demo-only, header-enforced, no real-money capability.%s\n" "$GREEN" "$OFF"
   exit 0
 fi
 printf "%sAUDIT FAILED — %d issue(s) above must be fixed.%s\n" "$RED" "$FAILURES" "$OFF"

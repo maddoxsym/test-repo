@@ -463,6 +463,97 @@ class DonchianTrendFollow(Strategy):
         )
 
 
+class MultiTimeframeTrendPullback(Strategy):
+    """8. Multi-timeframe trend pullback — HTF direction, LTF timing.
+
+    Distinct from :class:`MaPullback`, which decides direction *and* timing on a
+    single timeframe. Here the 4H decides the direction, the 1H must agree, and
+    only the 15m decides *when* — so it declines trades a single-timeframe
+    pullback would take against a higher-timeframe trend.
+    """
+
+    id = "mtf_trend_pullback_15m"
+    name = "Multi-Timeframe Trend Pullback"
+    version = "1.0"
+    category = StrategyCategory.TREND
+    hypothesis = (
+        "A pullback is only worth buying when the timeframe that sets direction "
+        "and the timeframe that sets timing disagree about the pullback but "
+        "agree about the trend."
+    )
+    primary_timeframe = "15"
+    context_timeframes = ("60", "240")
+    default_rr = 2.5
+    atr_stop_mult = 1.6
+    exit_mechanisms = frozenset(
+        {ExitMechanism.FIXED_RR, ExitMechanism.ATR_STOP, ExitMechanism.TRAILING_STOP,
+         ExitMechanism.BREAK_EVEN, ExitMechanism.STRUCTURE_TARGET}
+    )
+    preferred_regimes = frozenset(
+        {Regime.TREND_UP, Regime.TREND_DOWN, Regime.STRONG_TREND_UP, Regime.STRONG_TREND_DOWN}
+    )
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"pullback_ma": "ema21", "rr_target": 2.5, "atr_stop_mult": 1.6,
+                "max_pullback_atr": 2.5, "break_even_at_r": 1.2}
+
+    @classmethod
+    def parameter_space(cls) -> dict[str, list[Any]]:
+        return {"rr_target": [2.0, 2.5, 3.0], "atr_stop_mult": [1.2, 1.6, 2.0],
+                "max_pullback_atr": [1.5, 2.5, 3.5]}
+
+    def detect(self, ctx: StrategyContext, features: FeatureSet) -> SetupProposal | None:
+        htf = ctx.tf("240")
+        mtf = ctx.tf("60")
+        if htf is None or mtf is None:
+            return None
+
+        # Direction comes from the 4H, and the 1H must not contradict it.
+        htf_long = trend_alignment(htf, Direction.LONG)
+        htf_short = trend_alignment(htf, Direction.SHORT)
+        if htf_long > 0 and trend_alignment(mtf, Direction.LONG) > 0:
+            direction = Direction.LONG
+        elif htf_short > 0 and trend_alignment(mtf, Direction.SHORT) > 0:
+            direction = Direction.SHORT
+        else:
+            return None
+
+        ma_name = self.param("pullback_ma")
+        ma_now = features.last(ma_name)
+        atr = features.last("atr14")
+        close = features.close
+        if not all(np.isfinite(v) for v in (ma_now, atr, close)) or atr <= 0:
+            return None
+
+        # The pullback itself: price has come back *to* the MA on the entry
+        # timeframe, but not so far that the trend is in question.
+        distance_atr = abs(close - ma_now) / atr
+        if distance_atr > float(self.param("max_pullback_atr")):
+            return None
+        if direction is Direction.LONG:
+            touched = features.low <= ma_now and close > ma_now
+        else:
+            touched = features.high >= ma_now and close < ma_now
+        if not touched:
+            return None
+
+        confidence = 0.58 + clamp((2.5 - distance_atr) * 0.06, 0.0, 0.15)
+        if abs(htf_long if direction is Direction.LONG else htf_short) > 0.5:
+            confidence += 0.06
+
+        return SetupProposal(
+            direction=direction,
+            entry_reference=close,
+            setup_key=f"mtfpull_{int(features.bar_open_ms)}_{direction.value}",
+            rationale=(
+                f"4H and 1H both {direction.value}; 15m pulled back to {ma_name} "
+                f"({distance_atr:.2f} ATR) and closed back through it."
+            ),
+            raw_confidence=confidence,
+        )
+
+
 TREND_STRATEGIES: tuple[type[Strategy], ...] = (
     EmaTrendCross,
     EmaAdxTrend,
@@ -471,4 +562,5 @@ TREND_STRATEGIES: tuple[type[Strategy], ...] = (
     IchimokuTrend,
     MaPullback,
     DonchianTrendFollow,
+    MultiTimeframeTrendPullback,
 )

@@ -130,6 +130,7 @@ class CandidateGenerator:
                 fee_rate_maker=self.backtest_config.fee_rate_maker,
                 slippage_bps=self.backtest_config.slippage_bps,
                 spread_bps=self.backtest_config.spread_bps,
+                funding_rate_8h=self.backtest_config.funding_rate_8h,
             ),
             regime_config=self.regime_config,
         )
@@ -305,6 +306,7 @@ class CandidateGenerator:
                 fee_rate_maker=self.backtest_config.fee_rate_maker,
                 slippage_bps=self.backtest_config.slippage_bps,
                 spread_bps=self.backtest_config.spread_bps,
+                funding_rate_8h=self.backtest_config.funding_rate_8h,
             ),
             regime_config=self.regime_config,
         )

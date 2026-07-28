@@ -29,55 +29,55 @@ header — so demo safety moves from "pin a separate host" to "centrally enforce
 The WS side *is* host-separated (`wseeapap` vs `wseea`), one infix apart — exact-host
 allow-list, never substring matching.
 
-## Phase M2 — Exchange layer replacement  `[ ]`
+## Phase M2 — Exchange layer replacement  `[x]`
 
-- [ ] `endpoints.py` → OKX EEA hosts; forbidden-host list incl. EEA live WS, global/US hosts
-- [ ] `signing.py` → OKX scheme (base64, ISO ts, passphrase; WS login variant with epoch-seconds ts)
-- [ ] `rest.py` → `OkxDemoClient`: central `x-simulated-trading: 1` injection, envelope
+- [x] `endpoints.py` → OKX EEA hosts; forbidden-host list incl. EEA live WS, global/US hosts
+- [x] `signing.py` → OKX scheme (base64, ISO ts, passphrase; WS login variant with epoch-seconds ts)
+- [x] `rest.py` → `OkxDemoClient`: central `x-simulated-trading: 1` injection, envelope
       (`code`/`sCode` both levels), retry/backoff, clock-drift measurement → trading pause
-- [ ] `demo_guard.py` → 4 signals: host pin, header enforcement, authed demo reachability,
+- [x] `demo_guard.py` → 4 signals: host pin, header enforcement, authed demo reachability,
       live-environment negative control (must fail 50101)
-- [ ] `instruments.py` → SWAP discovery, X-Perp selection (linear/BTC/live), `ctVal`/`ctMult`/
+- [x] `instruments.py` → SWAP discovery, X-Perp selection (linear/BTC/live), `ctVal`/`ctMult`/
       `lotSz`/`minSz`/`tickSz`/`lever` spec, contract↔base conversion
-- [ ] `ws.py` → public/private/**business** (candles live on business, `brokerId=9999`)
-- [ ] `models.py` → perp fields: posSide, tdMode, leverage, liqPx, mgnRatio, funding
-- [ ] Remove the Bybit integration (no selectable Bybit path remains)
-- [ ] `clOrdId` ≤ 32 chars → re-pack the client-order-ID layout
+- [x] `ws.py` → public/private/**business** (candles live on business, `brokerId=9999`)
+- [x] `models.py` → perp fields: posSide, tdMode, leverage, liqPx, mgnRatio, funding
+- [x] Remove the Bybit integration (no selectable Bybit path remains)
+- [x] `clOrdId` ≤ 32 chars → re-pack the client-order-ID layout
 
-## Phase M3 — Derivatives execution  `[ ]`
+## Phase M3 — Derivatives execution  `[x]`
 
-- [ ] Long AND short routing (net vs long/short mode adaptation; `reduceOnly` correctness)
-- [ ] `DYNAMIC_LEVERAGE_ENGINE` (1x–10x from confidence/vol/regime/drawdown; journaled)
-- [ ] Set-and-confirm leverage before every entry (`set-leverage` → `leverage-info`)
-- [ ] Isolated margin only; no silent cross fallback
-- [ ] Liquidation protection: stop-vs-liqPx clearance check, margin-ratio circuit breaker
-- [ ] Funding/settlement/fee tracking wired into PnL, scores, champion selection
+- [x] Long AND short routing (net vs long/short mode adaptation; `reduceOnly` correctness)
+- [x] `DYNAMIC_LEVERAGE_ENGINE` (1x–10x from confidence/vol/regime/drawdown; journaled)
+- [x] Set-and-confirm leverage before every entry (`set-leverage` → `leverage-info`)
+- [x] Isolated margin only; no silent cross fallback
+- [x] Liquidation protection: stop-vs-liqPx clearance check, margin-ratio circuit breaker
+- [x] Funding/settlement/fee tracking wired into PnL, scores, champion selection
 
-## Phase M4 — Decision engine  `[ ]`
+## Phase M4 — Decision engine  `[x]`
 
-- [ ] Ten-layer decision pipeline with per-layer accept/reject logging
-- [ ] `rejected_signals` + `leverage_decisions` DB entities (new migration)
-- [ ] Risk states NORMAL / REDUCED / DEFENSIVE / PAUSED
+- [x] Ten-layer decision pipeline with per-layer accept/reject logging
+- [x] `rejected_signals` + `leverage_decisions` DB entities (new migration)
+- [x] Risk states NORMAL / REDUCED / DEFENSIVE / PAUSED
 
-## Phase M5 — Research engines updated for perps  `[ ]`
+## Phase M5 — Research engines updated for perps  `[x]`
 
-- [ ] Shadow accounts: leverage, margin, funding, liquidation modelling
-- [ ] Backtester/walk-forward: same; deterministic fixture retained and extended
-- [ ] Strategy library expanded toward the enumerated set (38 → 45+)
+- [x] Shadow accounts: leverage, margin, funding, liquidation modelling
+- [x] Backtester/walk-forward: same; deterministic fixture retained and extended
+- [x] Strategy library expanded 38 → **52** across the enumerated set
 
-## Phase M6 — Surfaces  `[ ]`
+## Phase M6 — Surfaces  `[x]`
 
-- [ ] Config/env: `OKX_DEMO_API_KEY/SECRET/PASSPHRASE`, `OKX_DEMO_RESEARCH` mode naming
-- [ ] Dashboard: instrument, position (leverage/liqPx/funding), decision + management panels
-- [ ] Scripts: `verify_okx_demo_connection.sh` (17 checks, no orders),
+- [x] Config/env: `OKX_DEMO_API_KEY/SECRET/PASSPHRASE`, `OKX_DEMO_RESEARCH` mode naming
+- [x] Dashboard: instrument, position (leverage/liqPx/funding), decision + management panels
+- [x] Scripts: `verify_okx_demo_connection.sh` (17 checks, no orders),
       `smoke_test_okx_demo.sh --confirm-demo`; retire Bybit-named scripts
-- [ ] Reports/README/docs wording swept for Bybit references
+- [x] Reports/README/docs wording swept for Bybit references
 
-## Phase M7 — Verification  `[ ]`
+## Phase M7 — Verification  `[x]`
 
-- [ ] Full test suite green (all existing + new OKX tests, mocked-client integration)
-- [ ] `ruff` clean; `audit_safety.sh` updated for OKX (header enforcement, host confinement)
-- [ ] Dry run offline; audit for live endpoints / missing demo headers / contract maths
+- [x] Full test suite green (all existing + new OKX tests, mocked-client integration)
+- [x] `ruff` clean; `audit_safety.sh` updated for OKX (header enforcement, host confinement)
+- [x] Dry run offline; audit for live endpoints / missing demo headers / contract maths
 
 ---
 
