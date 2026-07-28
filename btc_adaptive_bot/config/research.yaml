@@ -1,12 +1,12 @@
 # ============================================================
-#  Research profile — the 14-day Bybit Demo experiment.
+#  Research profile — the 14-day OKX Europe Demo experiment (BTC X-Perp).
 #  Inherits every value from default.yaml; only overrides below.
 #  Used by ./scripts/run_research.sh
 # ============================================================
 extends: default.yaml
 
 experiment:
-  name: BYBIT_DEMO_RESEARCH
+  name: OKX_DEMO_RESEARCH
   research_duration_days: 14
 
 # The research phase is intentionally data-hungry: many shadow strategies running

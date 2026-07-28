@@ -23,7 +23,7 @@ from btcbot.config.schema import (  # noqa: E402
 from btcbot.database.db import Database  # noqa: E402
 from btcbot.database.migrations import run_migrations  # noqa: E402
 from btcbot.database.repositories import Repositories  # noqa: E402
-from btcbot.exchange.models import Candle, Capability, Category, InstrumentSpec  # noqa: E402
+from btcbot.exchange.models import Candle, Capability, InstrumentSpec, InstType  # noqa: E402
 
 
 @pytest.fixture
@@ -51,52 +51,38 @@ def scoring_config() -> ScoringConfig:
     return ScoringConfig()
 
 
-@pytest.fixture
-def spot_instrument() -> InstrumentSpec:
-    """A BTCUSDT spot instrument matching Bybit's documented response shape."""
-    return InstrumentSpec(
-        symbol="BTCUSDT",
-        category=Category.SPOT,
-        base_coin="BTC",
-        quote_coin="USDT",
-        status="Trading",
-        tick_size=Decimal("0.1"),
-        qty_step=Decimal("0.000001"),
-        min_order_qty=Decimal("0.000011"),
-        max_order_qty=Decimal("83"),
-        min_order_amt=Decimal("5"),
-        max_order_amt=Decimal("8000000"),
-        max_market_order_qty=Decimal("41.5"),
-        base_precision=Decimal("0.000001"),
-        capabilities=frozenset(
-            {
-                Capability.LONG,
-                Capability.MARKET_ORDER,
-                Capability.LIMIT_ORDER,
-                Capability.ATTACHED_TPSL,
-            }
-        ),
-        margin_trading="utaOnly",
-    )
+def make_perp_instrument(
+    *,
+    inst_id: str = "BTC-USDT-SWAP",
+    ct_val: str = "0.01",
+    lot_size: str = "0.1",
+    min_size: str = "0.1",
+    tick_size: str = "0.1",
+    max_leverage: str = "100",
+    settle_ccy: str = "USDT",
+) -> InstrumentSpec:
+    """A linear BTC perpetual matching OKX's instruments response shape.
 
-
-@pytest.fixture
-def linear_instrument() -> InstrumentSpec:
-    """A derivatives instrument — used to prove short support is discovered, not assumed."""
+    ``inst_id`` and the contract parameters are *fixture inputs*, mirroring
+    what runtime discovery would return — production code never hardcodes them.
+    """
     return InstrumentSpec(
-        symbol="BTCUSDT",
-        category=Category.LINEAR,
-        base_coin="BTC",
-        quote_coin="USDT",
-        status="Trading",
-        tick_size=Decimal("0.10"),
-        qty_step=Decimal("0.001"),
-        min_order_qty=Decimal("0.001"),
-        max_order_qty=Decimal("1190"),
-        min_order_amt=None,
-        max_order_amt=None,
-        max_market_order_qty=Decimal("500"),
-        base_precision=None,
+        inst_id=inst_id,
+        inst_type=InstType.SWAP,
+        base_ccy="BTC",
+        quote_ccy="USDT",
+        settle_ccy=settle_ccy,
+        ct_type="linear",
+        ct_val=Decimal(ct_val),
+        ct_val_ccy="BTC",
+        ct_mult=Decimal("1"),
+        state="live",
+        tick_size=Decimal(tick_size),
+        lot_size=Decimal(lot_size),
+        min_size=Decimal(min_size),
+        max_lmt_size=Decimal("100000"),
+        max_mkt_size=Decimal("12000"),
+        max_leverage=Decimal(max_leverage),
         capabilities=frozenset(
             {
                 Capability.LONG,
@@ -105,9 +91,22 @@ def linear_instrument() -> InstrumentSpec:
                 Capability.MARKET_ORDER,
                 Capability.LIMIT_ORDER,
                 Capability.REDUCE_ONLY,
+                Capability.ATTACHED_TPSL,
             }
         ),
     )
+
+
+@pytest.fixture
+def perp_instrument() -> InstrumentSpec:
+    """The default linear BTC X-Perp used across execution/sizing tests."""
+    return make_perp_instrument()
+
+
+@pytest.fixture
+def linear_instrument() -> InstrumentSpec:
+    """Alias fixture — a discovered linear perpetual with native short support."""
+    return make_perp_instrument()
 
 
 @pytest.fixture

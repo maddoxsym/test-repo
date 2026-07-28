@@ -42,6 +42,8 @@ class BreakerType(str, Enum):
     ORDER_FREQUENCY = "abnormal_order_frequency"
     DUPLICATE_ORDER = "duplicate_order_attempt"
     DEMO_UNVERIFIED = "demo_unverified"
+    CLOCK_DRIFT = "clock_drift"
+    LIQUIDATION_RISK = "liquidation_risk"
 
 
 @dataclass(slots=True)
@@ -233,6 +235,43 @@ class CircuitBreakers:
         if not 0.0 <= confidence <= 1.0:
             return self._trip(
                 BreakerType.CORRUPT_STRATEGY_OUTPUT, f"confidence {confidence} outside [0, 1]"
+            )
+        return None
+
+    def check_clock_drift(self, drift_ms: int) -> BreakerTrip | None:
+        """Pause authenticated trading when the local clock wanders.
+
+        OKX rejects requests whose timestamp strays too far from server time,
+        and a machine whose clock cannot be trusted cannot stamp orders. The
+        drift is measured against the exchange's own time endpoint.
+        """
+        if abs(drift_ms) > self.config.max_clock_drift_ms:
+            return self._trip(
+                BreakerType.CLOCK_DRIFT,
+                f"local clock differs from OKX server time by {drift_ms}ms "
+                f"(limit {self.config.max_clock_drift_ms}ms) — authenticated trading paused; "
+                "enable NTP time sync",
+            )
+        return None
+
+    def check_liquidation_risk(
+        self, *, margin_ratio: float | None, inst_id: str
+    ) -> BreakerTrip | None:
+        """Trip when a live position's margin ratio degrades toward liquidation.
+
+        OKX's ``mgnRatio`` shrinks toward 1.0 as a position approaches its
+        maintenance level; below the configured floor the position must be
+        flattened and trading paused.
+        """
+        if margin_ratio is None:
+            return None
+        if margin_ratio <= 0:
+            return None
+        if margin_ratio < self.config.liquidation_margin_ratio_floor:
+            return self._trip(
+                BreakerType.LIQUIDATION_RISK,
+                f"{inst_id} margin ratio {margin_ratio:.2f} is below the floor "
+                f"{self.config.liquidation_margin_ratio_floor:.2f} — flattening and pausing",
             )
         return None
 

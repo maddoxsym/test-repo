@@ -32,19 +32,24 @@ class OrderBookState:
     valid: bool = False
 
     def apply(self, data: dict[str, Any], msg_type: str) -> None:
+        """Apply an OKX ``books`` frame (``action`` snapshot/update).
+
+        OKX levels are ``[price, size, liquidatedOrders, orderCount]``; a size
+        of 0 deletes the level.
+        """
         if msg_type == "snapshot":
             self.bids.clear()
             self.asks.clear()
             self.resets += 1
             self.valid = True
-        for price_str, size_str in data.get("b", []) or []:
-            price, size = float(price_str), float(size_str)
+        for level in data.get("bids", []) or []:
+            price, size = float(level[0]), float(level[1])
             if size == 0:
                 self.bids.pop(price, None)
             else:
                 self.bids[price] = size
-        for price_str, size_str in data.get("a", []) or []:
-            price, size = float(price_str), float(size_str)
+        for level in data.get("asks", []) or []:
+            price, size = float(level[0]), float(level[1])
             if size == 0:
                 self.asks.pop(price, None)
             else:
@@ -93,10 +98,15 @@ class TradeFlow:
     last_update_ms: int = 0
 
     def add(self, trades: list[dict[str, Any]]) -> None:
+        """Ingest OKX ``trades`` items: ``{ts, side, sz, px, tradeId}``."""
         for trade in trades:
             try:
                 self.window.append(
-                    (int(trade.get("T", 0)), str(trade.get("S", "")), float(trade.get("v", 0.0)))
+                    (
+                        int(trade.get("ts", 0)),
+                        str(trade.get("side", "")).lower(),
+                        float(trade.get("sz", 0.0)),
+                    )
                 )
             except (TypeError, ValueError):
                 continue
@@ -111,9 +121,9 @@ class TradeFlow:
         for ts, side, volume in reversed(self.window):
             if ts < cutoff:
                 break
-            if side == "Buy":
+            if side == "buy":
                 buys += volume
-            elif side == "Sell":
+            elif side == "sell":
                 sells += volume
         total = buys + sells
         return safe_div(buys - sells, total)
@@ -179,39 +189,6 @@ class MarketDataStore:
         self.ticker_updated_ms = now_ms()
         if ticker.last_price > 0:
             self._last_price = ticker.last_price
-
-    def update_ticker_from_ws(self, data: dict[str, Any]) -> None:
-        """Merge a partial ticker delta.
-
-        Bybit's spot ticker frames are partial: absent fields must keep their
-        previous value rather than resetting to zero.
-        """
-        if not data:
-            return
-        previous = self.ticker
-
-        def pick(key: str, fallback: float) -> float:
-            value = data.get(key)
-            if value in (None, ""):
-                return fallback
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return fallback
-
-        self.ticker = Ticker(
-            symbol=data.get("symbol", self.symbol),
-            last_price=pick("lastPrice", previous.last_price if previous else 0.0),
-            bid_price=pick("bid1Price", previous.bid_price if previous else 0.0),
-            ask_price=pick("ask1Price", previous.ask_price if previous else 0.0),
-            volume_24h=pick("volume24h", previous.volume_24h if previous else 0.0),
-            turnover_24h=pick("turnover24h", previous.turnover_24h if previous else 0.0),
-            price_24h_pct=pick("price24hPcnt", previous.price_24h_pct if previous else 0.0),
-            ts_ms=now_ms(),
-        )
-        self.ticker_updated_ms = now_ms()
-        if self.ticker.last_price > 0:
-            self._last_price = self.ticker.last_price
 
     def update_orderbook(self, data: dict[str, Any], msg_type: str) -> None:
         self.orderbook.apply(data, msg_type)

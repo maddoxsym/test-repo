@@ -1,6 +1,6 @@
 """Command-line entry points.
 
-    btcbot verify      # pre-flight demo check, places no order
+    btcbot verify      # pre-flight demo check (17 checks), places no order
     btcbot research    # start/resume the 14-day experiment
     btcbot champion    # run champion mode on the same demo account
     btcbot dry-run     # real public data, no authenticated orders, no timer
@@ -8,10 +8,11 @@
     btcbot report      # regenerate reports
     btcbot export      # export every entity to CSV
     btcbot backup      # back up the database
-    btcbot topup       # request demo funds (demo-only endpoint)
 
 There is deliberately **no** flag anywhere here that enables real-money
-trading, selects a different host, or bypasses demo verification.
+trading, selects a different host, disables the demo header, or bypasses
+demo verification. (OKX demo funds are topped up in the OKX Demo Trading
+web UI — the API exposes no funds endpoint, so none exists here.)
 """
 
 from __future__ import annotations
@@ -236,43 +237,6 @@ async def cmd_backup(args: argparse.Namespace) -> int:
     return 0
 
 
-async def cmd_topup(args: argparse.Namespace) -> int:
-    """Request demo funds via Bybit's demo-only endpoint."""
-    from ..exchange.rest import BybitDemoClient
-
-    loaded = load_config(args.config)
-    _configure_logging(loaded, override_level=args.log_level)
-    credentials = load_credentials(required=True)
-    assert credentials is not None
-
-    client = BybitDemoClient(
-        api_key=credentials.api_key,
-        api_secret=credentials.api_secret,
-        recv_window_ms=loaded.config.exchange.recv_window_ms,
-    )
-    try:
-        from ..exchange.demo_guard import DemoGuard
-
-        guard = DemoGuard(
-            client,
-            api_key=credentials.api_key,
-            api_secret=credentials.api_secret,
-            run_mainnet_negative_control=loaded.config.safety.mainnet_negative_control,
-        )
-        verification = await guard.verify()
-        if not verification.verified:
-            log.error("SAFETY", "Demo not verified — refusing to call the funds endpoint.")
-            return 1
-
-        result = await client.request_demo_funds(args.coin, args.amount)
-        log.info("BALANCE", f"Requested {args.amount} {args.coin} of demo funds: {result}")
-        balance = await client.get_wallet_balance()
-        log.info("BALANCE", f"Demo equity is now ${balance.total_equity:,.2f}")
-    finally:
-        await client.close()
-    return 0
-
-
 # ---------------------------------------------------------------- parser
 
 
@@ -280,8 +244,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="btcbot",
         description=(
-            "Adaptive BTC trading research system — Bybit Demo only. "
-            "This build has no real-money trading mode."
+            "Adaptive BTC trading research system — OKX Europe Demo only "
+            "(BTC X-Perp). This build has no real-money trading mode."
         ),
     )
     parser.add_argument("--version", action="version", version=f"btcbot {__version__} ({git_commit()})")
@@ -292,7 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-dashboard", action="store_true", help="do not start the dashboard")
 
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("verify", help="verify the Bybit demo connection (places no order)")
+    sub.add_parser("verify", help="verify the OKX demo connection (17 checks, places no order)")
     sub.add_parser("research", help="start or resume the 14-day demo research experiment")
     sub.add_parser("champion", help="run champion mode on the same demo account")
     sub.add_parser("dry-run", help="real public data, no authenticated orders, no timer")
@@ -300,10 +264,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("report", help="regenerate strategy/execution/learning reports")
     sub.add_parser("export", help="export all research data to CSV")
     sub.add_parser("backup", help="back up the database")
-
-    topup = sub.add_parser("topup", help="request Bybit demo funds (demo-only endpoint)")
-    topup.add_argument("--coin", default="USDT", choices=["USDT", "USDC", "BTC", "ETH"])
-    topup.add_argument("--amount", default="10000", help="amount to request (max: USDT 100000)")
 
     return parser
 
@@ -317,7 +277,6 @@ COMMANDS = {
     "report": cmd_report,
     "export": cmd_export,
     "backup": cmd_backup,
-    "topup": cmd_topup,
 }
 
 

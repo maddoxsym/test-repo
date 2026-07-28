@@ -21,16 +21,25 @@ from btcbot.config.schema import (
     SafetyConfig,
     ShadowConfig,
 )
+from btcbot.config.schema import LeverageConfig
 from btcbot.exchange.demo_guard import DemoGuard, DemoVerification, SignalResult
 from btcbot.exchange.instruments import ExchangeCapabilities
-from btcbot.exchange.models import Category, Execution, OrderResult, Side
-from btcbot.exchange.rest import BybitDemoClient
+from btcbot.exchange.models import (
+    Execution,
+    LeverageInfo,
+    OrderResult,
+    PositionMode,
+    Side,
+    TdMode,
+)
+from btcbot.exchange.rest import OkxDemoClient
 from btcbot.execution.allocator import DemoAllocator
 from btcbot.execution.demo_executor import DemoExecutor
 from btcbot.execution.order_safety import OrderSafetyGuard
 from btcbot.execution.position_ledger import PositionLedger
 from btcbot.execution.trade_manager import TradeManager
 from btcbot.regime.classifier import Regime
+from btcbot.risk.leverage_engine import LeverageEngine
 from btcbot.risk.position_sizing import PositionSizer
 from btcbot.safety.circuit_breakers import CircuitBreakers
 from btcbot.strategies.base import Direction, ExitMechanism, ExitPolicy, StrategySignal
@@ -40,14 +49,26 @@ from btcbot.utils.timeutil import now_utc
 pytestmark = pytest.mark.integration
 
 
-class MockBybitClient:
-    """Records calls; never touches the network."""
+class MockOkxClient:
+    """Records calls; never touches the network.
 
-    def __init__(self, *, fail_with: Exception | None = None) -> None:
-        self.base_url = "https://api-demo.bybit.com"
+    Mirrors the OKX client surface the executor uses, including the
+    set-and-confirm leverage round trip.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_with: Exception | None = None,
+        leverage_confirm_mismatch: bool = False,
+    ) -> None:
+        self.base_url = "https://eea.okx.com"
         self.orders: list[Any] = []
         self.cancels: list[Any] = []
+        self.leverage_sets: list[tuple[str, str, str | None]] = []
         self._fail_with = fail_with
+        self._leverage_confirm_mismatch = leverage_confirm_mismatch
+        self._current_leverage = "0"
         self.consecutive_errors = 0
 
     @property
@@ -62,21 +83,40 @@ class MockBybitClient:
             client_order_id=request.client_order_id,
             exchange_order_id=f"mock-{len(self.orders)}",
             accepted=True,
-            raw={"retCode": 0},
+            raw={"code": "0"},
         )
 
-    async def cancel_all(self, symbol: str, *, category: Category) -> dict[str, Any]:
-        self.cancels.append((symbol, category))
-        return {}
+    async def set_leverage(self, inst_id, leverage, *, mgn_mode, pos_side=None):
+        self.leverage_sets.append((inst_id, leverage, pos_side))
+        self._current_leverage = leverage
+        return {"instId": inst_id, "lever": leverage, "mgnMode": mgn_mode}
+
+    async def get_leverage_info(self, inst_id, *, mgn_mode):
+        lever = "1" if self._leverage_confirm_mismatch else self._current_leverage
+        return [
+            LeverageInfo(inst_id=inst_id, margin_mode=mgn_mode, pos_side="net",
+                         leverage=__import__("decimal").Decimal(lever))
+        ]
+
+    async def get_positions(self, inst_id=None):
+        return []
+
+    async def cancel_all(self, inst_id: str) -> dict[str, Any]:
+        self.cancels.append(inst_id)
+        return {"cancelled": 0, "failed": []}
+
+
+# Backwards-friendly alias used throughout this module.
+MockBybitClient = MockOkxClient
 
 
 def _verified_guard() -> DemoGuard:
-    guard = DemoGuard(BybitDemoClient(), run_mainnet_negative_control=False)
+    guard = DemoGuard(OkxDemoClient(), run_mainnet_negative_control=False)
     signals = [
         SignalResult("host pin", True, "ok"),
+        SignalResult("demo header enforcement", True, "ok"),
         SignalResult("authenticated reachability", True, "ok"),
-        SignalResult("demo-only endpoint probe", True, "ok"),
-        SignalResult("mainnet negative control", True, "ok"),
+        SignalResult("live-environment negative control", True, "ok"),
     ]
     guard._verified = True                       # noqa: SLF001 - test seam
     guard._last_verification = DemoVerification(  # noqa: SLF001
@@ -86,7 +126,7 @@ def _verified_guard() -> DemoGuard:
 
 
 def _unverified_guard() -> DemoGuard:
-    return DemoGuard(BybitDemoClient(), run_mainnet_negative_control=False)
+    return DemoGuard(OkxDemoClient(), run_mainnet_negative_control=False)
 
 
 def _signal(direction: Direction = Direction.LONG, **overrides) -> StrategySignal:
@@ -94,7 +134,7 @@ def _signal(direction: Direction = Direction.LONG, **overrides) -> StrategySigna
         strategy_id="ema_trend_cross_15m",
         strategy_version="1.0",
         direction=direction,
-        symbol="BTCUSDT",
+        symbol="BTC-USDT-SWAP",
         timeframe="15",
         bar_open_ms=1_700_000_000_000,
         entry_reference=50_000.0,
@@ -115,38 +155,56 @@ def _signal(direction: Direction = Direction.LONG, **overrides) -> StrategySigna
 
 
 @pytest.fixture
-def capabilities(spot_instrument) -> ExchangeCapabilities:
-    return ExchangeCapabilities(
-        symbol="BTCUSDT",
-        instruments={Category.SPOT: spot_instrument},
-        tradable_categories=(Category.SPOT,),
-        primary_category=Category.SPOT,
-    )
+def capabilities(perp_instrument) -> ExchangeCapabilities:
+    return ExchangeCapabilities(base_ccy="BTC", instrument=perp_instrument)
 
 
 @pytest.fixture
-def linear_capabilities(linear_instrument) -> ExchangeCapabilities:
-    return ExchangeCapabilities(
-        symbol="BTCUSDT",
-        instruments={Category.LINEAR: linear_instrument},
-        tradable_categories=(Category.LINEAR,),
-        primary_category=Category.LINEAR,
+def long_only_capabilities() -> ExchangeCapabilities:
+    """A hypothetical long-only product — proves capability is discovered."""
+    from dataclasses import replace
+
+    from btcbot.exchange.models import Capability
+
+    from conftest import make_perp_instrument
+
+    crippled = replace(
+        make_perp_instrument(),
+        capabilities=frozenset({Capability.LONG, Capability.MARKET_ORDER}),
     )
+    return ExchangeCapabilities(base_ccy="BTC", instrument=crippled)
 
 
-def _executor(repos, client, guard, *, dry_run: bool = False) -> tuple[DemoExecutor, PositionLedger]:
+# The full perp capabilities double as the "shorts allowed" fixture.
+@pytest.fixture
+def linear_capabilities(capabilities) -> ExchangeCapabilities:
+    return capabilities
+
+
+def _executor(
+    repos,
+    client,
+    guard,
+    *,
+    dry_run: bool = False,
+    position_mode: PositionMode = PositionMode.NET,
+) -> tuple[DemoExecutor, PositionLedger]:
     ledger = PositionLedger(repos.positions, experiment_id="exp_test")
     executor = DemoExecutor(
         client,
         guard=guard,
         breakers=CircuitBreakers(SafetyConfig()),
         sizer=PositionSizer(RiskConfig()),
+        leverage_engine=LeverageEngine(LeverageConfig()),
         ledger=ledger,
         safety=OrderSafetyGuard(repos.demo_orders),
         orders=repos.demo_orders,
+        leverage_decisions=repos.leverage,
+        rejected_signals=repos.rejected,
         system=repos.system,
         risk_config=RiskConfig(),
         experiment_id="exp_test",
+        position_mode=position_mode,
         dry_run=dry_run,
     )
     return executor, ledger
@@ -184,10 +242,17 @@ class TestHappyPath:
 
         request = client.orders[0]
         assert request.side is Side.BUY
-        assert request.category is Category.SPOT
-        # Spot market orders default to quote-denominated size; we always state it.
-        assert request.market_unit == "baseCoin"
-        assert "e" not in request.qty.lower(), "quantity used scientific notation"
+        assert request.td_mode is TdMode.ISOLATED, "orders must use isolated margin"
+        assert request.pos_side is None, "net mode omits posSide"
+        assert "e" not in request.sz.lower(), "quantity used scientific notation"
+
+        # Leverage was SET and CONFIRMED before the order existed.
+        assert client.leverage_sets, "no set-leverage call before the entry"
+        assert result.leverage_decision is not None
+        assert 1.0 <= result.leverage_decision.leverage <= 10.0
+        lev_rows = repos.leverage.recent(5)
+        assert lev_rows and lev_rows[0]["approved"] == 1
+        assert lev_rows[0]["confirmed_by_exchange"] == 1
 
         # Attribution is fully recorded.
         stored = repos.demo_orders.get(result.client_order_id)
@@ -199,6 +264,9 @@ class TestHappyPath:
         assert stored["status"] == "accepted"
         assert stored["signal_ts_utc"]
         assert stored["sizing_reasoning"]
+        assert stored["td_mode"] == "isolated"
+        assert stored["leverage"] and 1.0 <= stored["leverage"] <= 10.0
+        assert stored["contracts"] and stored["contracts"] > 0
 
         # The ledger knows why, who, and when.
         position = ledger.current()
@@ -220,6 +288,8 @@ class TestHappyPath:
         assert exit_result.success
         assert len(client.orders) == 2
         assert client.orders[1].side is Side.SELL
+        # In net mode a close carries reduceOnly so it can never flip direction.
+        assert client.orders[1].reduce_only is True
 
         trade = ledger.close(
             position, exit_price=52_000.0, exit_reason="take_profit",
@@ -236,8 +306,9 @@ class TestHappyPath:
 
         execution = Execution(
             exec_id="exec_1", order_id="mock-1", client_order_id=result.client_order_id,
-            symbol="BTCUSDT", side=Side.BUY, price=50_010.0, qty=0.001, fee=0.0275,
-            fee_currency="USDT", is_maker=False, exec_ts_ms=1_700_000_000_000,
+            inst_id="BTC-USDT-SWAP", side=Side.BUY, pos_side="net", price=50_010.0,
+            qty=0.1, fee=0.0275, fee_currency="USDT", is_maker=False,
+            exec_ts_ms=1_700_000_000_000,
         )
         executor.record_fill(execution)
         executor.record_fill(execution)
@@ -259,24 +330,27 @@ class TestGatesBlockBeforeAnyRequest:
         assert client.orders == [], "an order was sent despite failed verification"
         assert not ledger.has_open_position
 
-    async def test_short_on_spot_is_skipped_and_journaled(self, repos, capabilities):
-        """SHORT strategies stay researchable in shadow, but send no order."""
-        client = MockBybitClient()
+    async def test_short_on_long_only_product_is_skipped_and_journaled(
+        self, repos, long_only_capabilities
+    ):
+        """Capability is discovered, not assumed — a long-only product sends
+        no short order, and the refusal lands in rejected_signals."""
+        client = MockOkxClient()
         executor, _ = _executor(repos, client, _verified_guard())
 
-        result = await _submit(executor, _signal(Direction.SHORT), capabilities)
+        result = await _submit(executor, _signal(Direction.SHORT), long_only_capabilities)
 
         assert not result.success
-        assert "short_not_supported_on_spot" in result.reason
+        assert "not supported" in result.reason
         assert client.orders == []
         categories = {e["category"] for e in repos.system.recent_events(10)}
         assert "order_not_sent" in categories
+        rejected = repos.rejected.recent(5)
+        assert rejected and rejected[0]["layer_name"] == "instrument_capability"
 
-    async def test_short_is_allowed_when_the_product_supports_it(
-        self, repos, linear_capabilities
-    ):
-        """Capability is discovered, not assumed — linear permits shorts."""
-        client = MockBybitClient()
+    async def test_short_is_allowed_on_the_perp(self, repos, linear_capabilities):
+        """The X-Perp shorts natively — a SHORT entry is a sell order."""
+        client = MockOkxClient()
         executor, _ = _executor(repos, client, _verified_guard())
 
         result = await _submit(executor, _signal(Direction.SHORT), linear_capabilities)
@@ -284,6 +358,44 @@ class TestGatesBlockBeforeAnyRequest:
         assert result.success, result.reason
         assert client.orders[0].side is Side.SELL
         assert client.orders[0].reduce_only is None  # entry, not a reduce
+
+    async def test_long_short_mode_carries_pos_side(self, repos, capabilities):
+        """In long/short accounts the order pair (side, posSide) is explicit."""
+        from btcbot.exchange.models import PosSide
+
+        client = MockOkxClient()
+        executor, ledger = _executor(
+            repos, client, _verified_guard(), position_mode=PositionMode.LONG_SHORT
+        )
+        result = await _submit(executor, _signal(Direction.SHORT), capabilities)
+        assert result.success, result.reason
+        assert client.orders[0].side is Side.SELL
+        assert client.orders[0].pos_side is PosSide.SHORT
+
+        position = ledger.current()
+        exit_result = await executor.submit_exit(
+            position, exit_reason="stop_loss", capabilities=capabilities
+        )
+        assert exit_result.success
+        assert client.orders[1].side is Side.BUY
+        assert client.orders[1].pos_side is PosSide.SHORT
+        assert client.orders[1].reduce_only is None  # unambiguous from the pair
+
+    async def test_leverage_confirmation_mismatch_blocks_the_order(
+        self, repos, capabilities
+    ):
+        """Set-without-confirm is never trusted: a mismatch aborts the entry."""
+        client = MockOkxClient(leverage_confirm_mismatch=True)
+        executor, ledger = _executor(repos, client, _verified_guard())
+
+        result = await _submit(executor, _signal(), capabilities)
+
+        assert not result.success
+        assert "expected" in result.reason or "leverage" in result.reason.lower()
+        assert client.orders == [], "order sent despite unconfirmed leverage"
+        assert not ledger.has_open_position
+        rejected = repos.rejected.recent(5)
+        assert any(r["layer_name"] == "leverage_confirmation" for r in rejected)
 
     async def test_duplicate_setup_sends_only_one_order(self, repos, capabilities):
         client = MockBybitClient()
@@ -334,7 +446,7 @@ class TestGatesBlockBeforeAnyRequest:
         assert result.sizing is not None and result.sizing.approved
 
     async def test_api_rejection_is_recorded_not_retried_blindly(self, repos, capabilities):
-        client = MockBybitClient(fail_with=ApiError(170131, "Insufficient balance", "/v5/order/create"))
+        client = MockOkxClient(fail_with=ApiError(51008, "Insufficient balance", "/api/v5/trade/order"))
         executor, ledger = _executor(repos, client, _verified_guard())
 
         result = await _submit(executor, _signal(), capabilities)
@@ -344,7 +456,7 @@ class TestGatesBlockBeforeAnyRequest:
         assert not ledger.has_open_position
         stored = repos.demo_orders.get(result.client_order_id)
         assert stored["status"] == "rejected"
-        assert "170131" in stored["reject_reason"]
+        assert "51008" in stored["reject_reason"]
 
     async def test_transport_failure_leaves_the_order_for_reconciliation(
         self, repos, capabilities
@@ -352,7 +464,7 @@ class TestGatesBlockBeforeAnyRequest:
         """An ambiguous send must not be blindly retried into a second position."""
         from btcbot.utils.errors import TransportError
 
-        client = MockBybitClient(fail_with=TransportError("connection reset"))
+        client = MockOkxClient(fail_with=TransportError("connection reset"))
         executor, ledger = _executor(repos, client, _verified_guard())
 
         result = await _submit(executor, _signal(), capabilities)
@@ -461,7 +573,7 @@ class TestAllocatorIntegration:
             "setup_id": "set_rate", "strategy_id": "s1", "strategy_version": "1.0",
             "signal_ts_utc": "2026-07-24T12:00:00Z",
             "submitted_ts_utc": now_utc().isoformat().replace("+00:00", "Z"),
-            "symbol": "BTCUSDT", "category": "spot", "side": "Buy", "order_type": "Market",
+            "symbol": "BTC-USDT-SWAP", "category": "SWAP", "side": "buy", "order_type": "market",
             "intent": "entry", "quantity": 0.001, "quantity_str": "0.001", "price": None,
             "estimated_notional": 50.0, "stop_price": 49_000.0, "target_price": 52_000.0,
             "estimated_risk_pct": 0.0075, "regime": "TREND_UP", "confidence": 0.7,
@@ -506,9 +618,10 @@ class TestTradeManagement:
         ledger = PositionLedger(repos.positions, experiment_id="exp_test")
         signal = _signal()
         position = ledger.open(
-            signal=signal, setup_id="set_1", signal_id="sig_1", category="spot",
+            signal=signal, setup_id="set_1", signal_id="sig_1", category="SWAP",
             entry_price=50_000.0, quantity=0.01, entry_order_id="o1",
-            news_state="calm", atr=500.0,
+            news_state="calm", atr=500.0, leverage=2.0, contracts=1.0,
+            liq_price_at_entry=42_000.0,
         )
         return ledger, position
 
@@ -565,7 +678,7 @@ class TestShadowEngineIntegration:
         from btcbot.strategies.trend import EmaTrendCross
 
         engine = ShadowEngine(
-            ShadowConfig(), repos.shadow, experiment_id="exp_test", symbol="BTCUSDT"
+            ShadowConfig(), repos.shadow, experiment_id="exp_test", symbol="BTC-USDT-SWAP"
         )
         strategy = EmaTrendCross()
         engine.initialise([strategy.id, "other"])
@@ -583,7 +696,7 @@ class TestShadowEngineIntegration:
         from btcbot.strategies.trend import EmaTrendCross
 
         engine = ShadowEngine(
-            ShadowConfig(), repos.shadow, experiment_id="exp_test", symbol="BTCUSDT"
+            ShadowConfig(), repos.shadow, experiment_id="exp_test", symbol="BTC-USDT-SWAP"
         )
         strategy = EmaTrendCross()
         engine.initialise([strategy.id])
@@ -611,7 +724,7 @@ class TestShadowEngineIntegration:
         from btcbot.strategies.trend import EmaTrendCross
 
         engine = ShadowEngine(
-            ShadowConfig(), repos.shadow, experiment_id="exp_test", symbol="BTCUSDT"
+            ShadowConfig(), repos.shadow, experiment_id="exp_test", symbol="BTC-USDT-SWAP"
         )
         strategy = EmaTrendCross()
         engine.initialise([strategy.id])

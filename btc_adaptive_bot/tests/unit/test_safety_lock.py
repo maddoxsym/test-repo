@@ -1,8 +1,9 @@
-"""Demo safety lock, mainnet rejection, and circuit breakers.
+"""Demo safety lock, live-environment rejection, and circuit breakers.
 
-The core guarantee under test: **there is no way to construct an authenticated
-client against a real-money host, and no way to submit an order without a passing
-demo verification.**
+The core guarantees under test: **there is no way to construct an authenticated
+client against a live host, no way to emit a request without the
+``x-simulated-trading: 1`` header, and no way to submit an order without a
+passing demo verification.**
 """
 
 from __future__ import annotations
@@ -15,13 +16,19 @@ from btcbot.config.schema import SafetyConfig
 from btcbot.exchange.demo_guard import SAFETY_LOCK_BANNER, DemoGuard, DemoVerification, SignalResult
 from btcbot.exchange.endpoints import (
     ALLOWED_DEMO_HOSTS,
+    ALLOWED_WS_URLS,
     DEMO_REST_HOST,
+    DEMO_WS_BUSINESS,
     DEMO_WS_PRIVATE,
+    DEMO_WS_PUBLIC,
     FORBIDDEN_ENDPOINT_FRAGMENTS,
+    FORBIDDEN_HOSTS,
+    SIMULATED_TRADING_HEADER,
+    SIMULATED_TRADING_VALUE,
     is_allowed_authenticated_host,
-    public_ws_url,
+    is_allowed_ws_url,
 )
-from btcbot.exchange.rest import BybitDemoClient, MainnetNegativeControlProbe
+from btcbot.exchange.rest import LiveEnvironmentNegativeControlProbe, OkxDemoClient
 from btcbot.safety.circuit_breakers import BreakerType, CircuitBreakers
 from btcbot.utils.errors import MainnetRejectedError
 from btcbot.utils.ids import redact_secret
@@ -30,27 +37,32 @@ from btcbot.utils.logging import register_secret
 SRC_ROOT = Path(__file__).resolve().parents[2] / "src"
 
 
+def _demo_client(**overrides) -> OkxDemoClient:
+    kwargs = {"api_key": "k" * 20, "api_secret": "s" * 20, "passphrase": "p" * 12}
+    kwargs.update(overrides)
+    return OkxDemoClient(**kwargs)
+
+
 class TestHostAllowList:
-    def test_demo_host_is_the_documented_one(self):
-        assert DEMO_REST_HOST == "https://api-demo.bybit.com"
+    def test_demo_host_is_the_eea_entity(self):
+        assert DEMO_REST_HOST == "https://eea.okx.com"
         assert DEMO_REST_HOST in ALLOWED_DEMO_HOSTS
 
-    def test_allow_list_is_immutable(self):
+    def test_allow_lists_are_immutable(self):
         assert isinstance(ALLOWED_DEMO_HOSTS, frozenset)
+        assert isinstance(ALLOWED_WS_URLS, frozenset)
         with pytest.raises(AttributeError):
-            ALLOWED_DEMO_HOSTS.add("https://api.bybit.com")  # type: ignore[attr-defined]
+            ALLOWED_DEMO_HOSTS.add("https://www.okx.com")  # type: ignore[attr-defined]
 
     @pytest.mark.parametrize(
         "host",
         [
-            "https://api.bybit.com",
-            "https://api.bytick.com",
-            "https://api.bybit.eu",
-            "https://api.bybit.nl",
-            "https://api.bybit.tr",
-            "https://api-testnet.bybit.com",
-            "https://api-demo.bybit.com.evil.example",
-            "http://api-demo.bybit.com",
+            "https://www.okx.com",
+            "https://us.okx.com",
+            "https://openapi.okx.com",
+            "https://my.okx.com",
+            "https://eea.okx.com.evil.example",
+            "http://eea.okx.com",
             "https://localhost",
             "",
         ],
@@ -58,55 +70,106 @@ class TestHostAllowList:
     def test_non_demo_hosts_are_refused(self, host):
         assert not is_allowed_authenticated_host(host)
 
-    def test_private_ws_is_the_demo_stream(self):
-        assert DEMO_WS_PRIVATE.startswith("wss://stream-demo.bybit.com")
+    def test_ws_urls_are_the_eea_demo_endpoints(self):
+        assert DEMO_WS_PUBLIC == "wss://wseeapap.okx.com:8443/ws/v5/public"
+        assert DEMO_WS_PRIVATE == "wss://wseeapap.okx.com:8443/ws/v5/private"
+        # Candle channels live on the business endpoint, which carries the
+        # demo brokerId query.
+        assert DEMO_WS_BUSINESS == "wss://wseeapap.okx.com:8443/ws/v5/business?brokerId=9999"
+        for url in (DEMO_WS_PUBLIC, DEMO_WS_PRIVATE, DEMO_WS_BUSINESS):
+            assert is_allowed_ws_url(url)
 
-    def test_public_ws_is_unauthenticated_mainnet_stream(self):
-        # Bybit documents that demo has no public stream and mainnet public data
-        # is identical. This connection carries no credentials.
-        assert public_ws_url("spot") == "wss://stream.bybit.com/v5/public/spot"
-        assert public_ws_url("linear") == "wss://stream.bybit.com/v5/public/linear"
+    def test_eea_live_ws_differs_by_one_infix_and_is_refused(self):
+        """The live host is a single dropped 'pap' away — exact matching only."""
+        live = DEMO_WS_PRIVATE.replace("wseeapap", "wseea")
+        assert live == "wss://wseea.okx.com:8443/ws/v5/private"
+        assert not is_allowed_ws_url(live)
+        assert live in FORBIDDEN_HOSTS
 
-    def test_unknown_category_has_no_public_stream(self):
-        with pytest.raises(ValueError):
-            public_ws_url("options_that_do_not_exist")
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "wss://ws.okx.com:8443/ws/v5/private",       # global live
+            "wss://wspap.okx.com:8443/ws/v5/private",    # global demo, wrong entity
+            "wss://wsuspap.okx.com:8443/ws/v5/private",  # US demo, wrong entity
+            "wss://wseea.okx.com:8443/ws/v5/public",     # EEA LIVE
+            "wss://wseeapap.okx.com:8443/ws/v5/business",  # missing brokerId query
+            "",
+        ],
+    )
+    def test_every_other_ws_url_is_refused(self, url):
+        assert not is_allowed_ws_url(url)
+
+    def test_ws_socket_construction_refuses_live_urls(self):
+        from btcbot.exchange.ws import _ReconnectingSocket
+
+        with pytest.raises(MainnetRejectedError):
+            _ReconnectingSocket("wss://wseea.okx.com:8443/ws/v5/private", name="x")
 
 
-class TestMainnetRejection:
+class TestLiveEnvironmentRejection:
     @pytest.mark.parametrize(
         "host",
         [
-            "https://api.bybit.com",
-            "https://api.bybit.eu",
-            "https://api-testnet.bybit.com",
-            "https://api.bytick.com",
+            "https://www.okx.com",
+            "https://us.okx.com",
+            "https://openapi.okx.com",
+            "https://my.okx.com",
         ],
     )
     def test_client_construction_refuses_non_demo_hosts(self, host):
         """Refusal happens at construction, before any network activity."""
         with pytest.raises(MainnetRejectedError) as exc:
-            BybitDemoClient(api_key="k" * 20, api_secret="s" * 20, base_url=host)
+            _demo_client(base_url=host)
         assert "no real-money trading mode" in str(exc.value)
 
     def test_demo_host_construction_succeeds(self):
-        client = BybitDemoClient(api_key="k" * 20, api_secret="s" * 20)
+        client = _demo_client()
         assert client.base_url == DEMO_REST_HOST
 
     def test_trailing_slash_is_normalised(self):
-        client = BybitDemoClient(base_url=DEMO_REST_HOST + "/")
+        client = OkxDemoClient(base_url=DEMO_REST_HOST + "/")
         assert client.base_url == DEMO_REST_HOST
 
     def test_negative_control_probe_has_no_order_capability(self):
-        """The mainnet probe must be structurally incapable of trading."""
-        probe = MainnetNegativeControlProbe("k" * 20, "s" * 20)
+        """The live-environment probe must be structurally incapable of trading."""
+        probe = LiveEnvironmentNegativeControlProbe("k" * 20, "s" * 20, "p" * 12)
         for forbidden in (
-            "place_order", "cancel_order", "submit", "request_demo_funds",
+            "place_order", "cancel_order", "submit", "set_leverage",
             "cancel_all", "get_wallet_balance",
         ):
             assert not hasattr(probe, forbidden), f"probe must not expose {forbidden}"
         # Exactly one public method.
         public = [n for n in dir(probe) if not n.startswith("_")]
         assert public == ["credentials_are_rejected"]
+
+
+class TestDemoHeaderEnforcement:
+    """OKX selects the environment per-request; the header is the safety switch."""
+
+    def test_header_constants_match_the_documented_switch(self):
+        assert SIMULATED_TRADING_HEADER == "x-simulated-trading"
+        assert SIMULATED_TRADING_VALUE == "1"
+
+    def test_finalize_headers_always_injects_the_demo_switch(self):
+        client = _demo_client()
+        for base in (None, {}, {"Content-Type": "application/json"}, {"X-Whatever": "y"}):
+            built = client._finalize_headers(base)  # noqa: SLF001 - the choke point itself
+            assert built[SIMULATED_TRADING_HEADER] == SIMULATED_TRADING_VALUE
+
+    def test_finalize_headers_cannot_be_overridden_by_input(self):
+        client = _demo_client()
+        built = client._finalize_headers({SIMULATED_TRADING_HEADER: "0"})  # noqa: SLF001
+        assert built[SIMULATED_TRADING_HEADER] == SIMULATED_TRADING_VALUE
+
+    def test_runtime_self_check_passes(self):
+        assert _demo_client().demo_header_enforced() is True
+
+    def test_credentials_require_all_three_parts(self):
+        assert _demo_client().has_credentials
+        assert not _demo_client(passphrase=None).has_credentials
+        assert not _demo_client(api_secret=None).has_credentials
+        assert not OkxDemoClient().has_credentials
 
 
 class TestSourceAudit:
@@ -126,7 +189,7 @@ class TestSourceAudit:
                     offenders.append(f"{path.name}: {fragment}")
         assert not offenders, f"withdrawal/transfer/deposit endpoints found: {offenders}"
 
-    def test_no_bybit_host_literals_outside_endpoints_module(self):
+    def test_no_okx_host_literals_outside_endpoints_module(self):
         offenders: list[str] = []
         for path in self._python_files():
             if path.name == "endpoints.py":
@@ -135,18 +198,28 @@ class TestSourceAudit:
                 stripped = line.strip()
                 if stripped.startswith("#") or stripped.startswith("*"):
                     continue
-                if "https://api.bybit" in line or "https://api-testnet.bybit" in line:
+                if "okx.com" in line:
                     offenders.append(f"{path.name}: {stripped[:90]}")
-        assert not offenders, f"Bybit host literals outside endpoints.py: {offenders}"
+        assert not offenders, f"OKX host literals outside endpoints.py: {offenders}"
 
-    def test_mainnet_constant_used_only_by_the_probe(self):
+    def test_negative_control_path_used_only_by_the_probe(self):
         users = [
             path.name
             for path in self._python_files()
             if path.name != "endpoints.py"
-            and "NEGATIVE_CONTROL_HOST" in path.read_text(encoding="utf-8")
+            and "NEGATIVE_CONTROL_PATH" in path.read_text(encoding="utf-8")
         ]
-        assert users == ["rest.py"], f"unexpected users of the mainnet host: {users}"
+        assert users == ["rest.py"], f"unexpected users of the negative-control path: {users}"
+
+    def test_demo_header_constant_used_only_by_the_transport_layer(self):
+        """One header-building path: endpoints.py defines it, rest.py injects it."""
+        users = [
+            path.name
+            for path in self._python_files()
+            if path.name != "endpoints.py"
+            and "SIMULATED_TRADING_HEADER" in path.read_text(encoding="utf-8")
+        ]
+        assert users == ["rest.py"], f"unexpected users of the demo header: {users}"
 
     def test_no_bare_except_blocks(self):
         offenders: list[str] = []
@@ -160,7 +233,7 @@ class TestSourceAudit:
         import re
 
         pattern = re.compile(
-            r"""(api_key|api_secret|apikey|secret)\s*=\s*["'][A-Za-z0-9_\-]{16,}["']""",
+            r"""(api_key|api_secret|apikey|secret|passphrase)\s*=\s*["'][A-Za-z0-9_\-]{16,}["']""",
             re.IGNORECASE,
         )
         offenders: list[str] = []
@@ -174,7 +247,8 @@ class TestSourceAudit:
         import re
 
         pattern = re.compile(
-            r"\b(live_trading|real_money|enable_live|mainnet_mode|allow_live)\b", re.IGNORECASE
+            r"\b(live_trading|real_money|enable_live|mainnet_mode|allow_live|disable_simulated)\b",
+            re.IGNORECASE,
         )
         offenders: list[str] = []
         for path in self._python_files():
@@ -182,6 +256,18 @@ class TestSourceAudit:
                 if pattern.search(line):
                     offenders.append(f"{path.name}:{number}")
         assert not offenders, f"live/real-money flags found: {offenders}"
+
+    def test_no_hardcoded_inst_id_in_source(self):
+        """The X-Perp instId must come from runtime discovery, never a literal."""
+        offenders: list[str] = []
+        for path in self._python_files():
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if '"BTC-USDT-SWAP"' in line or "'BTC-USDT-SWAP'" in line:
+                    offenders.append(f"{path.name}:{number}")
+        assert not offenders, f"hardcoded instId found in src/: {offenders}"
 
 
 class TestConfigCannotBypassTheLock:
@@ -202,7 +288,7 @@ class TestDemoGuardGating:
     def _guard_with(self, signals: list[SignalResult]) -> DemoGuard:
         from btcbot.utils.timeutil import now_utc
 
-        client = BybitDemoClient()
+        client = OkxDemoClient()
         guard = DemoGuard(client, run_mainnet_negative_control=False)
         verified = all(s.passed for s in signals if s.required)
         guard._verified = verified              # noqa: SLF001 - test seam
@@ -212,7 +298,7 @@ class TestDemoGuardGating:
         return guard
 
     def test_orders_blocked_before_verification(self):
-        guard = DemoGuard(BybitDemoClient())
+        guard = DemoGuard(OkxDemoClient())
         assert guard.verified is False
         assert guard.orders_permitted() is False
 
@@ -220,9 +306,9 @@ class TestDemoGuardGating:
         guard = self._guard_with(
             [
                 SignalResult("host pin", True, "ok"),
+                SignalResult("demo header enforcement", True, "ok"),
                 SignalResult("authenticated reachability", True, "ok"),
-                SignalResult("demo-only endpoint probe", True, "ok"),
-                SignalResult("mainnet negative control", True, "ok"),
+                SignalResult("live-environment negative control", True, "ok"),
             ]
         )
         assert guard.orders_permitted() is True
@@ -231,9 +317,9 @@ class TestDemoGuardGating:
         guard = self._guard_with(
             [
                 SignalResult("host pin", True, "ok"),
+                SignalResult("demo header enforcement", False, "header missing"),
                 SignalResult("authenticated reachability", True, "ok"),
-                SignalResult("demo-only endpoint probe", False, "route missing"),
-                SignalResult("mainnet negative control", True, "ok"),
+                SignalResult("live-environment negative control", True, "ok"),
             ]
         )
         assert guard.orders_permitted() is False
@@ -243,9 +329,11 @@ class TestDemoGuardGating:
         guard = self._guard_with(
             [
                 SignalResult("host pin", True, "ok"),
+                SignalResult("demo header enforcement", True, "ok"),
                 SignalResult("authenticated reachability", True, "ok"),
-                SignalResult("demo-only endpoint probe", True, "ok"),
-                SignalResult("mainnet negative control", False, "skipped", required=False),
+                SignalResult(
+                    "live-environment negative control", False, "skipped", required=False
+                ),
             ]
         )
         assert guard.orders_permitted() is True
@@ -261,7 +349,7 @@ class TestDemoGuardGating:
     def test_banner_text_matches_the_specification(self):
         assert SAFETY_LOCK_BANNER == (
             "SAFETY LOCK",
-            "BYBIT DEMO ENVIRONMENT COULD NOT BE VERIFIED",
+            "OKX DEMO ENVIRONMENT COULD NOT BE VERIFIED",
             "ORDER SUBMISSION DISABLED",
         )
 
@@ -293,6 +381,24 @@ class TestSecretHandling:
         SecretRedactionFilter().filter(record)
         assert secret not in record.getMessage()
         assert "REDACTED" in record.getMessage()
+
+    def test_passphrase_is_registered_for_redaction(self, monkeypatch):
+        """Loading credentials must register all three parts with the filter."""
+        import logging
+
+        from btcbot.config.loader import load_credentials
+        from btcbot.utils.logging import SecretRedactionFilter
+
+        monkeypatch.setenv("OKX_DEMO_API_KEY", "KEYKEYKEYKEY123456")
+        monkeypatch.setenv("OKX_DEMO_API_SECRET", "SECSECSECSEC123456")
+        monkeypatch.setenv("OKX_DEMO_PASSPHRASE", "PASSPHRASE9876543")
+        load_credentials(env_file=None, required=True)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname=__file__, lineno=1,
+            msg="auth with PASSPHRASE9876543", args=(), exc_info=None,
+        )
+        SecretRedactionFilter().filter(record)
+        assert "PASSPHRASE9876543" not in record.getMessage()
 
 
 class TestCircuitBreakers:
@@ -356,6 +462,33 @@ class TestCircuitBreakers:
     def test_state_mismatch_trips(self, breakers):
         assert breakers.check_state_consistency(exchange_positions=1, ledger_positions=1) is None
         assert breakers.check_state_consistency(exchange_positions=2, ledger_positions=0) is not None
+
+    def test_clock_drift_within_budget_passes(self, breakers):
+        assert breakers.check_clock_drift(1_000) is None
+        assert not breakers.safe_mode.active
+
+    def test_clock_drift_beyond_budget_trips(self, breakers):
+        """OKX rejects drifted timestamps; a wandering clock pauses trading."""
+        trip = breakers.check_clock_drift(SafetyConfig().max_clock_drift_ms + 1)
+        assert trip is not None
+        assert trip.breaker is BreakerType.CLOCK_DRIFT
+        assert breakers.safe_mode.active
+
+    def test_negative_drift_also_trips(self, breakers):
+        assert breakers.check_clock_drift(-(SafetyConfig().max_clock_drift_ms + 1)) is not None
+
+    def test_healthy_margin_ratio_passes(self, breakers):
+        assert (
+            breakers.check_liquidation_risk(margin_ratio=25.0, inst_id="X") is None
+        )
+        assert breakers.check_liquidation_risk(margin_ratio=None, inst_id="X") is None
+
+    def test_degraded_margin_ratio_trips(self, breakers):
+        """A margin ratio near the maintenance level must flatten and pause."""
+        floor = SafetyConfig().liquidation_margin_ratio_floor
+        trip = breakers.check_liquidation_risk(margin_ratio=floor - 0.5, inst_id="X")
+        assert trip is not None
+        assert trip.breaker is BreakerType.LIQUIDATION_RISK
 
     def test_corrupt_strategy_output_trips(self, breakers):
         class Broken:

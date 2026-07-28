@@ -203,6 +203,7 @@ class ExperimentManager:
         enabled_strategies: list[str],
         strategy_versions: dict[str, str],
         demo_category: str,
+        primary_symbol: str,
     ) -> ExperimentState:
         """Resume the existing experiment, or start a new one if none exists."""
         if not preconditions.all_met:
@@ -252,7 +253,8 @@ class ExperimentManager:
             "config_hash": self.config_hash,
             "software_version": __version__,
             "git_commit": git_commit(),
-            "primary_symbol": self.config.market.primary_symbol,
+            # The discovered X-Perp instId — recorded, never configured.
+            "primary_symbol": primary_symbol,
             "demo_category": demo_category,
             "outage_policy": self.config.experiment.outage_adjustment_policy,
             "metadata": {

@@ -190,7 +190,7 @@ class TestExperimentTimer:
                 starting_demo_equity=10_000.0,
                 enabled_strategies=["s1"],
                 strategy_versions={"s1": "1.0"},
-                demo_category="spot",
+                demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
             )
         message = str(exc.value)
         assert "demo environment verification" in message
@@ -206,7 +206,7 @@ class TestExperimentTimer:
             starting_demo_equity=9_876.54,
             enabled_strategies=["s1", "s2"],
             strategy_versions={"s1": "1.0", "s2": "2.1"},
-            demo_category="spot",
+            demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         assert state.experiment_id.startswith("exp_")
         assert state.duration_days == 14
@@ -226,14 +226,14 @@ class TestExperimentTimer:
         first = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="abc123")
         original = first.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
 
         # A brand-new manager, as if the process had been restarted.
         second = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="abc123")
         resumed = second.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_500.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
 
         assert resumed.experiment_id == original.experiment_id, "a new experiment was created"
@@ -247,7 +247,7 @@ class TestExperimentTimer:
         manager = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")
         first = manager.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         for _ in range(10):
             fresh = ExperimentManager(
@@ -255,7 +255,7 @@ class TestExperimentTimer:
             )
             state = fresh.start_or_resume(
                 mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=1.0,
-                enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+                enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
             )
             assert state.start == first.start
             assert state.experiment_id == first.experiment_id
@@ -264,12 +264,12 @@ class TestExperimentTimer:
         first = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="hash_a")
         first.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         second = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="hash_b")
         state = second.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         assert state.resumed
         categories = {e["category"] for e in repos.system.recent_events(20)}
@@ -279,7 +279,7 @@ class TestExperimentTimer:
         manager = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")
         state = manager.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         assert state.day == 1
         assert 0.0 <= state.progress_pct < 1.0
@@ -295,7 +295,7 @@ class TestExperimentTimer:
         manager = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")
         state = manager.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         assert not state.is_complete
         state.scheduled_end = now_utc() - timedelta(seconds=1)
@@ -305,7 +305,7 @@ class TestExperimentTimer:
         manager = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")
         manager.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         text = "\n".join(manager.require_state().countdown_lines())
         for expected in ("DAY 1 / 14", "TIME ELAPSED", "TIME REMAINING", "START TIME", "END TIME"):
@@ -315,7 +315,7 @@ class TestExperimentTimer:
         manager = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")
         state = manager.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         original_end = state.scheduled_end
         assert manager.apply_outage_policy(7_200) is False
@@ -326,7 +326,7 @@ class TestExperimentTimer:
         manager = ExperimentManager(repos.experiments, repos.system, config, config_hash="h")
         state = manager.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         original_end = state.scheduled_end
         assert manager.apply_outage_policy(3_600) is True
@@ -339,7 +339,7 @@ class TestExperimentTimer:
         manager = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")
         first = manager.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         manager.complete()
         assert repos.experiments.get(first.experiment_id)["status"] == ExperimentStatus.COMPLETE
@@ -347,7 +347,7 @@ class TestExperimentTimer:
         fresh = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")
         second = fresh.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         assert second.experiment_id != first.experiment_id
         assert second.resumed is False
@@ -356,7 +356,7 @@ class TestExperimentTimer:
         manager = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")
         manager.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=9_500.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         text = "\n".join(manager.start_banner(strategy_count=38, actual_equity=9_500.0))
         assert "Environment:               DEMO" in text
@@ -371,7 +371,7 @@ class TestExperimentTimer:
         manager = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")
         state = manager.start_or_resume(
             mode=ExperimentMode.RESEARCH, preconditions=_met(), starting_demo_equity=10_000.0,
-            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="spot",
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"}, demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
         )
         outage_id = repos.system.start_outage(state.experiment_id, "market_data", "ws down")
         assert repos.system.open_outage(state.experiment_id, "market_data") is not None

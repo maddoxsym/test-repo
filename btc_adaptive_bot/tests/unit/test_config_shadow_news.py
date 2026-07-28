@@ -29,7 +29,9 @@ class TestConfigValidation:
         assert config.experiment.research_duration_days == 14
         assert config.shadow.initial_equity == 10_000.0
         assert config.experiment.expected_demo_equity == 10_000.0
-        assert config.market.primary_symbol == "BTCUSDT"
+        assert config.market.base_currency == "BTC"
+        assert config.market.settle_currency_preference[0] == "USDT"
+        assert config.risk.leverage.max_leverage <= 10.0
 
     def test_unknown_key_is_rejected(self):
         """A typo must fail loudly, not be silently ignored."""
@@ -53,18 +55,34 @@ class TestConfigValidation:
     def test_invalid_timeframe_is_rejected(self):
         with pytest.raises(Exception) as exc:
             MarketConfig(timeframes=["1", "7"])
-        assert "not a Bybit kline interval" in str(exc.value)
+        assert "not a supported timeframe" in str(exc.value)
 
-    def test_lowercase_symbol_is_rejected(self):
-        """Bybit documents symbols as uppercase only."""
+    def test_lowercase_currency_is_rejected(self):
         with pytest.raises(Exception) as exc:
-            MarketConfig(primary_symbol="btcusdt")
+            MarketConfig(base_currency="btc")
         assert "uppercase" in str(exc.value)
 
-    def test_preferred_category_must_be_enabled(self):
+    def test_hardcoded_inst_id_is_rejected(self):
+        """The X-Perp instId is discovered, never configured — the schema
+        refuses the key outright."""
         with pytest.raises(Exception) as exc:
-            MarketConfig(enabled_categories=["spot"], preferred_category="linear")
-        assert "not in enabled_categories" in str(exc.value)
+            MarketConfig(inst_id="BTC-USDT-SWAP")  # type: ignore[call-arg]
+        assert "Extra inputs" in str(exc.value) or "extra" in str(exc.value).lower()
+
+    def test_leverage_over_ten_is_rejected(self):
+        from btcbot.config.schema import LeverageConfig
+
+        with pytest.raises(Exception):
+            LeverageConfig(max_leverage=25.0)
+
+    def test_cross_margin_is_rejected(self):
+        with pytest.raises(Exception):
+            RiskConfig(margin_mode="cross")  # type: ignore[arg-type]
+
+    def test_empty_settle_preference_is_rejected(self):
+        with pytest.raises(Exception) as exc:
+            MarketConfig(settle_currency_preference=[])
+        assert "settle_currency_preference" in str(exc.value)
 
     def test_regime_timeframe_must_be_collected(self):
         with pytest.raises(Exception) as exc:
@@ -139,7 +157,7 @@ class TestConfigLoading:
         root = Path(__file__).resolve().parents[2]
         research = load_config(root / "config" / "research.yaml")
         # Value inherited from default.yaml.
-        assert research.config.market.primary_symbol == "BTCUSDT"
+        assert research.config.market.base_currency == "BTC"
         # Value overridden by research.yaml.
         assert research.config.allocator.forced_exploration_ratio == 0.3
 
@@ -179,25 +197,36 @@ class TestConfigLoading:
         assert "cycle" in str(exc.value)
 
     def test_missing_credentials_gives_actionable_guidance(self, monkeypatch):
-        monkeypatch.delenv("BYBIT_DEMO_API_KEY", raising=False)
-        monkeypatch.delenv("BYBIT_DEMO_API_SECRET", raising=False)
+        for var in ("OKX_DEMO_API_KEY", "OKX_DEMO_API_SECRET", "OKX_DEMO_PASSPHRASE"):
+            monkeypatch.delenv(var, raising=False)
         with pytest.raises(CredentialsMissingError) as exc:
             load_credentials(env_file=None, required=True)
         message = str(exc.value)
         assert ".env" in message and "Demo Trading" in message
+        assert "OKX_DEMO_PASSPHRASE" in message
+
+    def test_partial_credentials_are_rejected(self, monkeypatch):
+        """OKX needs all three parts — key+secret without passphrase is unusable."""
+        monkeypatch.setenv("OKX_DEMO_API_KEY", "key1234567890")
+        monkeypatch.setenv("OKX_DEMO_API_SECRET", "secret1234567890")
+        monkeypatch.delenv("OKX_DEMO_PASSPHRASE", raising=False)
+        with pytest.raises(CredentialsMissingError):
+            load_credentials(env_file=None, required=True)
 
     def test_credentials_are_optional_when_not_required(self, monkeypatch):
-        monkeypatch.delenv("BYBIT_DEMO_API_KEY", raising=False)
-        monkeypatch.delenv("BYBIT_DEMO_API_SECRET", raising=False)
+        for var in ("OKX_DEMO_API_KEY", "OKX_DEMO_API_SECRET", "OKX_DEMO_PASSPHRASE"):
+            monkeypatch.delenv(var, raising=False)
         assert load_credentials(env_file=None, required=False) is None
 
     def test_credentials_repr_does_not_leak(self, monkeypatch):
-        monkeypatch.setenv("BYBIT_DEMO_API_KEY", "key1234567890")
-        monkeypatch.setenv("BYBIT_DEMO_API_SECRET", "secret1234567890")
+        monkeypatch.setenv("OKX_DEMO_API_KEY", "key1234567890")
+        monkeypatch.setenv("OKX_DEMO_API_SECRET", "secret1234567890")
+        monkeypatch.setenv("OKX_DEMO_PASSPHRASE", "phrase1234567890")
         credentials = load_credentials(env_file=None, required=True)
         assert credentials is not None
         assert "key1234567890" not in repr(credentials)
         assert "secret" not in repr(credentials).replace("api_secret", "")
+        assert "phrase1234567890" not in repr(credentials)
 
 
 class TestShadowAccountIsolation:

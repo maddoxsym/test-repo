@@ -2,8 +2,9 @@
 
 Two weeks of live evidence is not enough to judge a strategy, so Layer 1 needs a
 long BTC history spanning genuinely different regimes. This module fetches it in
-pages (Bybit caps kline responses at 1000), stores it in SQLite, and repairs
-gaps rather than silently backtesting over holes.
+pages (OKX caps recent-candle responses at 300 and deep history at 100 — the
+client handles the endpoint switch), stores it in SQLite, and repairs gaps
+rather than silently backtesting over holes.
 """
 
 from __future__ import annotations
@@ -12,8 +13,8 @@ import asyncio
 from dataclasses import dataclass
 
 from ..database.repositories import MarketRepository
-from ..exchange.models import Candle, Category
-from ..exchange.rest import BybitDemoClient
+from ..exchange.models import Candle
+from ..exchange.rest import OkxDemoClient
 from ..utils.errors import ApiError, TransportError
 from ..utils.logging import get_logger
 from ..utils.timeutil import interval_ms, now_ms
@@ -21,7 +22,7 @@ from .candles import build_closed_only
 
 log = get_logger(__name__)
 
-PAGE_LIMIT = 1000  # documented maximum for /v5/market/kline
+PAGE_LIMIT = 300  # documented maximum for /api/v5/market/candles
 
 
 @dataclass(slots=True)
@@ -48,17 +49,15 @@ class HistoricalDataManager:
 
     def __init__(
         self,
-        client: BybitDemoClient,
+        client: OkxDemoClient,
         repository: MarketRepository,
         *,
         symbol: str,
-        category: Category,
         request_delay_seconds: float = 0.12,
     ) -> None:
         self._client = client
         self._repo = repository
         self.symbol = symbol
-        self.category = category
         self._delay = request_delay_seconds
 
     async def ensure_history(
@@ -120,7 +119,6 @@ class HistoricalDataManager:
                 candles = await self._client.get_klines(
                     self.symbol,
                     timeframe,
-                    category=self.category,
                     start_ms=page_start,
                     end_ms=cursor_end,
                     limit=PAGE_LIMIT,
@@ -204,7 +202,6 @@ class HistoricalDataManager:
                 page = await self._client.get_klines(
                     self.symbol,
                     timeframe,
-                    category=self.category,
                     start_ms=start_ms,
                     end_ms=cursor_end,
                     limit=min(PAGE_LIMIT, bars + 10),
@@ -238,7 +235,6 @@ class HistoricalDataManager:
             candles = await self._client.get_klines(
                 self.symbol,
                 timeframe,
-                category=self.category,
                 start_ms=since_ms,
                 end_ms=now_ms(),
                 limit=PAGE_LIMIT,

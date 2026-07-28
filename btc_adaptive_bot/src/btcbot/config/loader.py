@@ -27,13 +27,18 @@ MAX_EXTENDS_DEPTH = 5
 
 @dataclass(frozen=True, slots=True)
 class Credentials:
-    """Demo API credentials read from the environment. Never persisted."""
+    """Demo API credentials read from the environment. Never persisted.
+
+    OKX keys have three parts: the key, the secret, and the passphrase chosen
+    when the key was created. All three are required to authenticate.
+    """
 
     api_key: str
     api_secret: str
+    passphrase: str
 
     def __repr__(self) -> str:  # pragma: no cover - defensive against accidental logging
-        return "Credentials(api_key='***', api_secret='***')"
+        return "Credentials(api_key='***', api_secret='***', passphrase='***')"
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,22 +138,24 @@ def load_credentials(*, env_file: str | Path | None = ".env", required: bool = T
         if env_path.exists():
             load_dotenv(env_path, override=False)
 
-    api_key = (os.getenv("BYBIT_DEMO_API_KEY") or "").strip()
-    api_secret = (os.getenv("BYBIT_DEMO_API_SECRET") or "").strip()
+    api_key = (os.getenv("OKX_DEMO_API_KEY") or "").strip()
+    api_secret = (os.getenv("OKX_DEMO_API_SECRET") or "").strip()
+    passphrase = (os.getenv("OKX_DEMO_PASSPHRASE") or "").strip()
 
-    if not api_key or not api_secret:
+    if not api_key or not api_secret or not passphrase:
         if required:
             raise CredentialsMissingError(
-                "Bybit demo credentials not found.\n"
+                "OKX demo credentials not found.\n"
                 "  1. cp .env.example .env\n"
-                "  2. Set BYBIT_DEMO_API_KEY and BYBIT_DEMO_API_SECRET in .env\n"
-                "     (create the key inside Bybit's Demo Trading area — see README §9)"
+                "  2. Set OKX_DEMO_API_KEY, OKX_DEMO_API_SECRET and OKX_DEMO_PASSPHRASE in .env\n"
+                "     (create the key inside OKX's Demo Trading area — see README §9)"
             )
         return None
 
     register_secret(api_key)
     register_secret(api_secret)
-    return Credentials(api_key=api_key, api_secret=api_secret)
+    register_secret(passphrase)
+    return Credentials(api_key=api_key, api_secret=api_secret, passphrase=passphrase)
 
 
 def optional_env(name: str) -> str | None:

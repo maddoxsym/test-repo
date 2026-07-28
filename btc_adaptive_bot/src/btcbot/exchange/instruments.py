@@ -1,11 +1,22 @@
-"""Runtime instrument and capability discovery.
+"""Runtime instrument and capability discovery — the "BTCUSD UM X-Perp" finder.
 
-Nothing about the connected environment is assumed. On startup — and on a timer,
-because Bybit documents that several size limits are adjusted bi-monthly — the
-system asks the exchange what exists, what is tradable, and under what rules.
+"BTCUSD UM X-Perp" is a *display name* in the OKX Europe UI; the API-level
+``instId`` behind it is **never hardcoded** (and was deliberately not assumed
+during research — see ``docs/okx_demo_capabilities.md`` §5). On startup — and
+on a timer, because size limits can change — the system asks the exchange
+which SWAP instruments exist and selects the BTC USD-margined linear
+perpetual by its discovered properties:
 
-The result is an :class:`ExchangeCapabilities` snapshot that the execution layer
-consults before every order.
+1. ``GET /api/v5/public/instruments?instType=SWAP``
+2. keep instruments whose underlying references the configured base currency
+   (BTC), with ``ctType == "linear"`` and ``state == "live"``
+3. rank by the configured settle-currency preference (USDT, then USDC, …)
+4. exactly one winner is selected and journaled with the full contract spec;
+   ambiguity is journaled with the alternatives listed; **zero matches fails
+   loudly** with the instrument list logged — there is no guessed fallback.
+
+The result is an :class:`ExchangeCapabilities` snapshot that the execution
+layer consults before every order.
 """
 
 from __future__ import annotations
@@ -15,8 +26,8 @@ from dataclasses import dataclass, field
 from ..utils.errors import ApiError, InstrumentNotFoundError, TransportError
 from ..utils.logging import get_logger
 from ..utils.timeutil import now_utc
-from .models import Capability, Category, InstrumentSpec
-from .rest import BybitDemoClient
+from .models import Capability, InstrumentSpec, InstType
+from .rest import OkxDemoClient
 
 log = get_logger(__name__)
 
@@ -25,62 +36,65 @@ log = get_logger(__name__)
 class ExchangeCapabilities:
     """What the connected demo environment actually supports, right now."""
 
-    symbol: str
-    instruments: dict[Category, InstrumentSpec] = field(default_factory=dict)
-    tradable_categories: tuple[Category, ...] = ()
-    primary_category: Category | None = None
+    base_ccy: str
+    instrument: InstrumentSpec | None = None
+    alternatives: list[InstrumentSpec] = field(default_factory=list)
     discovered_at: str = ""
     notes: list[str] = field(default_factory=list)
 
     @property
     def primary(self) -> InstrumentSpec:
-        if self.primary_category is None or self.primary_category not in self.instruments:
+        if self.instrument is None:
             raise InstrumentNotFoundError(
-                f"no tradable instrument discovered for {self.symbol}; "
-                "check market.enabled_categories and the symbol name"
+                f"no tradable {self.base_ccy} linear perpetual discovered; "
+                "check market.base_currency and market.settle_currency_preference"
             )
-        return self.instruments[self.primary_category]
+        return self.instrument
+
+    @property
+    def inst_id(self) -> str:
+        return self.primary.inst_id
 
     @property
     def supports_short_on_exchange(self) -> bool:
-        """Whether a real short order can be sent in the primary category.
-
-        Spot cannot short. When this is False, SHORT signals are still researched
-        in the shadow engine but never routed to a real demo order.
-        """
+        """Perpetual swaps short natively; still asked, never assumed."""
         try:
             return self.primary.supports(Capability.SHORT)
         except InstrumentNotFoundError:
             return False
 
     def describe(self) -> list[str]:
-        lines = [f"Symbol: {self.symbol}"]
-        for category, spec in self.instruments.items():
+        lines = [f"Base currency: {self.base_ccy}"]
+        if self.instrument is not None:
+            spec = self.instrument
             lines.append(
-                f"  {category.value:<8} status={spec.status} "
-                f"tick={spec.tick_size} step={spec.qty_step} "
-                f"minQty={spec.min_order_qty} minAmt={spec.min_order_amt} "
-                f"caps={sorted(c.value for c in spec.capabilities)}"
+                f"  selected {spec.inst_id} ({spec.ct_type} {spec.inst_type.value}, "
+                f"settles {spec.settle_ccy}) state={spec.state}"
             )
+            lines.append(
+                f"  contract: ctVal={spec.ct_val} {spec.ct_val_ccy} × mult {spec.ct_mult}, "
+                f"lot={spec.lot_size}, min={spec.min_size}, tick={spec.tick_size}, "
+                f"maxLever={spec.max_leverage}"
+            )
+        for alt in self.alternatives:
+            lines.append(f"  alternative: {alt.inst_id} (settles {alt.settle_ccy})")
         lines.extend(f"  note: {note}" for note in self.notes)
         return lines
 
 
 class CapabilityDiscovery:
-    """Discovers instruments and refreshes them on a timer."""
+    """Discovers the X-Perp instrument and refreshes it on a timer."""
 
     def __init__(
         self,
-        client: BybitDemoClient,
+        client: OkxDemoClient,
         *,
-        symbol: str,
-        enabled_categories: list[str],
-        preferred_category: str,
+        base_ccy: str,
+        settle_preference: list[str],
     ) -> None:
         self._client = client
-        self._symbol = symbol
-        self._enabled = [Category(c) for c in enabled_categories]
-        self._preferred = Category(preferred_category)
+        self._base_ccy = base_ccy.upper()
+        self._settle_preference = [s.upper() for s in settle_preference]
         self._capabilities: ExchangeCapabilities | None = None
 
     @property
@@ -90,79 +104,84 @@ class CapabilityDiscovery:
         return self._capabilities
 
     async def discover(self) -> ExchangeCapabilities:
-        """Query every enabled category and build a capability snapshot."""
-        instruments: dict[Category, InstrumentSpec] = {}
+        """Query the SWAP instrument list and select the X-Perp."""
         notes: list[str] = []
+        try:
+            specs = await self._client.get_instruments(InstType.SWAP)
+        except (ApiError, TransportError) as exc:
+            if self._capabilities is not None:
+                raise
+            raise InstrumentNotFoundError(f"instrument discovery failed: {exc}") from exc
 
-        for category in self._enabled:
-            try:
-                specs = await self._client.get_instruments(category, self._symbol)
-            except ApiError as exc:
-                notes.append(f"{category.value}: unavailable on this account ({exc.ret_msg})")
-                continue
-            except TransportError as exc:
-                notes.append(f"{category.value}: discovery failed ({exc})")
-                continue
+        matches = [
+            spec
+            for spec in specs
+            if spec.base_ccy.upper() == self._base_ccy
+            and spec.ct_type == "linear"
+            and spec.is_tradable
+        ]
 
-            match = next((s for s in specs if s.symbol == self._symbol), None)
-            if match is None:
-                notes.append(f"{category.value}: {self._symbol} not listed")
-                continue
-            if not match.is_tradable:
-                notes.append(f"{category.value}: {self._symbol} status={match.status}, not tradable")
-                continue
-            instruments[category] = match
-
-        tradable = tuple(instruments)
-        if not tradable:
+        if not matches:
+            available = sorted(s.inst_id for s in specs)[:40]
             raise InstrumentNotFoundError(
-                f"{self._symbol} is not tradable in any enabled category "
-                f"{[c.value for c in self._enabled]}. Notes: {notes}"
+                f"no live linear {self._base_ccy} perpetual found among {len(specs)} SWAP "
+                f"instruments. This system never falls back to a guessed instId. "
+                f"Instruments returned (first 40): {available}"
             )
 
-        primary = self._preferred if self._preferred in instruments else tradable[0]
-        if primary is not self._preferred:
-            notes.append(
-                f"preferred category {self._preferred.value} unavailable; using {primary.value}"
-            )
+        def rank(spec: InstrumentSpec) -> int:
+            settle = spec.settle_ccy.upper()
+            try:
+                return self._settle_preference.index(settle)
+            except ValueError:
+                return len(self._settle_preference)
 
-        if not instruments[primary].supports(Capability.SHORT):
+        matches.sort(key=lambda s: (rank(s), s.inst_id))
+        selected = matches[0]
+        alternatives = matches[1:]
+
+        if selected.settle_ccy.upper() not in self._settle_preference:
             notes.append(
-                f"{primary.value} has no short side — SHORT signals will be researched in the "
-                "shadow engine only and never sent to the exchange"
+                f"selected settle currency {selected.settle_ccy} is outside the configured "
+                f"preference list {self._settle_preference} — it was the only live match"
+            )
+        if alternatives:
+            notes.append(
+                f"{len(alternatives)} alternative linear {self._base_ccy} perpetual(s) exist; "
+                "selection followed market.settle_currency_preference"
             )
 
         capabilities = ExchangeCapabilities(
-            symbol=self._symbol,
-            instruments=instruments,
-            tradable_categories=tradable,
-            primary_category=primary,
+            base_ccy=self._base_ccy,
+            instrument=selected,
+            alternatives=alternatives,
             discovered_at=now_utc().isoformat(),
             notes=notes,
         )
         self._capabilities = capabilities
 
         log.info(
-            "BYBIT",
-            f"Instrument discovery complete: {self._symbol} on {primary.value} "
-            f"(tick {instruments[primary].tick_size}, step {instruments[primary].qty_step})",
-            categories=[c.value for c in tradable],
+            "OKX",
+            f"Instrument discovery complete: {selected.inst_id} "
+            f"(ctVal {selected.ct_val} {selected.ct_val_ccy}, lot {selected.lot_size}, "
+            f"tick {selected.tick_size}, maxLever {selected.max_leverage})",
+            alternatives=[a.inst_id for a in alternatives],
         )
         for note in notes:
-            log.info("BYBIT", f"Discovery note: {note}")
+            log.info("OKX", f"Discovery note: {note}")
 
         return capabilities
 
     async def refresh(self) -> ExchangeCapabilities:
         """Re-run discovery; keeps the previous snapshot if the refresh fails.
 
-        Bybit warns that ``maxLimitOrderQty``/``maxMarketOrderQty`` change on a
-        schedule, so a stale snapshot is a real risk over a 14-day run.
+        Size limits can change over a 14-day run, so a stale snapshot is a real
+        risk — but a transient discovery failure must not stop trading either.
         """
         try:
             return await self.discover()
         except (InstrumentNotFoundError, ApiError, TransportError) as exc:
             if self._capabilities is not None:
-                log.warning("BYBIT", f"Instrument refresh failed, keeping previous snapshot: {exc}")
+                log.warning("OKX", f"Instrument refresh failed, keeping previous snapshot: {exc}")
                 return self._capabilities
             raise

@@ -176,79 +176,77 @@ class TestSafeArithmetic:
 
 
 class TestInstrumentValidation:
-    def test_quantity_bounds_are_enforced(self, spot_instrument):
-        ok, _ = spot_instrument.qty_within_bounds(Decimal("0.001"))
+    def test_quantity_bounds_are_enforced(self, perp_instrument):
+        ok, _ = perp_instrument.qty_within_bounds(Decimal("1"))
         assert ok
 
-        ok, message = spot_instrument.qty_within_bounds(Decimal("0"))
+        ok, message = perp_instrument.qty_within_bounds(Decimal("0"))
         assert not ok and "zero" in message
 
-        ok, message = spot_instrument.qty_within_bounds(Decimal("0.000001"))
+        ok, message = perp_instrument.qty_within_bounds(Decimal("0.05"))
         assert not ok and "below minimum" in message
 
-        ok, message = spot_instrument.qty_within_bounds(Decimal("1000"))
-        assert not ok and "above maximum" in message
+        ok, message = perp_instrument.qty_within_bounds(Decimal("999999"))
+        assert not ok and "maximum" in message
 
-    def test_notional_bounds_use_min_order_amt(self, spot_instrument):
-        """Bybit marks spot minOrderQty deprecated in favour of minOrderAmt."""
-        ok, message = spot_instrument.notional_within_bounds(Decimal("3"))
-        assert not ok and "below exchange minimum" in message
+    def test_contract_base_conversion_round_trips(self, perp_instrument):
+        """contracts_from_base floors to the lot; base_from_contracts is exact."""
+        contracts = perp_instrument.contracts_from_base(0.075)
+        assert contracts == Decimal("7.5")
+        assert perp_instrument.base_from_contracts(contracts) == Decimal("0.075")
 
-        ok, _ = spot_instrument.notional_within_bounds(Decimal("50"))
-        assert ok
+        # Flooring: 0.0749 BTC is 7.49 contracts → 7.4 at lot 0.1.
+        floored = perp_instrument.contracts_from_base(0.0749)
+        assert floored == Decimal("7.4")
+        assert perp_instrument.base_from_contracts(floored) <= Decimal("0.0749")
 
-    def test_linear_has_no_notional_minimum(self, linear_instrument):
-        ok, _ = linear_instrument.notional_within_bounds(Decimal("1"))
-        assert ok
+    def test_notional_uses_contract_value(self, perp_instrument):
+        notional = perp_instrument.notional_usd(Decimal("7.5"), 50_000.0)
+        assert notional == Decimal("3750.0")  # 0.075 BTC × 50k
 
-    def test_instrument_rounding_helpers(self, spot_instrument):
-        assert spot_instrument.round_qty(0.1234567) == Decimal("0.123456")
-        assert spot_instrument.round_price(50_000.06) == Decimal("50000.1")
+    def test_instrument_rounding_helpers(self, perp_instrument):
+        assert perp_instrument.round_qty(Decimal("7.59")) == Decimal("7.5")
+        assert perp_instrument.round_price(50_000.06) == Decimal("50000.1")
 
-    def test_capability_discovery_not_assumption(self, spot_instrument, linear_instrument):
+    def test_capability_discovery_not_assumption(self, perp_instrument):
         from btcbot.exchange.models import Capability
 
-        assert not spot_instrument.supports(Capability.SHORT)
-        assert not spot_instrument.supports(Capability.LEVERAGE)
-        assert linear_instrument.supports(Capability.SHORT)
-        assert linear_instrument.supports(Capability.LEVERAGE)
+        assert perp_instrument.supports(Capability.SHORT)
+        assert perp_instrument.supports(Capability.LEVERAGE)
+        assert perp_instrument.supports(Capability.REDUCE_ONLY)
 
-    def test_spot_parsing_matches_documented_response(self):
-        """Parsed from the exact JSON shape in Bybit's instruments-info docs."""
-        from btcbot.exchange.models import Category, InstrumentSpec
+    def test_swap_parsing_matches_documented_response(self):
+        """Parsed from the OKX v5 instruments response shape for a linear swap."""
+        from btcbot.exchange.models import Capability, InstrumentSpec, InstType
 
         payload = {
-            "symbolId": 9, "symbol": "BTCUSDT", "baseCoin": "BTC", "quoteCoin": "USDT",
-            "innovation": "0", "status": "Trading", "marginTrading": "utaOnly", "stTag": "0",
-            "lotSizeFilter": {
-                "basePrecision": "0.000001", "quotePrecision": "0.0000001",
-                "minOrderQty": "0.000011", "maxOrderQty": "83", "minOrderAmt": "5",
-                "maxOrderAmt": "8000000", "maxLimitOrderQty": "83",
-                "maxMarketOrderQty": "41.5", "postOnlyMaxLimitOrderSize": "60000",
-            },
-            "priceFilter": {"tickSize": "0.1"},
-            "riskParameters": {"priceLimitRatioX": "0.005", "priceLimitRatioY": "0.01"},
+            "instType": "SWAP", "instId": "BTC-USDT-SWAP", "uly": "BTC-USDT",
+            "instFamily": "BTC-USDT", "settleCcy": "USDT", "ctVal": "0.01",
+            "ctMult": "1", "ctValCcy": "BTC", "ctType": "linear", "state": "live",
+            "lever": "100", "tickSz": "0.1", "lotSz": "0.1", "minSz": "0.1",
+            "maxLmtSz": "100000", "maxMktSz": "12000", "listTime": "1573557408000",
         }
-        spec = InstrumentSpec.from_response(payload, Category.SPOT)
-        assert spec.symbol == "BTCUSDT"
-        assert spec.is_tradable
+        spec = InstrumentSpec.from_response(payload)
+        assert spec.inst_id == "BTC-USDT-SWAP"
+        assert spec.inst_type is InstType.SWAP
+        assert spec.is_tradable and spec.is_linear and spec.is_derivative
+        assert spec.base_ccy == "BTC"
+        assert spec.settle_ccy == "USDT"
+        assert spec.ct_val == Decimal("0.01")
+        assert spec.ct_val_ccy == "BTC"
         assert spec.tick_size == Decimal("0.1")
-        assert spec.qty_step == Decimal("0.000001")
-        assert spec.min_order_amt == Decimal("5")
-        assert spec.max_market_order_qty == Decimal("41.5")
-        assert spec.max_order_qty == Decimal("83")
+        assert spec.lot_size == Decimal("0.1")
+        assert spec.min_size == Decimal("0.1")
+        assert spec.max_leverage == Decimal("100")
+        assert spec.supports(Capability.SHORT)
 
-    def test_linear_parsing_matches_documented_response(self):
-        from btcbot.exchange.models import Capability, Category, InstrumentSpec
+    def test_unknown_state_is_not_tradable(self):
+        from btcbot.exchange.models import InstrumentSpec
 
         payload = {
-            "symbol": "BTCUSDT", "baseCoin": "BTC", "quoteCoin": "USDT", "status": "Trading",
-            "priceFilter": {"tickSize": "0.10"},
-            "lotSizeFilter": {"maxOrderQty": "1190.000", "minOrderQty": "0.001",
-                              "qtyStep": "0.001"},
+            "instType": "SWAP", "instId": "BTC-USDT-SWAP", "uly": "BTC-USDT",
+            "settleCcy": "USDT", "ctVal": "0.01", "ctType": "linear",
+            "state": "suspend", "tickSz": "0.1", "lotSz": "0.1", "minSz": "0.1",
         }
-        spec = InstrumentSpec.from_response(payload, Category.LINEAR)
-        assert spec.qty_step == Decimal("0.001")
-        assert spec.min_order_qty == Decimal("0.001")
-        assert spec.supports(Capability.SHORT)
-        assert spec.min_order_amt is None
+        spec = InstrumentSpec.from_response(payload)
+        assert not spec.is_tradable

@@ -8,7 +8,7 @@
 # ============================================================
 
 experiment:
-  name: BYBIT_DEMO_RESEARCH
+  name: OKX_DEMO_RESEARCH
   research_duration_days: 14
   expected_demo_equity: 10000.0
   # none          -> 14 real calendar days, outages recorded but not compensated (default)
@@ -21,27 +21,25 @@ experiment:
   auto_transition_to_champion: true
 
 market:
-  primary_symbol: BTCUSDT
-  # Categories the system may use for REAL demo orders, subject to runtime discovery.
-  # Bybit demo is a UTA; `spot` is the safe documented default (long-only, no leverage).
-  enabled_categories: ["spot"]
-  preferred_category: spot
-  quote_currency: USDT
+  # The tradable X-Perp is DISCOVERED at runtime from the exchange's SWAP
+  # instrument list (docs/okx_demo_capabilities.md §5) — there is deliberately
+  # no instId setting here. These two values drive the selection filter.
   base_currency: BTC
-  # Bybit kline intervals. "3" is a native Bybit interval (verified in docs).
+  settle_currency_preference: ["USDT", "USDC", "USD"]
+  # Internal timeframe notation (minutes; D/W). Translated to OKX bar strings
+  # at the transport boundary.
   timeframes: ["1", "3", "5", "15", "30", "60", "240"]
   # Timeframe used by the regime engine for the macro view.
   regime_timeframe: "60"
   regime_context_timeframe: "240"
 
 exchange:
-  recv_window_ms: 5000
   request_timeout_seconds: 15
   max_retries: 4
   retry_backoff_base_seconds: 0.75
   instrument_refresh_minutes: 60
-  # Public market data comes from mainnet public streams (Bybit docs: demo has no
-  # public stream; public data is identical to mainnet). Read-only, unauthenticated.
+  # Public + business (candles) + private streams all use the EEA DEMO
+  # WebSocket hosts (wseeapap.okx.com) — pinned in code, not configurable.
   public_ws_enabled: true
   private_ws_enabled: true
   orderbook_depth: 50
@@ -61,12 +59,27 @@ data:
   cache_dir: data/history
 
 risk:
+  # Margin mode is isolated and cannot be changed — no silent cross fallback.
+  margin_mode: isolated
+  # DYNAMIC_LEVERAGE_ENGINE bounds. The engine picks per-entry leverage from
+  # confidence/volatility/regime/drawdown inside these bounds; 10x is a hard
+  # schema-level ceiling.
+  leverage:
+    min_leverage: 1.0
+    max_leverage: 10.0
+    base_leverage: 2.0
+    high_vol_leverage_cap: 3.0
+    defensive_leverage_cap: 2.0
+    # Estimated liquidation distance must be >= this multiple of the stop distance.
+    liq_buffer_stop_ratio: 3.0
+    # Initial margin may not exceed this fraction of available balance.
+    margin_utilization_cap: 0.5
   # Fraction of DEMO equity risked on a normal actual-demo trade.
   normal_risk_pct: 0.0075
   min_risk_pct: 0.005
   # Hard ceiling. Sizing may never exceed this, whatever the inputs say.
   max_risk_pct: 0.02
-  # Notional ceiling as a fraction of equity (spot cash cap).
+  # Notional ceiling as a fraction of equity (multiplied by leverage for perps).
   max_notional_pct_equity: 0.95
   max_concurrent_demo_positions: 1
   # Refuse absurdly tight stops that would explode position size.
@@ -87,7 +100,9 @@ shadow:
   max_concurrent_per_strategy: 1
   # Shadow accounts may test alternative sizing models (research only).
   alternative_sizing_models: ["fixed_fractional", "volatility_target", "confidence_scaled"]
-  fee_rate_taker: 0.00055
+  # Defaults for the OKX perp schedule; the live account's discovered rates
+  # override these at runtime.
+  fee_rate_taker: 0.0005
   fee_rate_maker: 0.0002
   slippage_bps: 2.0
 
@@ -108,7 +123,7 @@ allocator:
   regime_suitability_weight: 0.2
 
 backtesting:
-  fee_rate_taker: 0.00055
+  fee_rate_taker: 0.0005
   fee_rate_maker: 0.0002
   slippage_bps: 2.0
   spread_bps: 1.0
@@ -219,11 +234,17 @@ champion:
   decay_min_trades: 25
 
 safety:
-  # The mainnet negative control sends the key ONCE, read-only, to the mainnet host and
-  # requires it to FAIL. It proves the key cannot act on real money.
+  # The live-environment negative control sends the key ONCE, read-only, WITHOUT the
+  # x-simulated-trading header and requires OKX to reject it (error 50101). It proves
+  # the key cannot act on real money.
   # Set false to skip (recorded in experiment metadata and warned about at startup).
   mainnet_negative_control: true
   reverify_interval_minutes: 60
+  # Clock drift beyond this pauses authenticated trading until re-sync.
+  max_clock_drift_ms: 5000
+  clock_resync_interval_minutes: 10
+  # Flatten + pause when a live position's margin ratio falls below this floor.
+  liquidation_margin_ratio_floor: 3.0
   max_consecutive_api_errors: 12
   max_orders_per_minute: 6
   price_sanity_min: 1000.0

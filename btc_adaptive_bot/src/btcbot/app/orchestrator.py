@@ -28,10 +28,12 @@ from ..config.loader import Credentials, LoadedConfig
 from ..database.db import Database
 from ..database.migrations import run_migrations
 from ..database.repositories import Repositories
+from ..decision.engine import DecisionEngine
+from ..decision.risk_state import RiskStateTracker
 from ..exchange.demo_guard import DemoGuard
 from ..exchange.instruments import CapabilityDiscovery
-from ..exchange.models import Candle, Category, Execution
-from ..exchange.rest import BybitDemoClient
+from ..exchange.models import Candle, Execution, PositionMode, Ticker, WalletBalance
+from ..exchange.rest import OkxDemoClient
 from ..exchange.ws import PrivateAccountStream, PublicMarketStream
 from ..execution.allocator import DemoAllocator
 from ..execution.demo_executor import DemoExecutor
@@ -47,6 +49,7 @@ from ..news.engine import NewsEngine
 from ..notifications.manager import NotificationManager
 from ..regime.classifier import RegimeClassifier, RegimeSnapshot, RegimeTracker
 from ..reporting.reports import ReportGenerator
+from ..risk.leverage_engine import LeverageEngine
 from ..risk.position_sizing import PositionSizer
 from ..safety.circuit_breakers import CircuitBreakers
 from ..scoring.champion import ChampionSelector
@@ -89,7 +92,7 @@ class Orchestrator:
 
         self.db: Database | None = None
         self.repos: Repositories | None = None
-        self.client: BybitDemoClient | None = None
+        self.client: OkxDemoClient | None = None
         self.guard: DemoGuard | None = None
         self.discovery: CapabilityDiscovery | None = None
         self.store: MarketDataStore | None = None
@@ -101,15 +104,23 @@ class Orchestrator:
         self.shadow: ShadowEngine | None = None
         self.allocator: DemoAllocator | None = None
         self.executor: DemoExecutor | None = None
+        self.decision: DecisionEngine | None = None
         self.ledger: PositionLedger | None = None
         self.trade_manager: TradeManager | None = None
         self.news: NewsEngine | None = None
         self.experiment: ExperimentManager | None = None
         self.breakers = CircuitBreakers(self.config.safety)
+        self.risk_state = RiskStateTracker(self.config.risk, self.breakers)
         self.notifications = NotificationManager(self.config.notifications)
         self.reports: ReportGenerator | None = None
         self.public_stream: PublicMarketStream | None = None
         self.private_stream: PrivateAccountStream | None = None
+        # The discovered X-Perp instId — set by capability discovery, never configured.
+        self._inst_id: str = ""
+        self._position_mode: PositionMode = PositionMode.NET
+        self._latest_margin_ratio: float | None = None
+        self._latest_funding_rate: float | None = None
+        self._next_funding_ms: int | None = None
 
         self._running = False
         self._tasks: list[asyncio.Task[Any]] = []
@@ -142,23 +153,26 @@ class Orchestrator:
         if applied:
             log.info("DB", f"Applied {applied} migration(s)")
 
-        # --- exchange client (demo host is pinned in the constructor) ---
-        self.client = BybitDemoClient(
+        # --- exchange client (EEA demo host is pinned in the constructor;
+        #     x-simulated-trading is injected by its transport layer) --------
+        self.client = OkxDemoClient(
             api_key=self.credentials.api_key if self.credentials else None,
             api_secret=self.credentials.api_secret if self.credentials else None,
-            recv_window_ms=self.config.exchange.recv_window_ms,
+            passphrase=self.credentials.passphrase if self.credentials else None,
             timeout_seconds=self.config.exchange.request_timeout_seconds,
             max_retries=self.config.exchange.max_retries,
             backoff_base_seconds=self.config.exchange.retry_backoff_base_seconds,
         )
         await self.client.sync_clock()
-        log.info("BYBIT", f"Connected to {self.client.base_url}")
+        log.info("OKX", f"Connected to {self.client.base_url} (demo environment)")
+        self.breakers.check_clock_drift(self.client.clock_offset_ms)
 
         # --- demo verification ----------------------------------------
         self.guard = DemoGuard(
             self.client,
             api_key=self.credentials.api_key if self.credentials else None,
             api_secret=self.credentials.api_secret if self.credentials else None,
+            passphrase=self.credentials.passphrase if self.credentials else None,
             run_mainnet_negative_control=self.config.safety.mainnet_negative_control,
         )
         if self.credentials is not None:
@@ -167,6 +181,10 @@ class Orchestrator:
                 s.name == "authenticated reachability" and s.passed for s in verification.signals
             )
             preconditions.demo_verified = verification.verified
+            if verification.account_config is not None:
+                # Adapt to the account's position mode — never force a change.
+                self._position_mode = verification.account_config.position_mode
+                log.info("OKX", f"Account position mode: {self._position_mode.value}")
         else:
             log.warning(
                 "SAFETY",
@@ -174,15 +192,16 @@ class Orchestrator:
                 "Order submission is disabled.",
             )
 
-        # --- capability discovery -------------------------------------
+        # --- instrument discovery (the X-Perp is found, never hardcoded) --
         self.discovery = CapabilityDiscovery(
             self.client,
-            symbol=self.config.market.primary_symbol,
-            enabled_categories=list(self.config.market.enabled_categories),
-            preferred_category=self.config.market.preferred_category,
+            base_ccy=self.config.market.base_currency,
+            settle_preference=list(self.config.market.settle_currency_preference),
         )
         capabilities = await self.discovery.discover()
-        category = capabilities.primary_category or Category.SPOT
+        self._inst_id = capabilities.inst_id
+        for line in capabilities.describe():
+            log.info("OKX", line)
 
         # --- balance ----------------------------------------------------
         if preconditions.demo_verified:
@@ -193,7 +212,7 @@ class Orchestrator:
             log.info(
                 "BALANCE",
                 f"Expected research capital: ${self.config.experiment.expected_demo_equity:,.2f} | "
-                f"Actual Bybit Demo capital: ${self._equity:,.2f}",
+                f"Actual OKX Demo capital: ${self._equity:,.2f}",
             )
             if abs(self._equity - self.config.experiment.expected_demo_equity) > 1.0:
                 log.info(
@@ -201,12 +220,13 @@ class Orchestrator:
                     "Actual demo balance differs from the expected figure — the actual "
                     "balance is what the demo execution engine will use.",
                 )
+            self.risk_state.start_of_day(self._equity)
         else:
             log.warning("BALANCE", "Demo balance unavailable (not verified) — demo layer disabled")
 
         # --- market data -----------------------------------------------
         self.store = MarketDataStore(
-            self.config.market.primary_symbol,
+            self._inst_id,
             list(self.config.market.timeframes),
             candle_buffer=self.config.data.candle_buffer,
             staleness_budgets={
@@ -218,8 +238,7 @@ class Orchestrator:
         self.history = HistoricalDataManager(
             self.client,
             self.repos.market,
-            symbol=self.config.market.primary_symbol,
-            category=category,
+            symbol=self._inst_id,
         )
 
         # --- strategies -------------------------------------------------
@@ -272,10 +291,7 @@ class Orchestrator:
         """Confirm BTC market data is genuinely functioning."""
         assert self.client and self.store
         try:
-            category = self.discovery.capabilities.primary_category or Category.SPOT
-            ticker = await self.client.get_ticker(
-                self.config.market.primary_symbol, category=category
-            )
+            ticker = await self.client.get_ticker(self._inst_id)
         except (ApiError, TransportError) as exc:
             log.error("DATA", f"Market data check failed: {exc}")
             return False
@@ -330,14 +346,14 @@ class Orchestrator:
             )
 
         capabilities = self.discovery.capabilities
-        category = capabilities.primary_category or Category.SPOT
         state = self.experiment.start_or_resume(
             mode=self.mode,
             preconditions=preconditions,
             starting_demo_equity=self._equity,
             enabled_strategies=self.registry.ids,
             strategy_versions=self.registry.version_map(),
-            demo_category=category.value,
+            demo_category=capabilities.primary.inst_type.value,
+            primary_symbol=self._inst_id,
         )
         self._starting_equity = state.starting_demo_equity or self._equity
         self._peak_equity = max(self._equity, self._starting_equity)
@@ -356,7 +372,7 @@ class Orchestrator:
         await self.notifications.notify(
             "Bot started",
             f"Experiment {state.experiment_id} day {state.day}/{state.duration_days} "
-            f"with {len(self.registry)} strategies on Bybit Demo.",
+            f"with {len(self.registry)} strategies on OKX Demo ({self._inst_id}).",
         )
 
         await self._run_live()
@@ -369,7 +385,7 @@ class Orchestrator:
             self.config.shadow,
             self.repos.shadow,
             experiment_id=experiment_id,
-            symbol=self.config.market.primary_symbol,
+            symbol=self._inst_id,
         )
         self.shadow.initialise(self.registry.ids)
 
@@ -384,17 +400,22 @@ class Orchestrator:
         self.ledger = PositionLedger(self.repos.positions, experiment_id=experiment_id)
         self.trade_manager = TradeManager(self.ledger)
         safety_guard = OrderSafetyGuard(self.repos.demo_orders)
+        self.decision = DecisionEngine(self.repos.rejected, experiment_id=experiment_id)
         self.executor = DemoExecutor(
             self.client,
             guard=self.guard,
             breakers=self.breakers,
             sizer=PositionSizer(self.config.risk),
+            leverage_engine=LeverageEngine(self.config.risk.leverage),
             ledger=self.ledger,
             safety=safety_guard,
             orders=self.repos.demo_orders,
+            leverage_decisions=self.repos.leverage,
+            rejected_signals=self.repos.rejected,
             system=self.repos.system,
             risk_config=self.config.risk,
             experiment_id=experiment_id,
+            position_mode=self._position_mode,
             dry_run=self.dry_run,
         )
 
@@ -413,15 +434,16 @@ class Orchestrator:
 
         log.info("RECOVERY", "Reconciling exchange state with the local ledger…")
         capabilities = self.discovery.capabilities
-        category = capabilities.primary_category or Category.SPOT
-        symbol = self.config.market.primary_symbol
+        instrument = capabilities.primary
+        inst_id = self._inst_id
 
         restored = self.ledger.restore()
 
         try:
-            open_orders = await self.client.get_open_orders(symbol, category=category)
+            open_orders = await self.client.get_open_orders(inst_id)
             balance = await self.client.get_wallet_balance()
-            executions = await self.client.get_executions(symbol, category=category, limit=50)
+            executions = await self.client.get_executions(inst_id, limit=50)
+            exchange_positions = await self.client.get_positions(inst_id)
         except (ApiError, TransportError) as exc:
             log.error("RECOVERY", f"Reconciliation queries failed: {exc}")
             return
@@ -433,7 +455,7 @@ class Orchestrator:
             {
                 "experiment_id": self.experiment.require_state().experiment_id,
                 "ts_utc": iso(now_utc()),
-                "account_type": balance.account_type,
+                "account_type": "OKX_DEMO",
                 "total_equity": balance.total_equity,
                 "available": self._available,
                 "wallet_balance": balance.total_wallet_balance,
@@ -454,7 +476,7 @@ class Orchestrator:
                 "restore a known-clean state before resuming",
             )
             with contextlib.suppress(ApiError, TransportError):
-                await self.client.cancel_all(symbol, category=category)
+                await self.client.cancel_all(inst_id)
 
         # Resolve in-flight orders whose outcome we never recorded.
         for order in self.repos.demo_orders.in_flight():
@@ -469,24 +491,31 @@ class Orchestrator:
                     reject_reason=None if filled else "not present at exchange on reconciliation",
                 )
 
-        # Spot holdings vs ledger. A mismatch is reported, not auto-corrected:
-        # guessing here could double a position.
-        base_holding = balance.coin_balance(self.config.market.base_currency)
+        # Exchange positions vs ledger. A mismatch is reported, not
+        # auto-corrected: guessing here could double a position.
+        live = [p for p in exchange_positions if abs(p.contracts) > 0]
+        exchange_base = sum(
+            float(instrument.base_from_contracts(abs(p.contracts))) for p in live
+        )
         ledger_qty = sum(p.remaining_qty for p in self.ledger.open_positions())
-        if abs(base_holding - ledger_qty) > max(1e-6, ledger_qty * 0.02):
+        if abs(exchange_base - ledger_qty) > max(1e-8, ledger_qty * 0.02):
             log.warning(
                 "RECOVERY",
-                f"Exchange holds {base_holding:.8f} {self.config.market.base_currency} but the "
-                f"ledger records {ledger_qty:.8f}. Trading continues with the ledger as the "
-                "authority for attribution; review manually if this persists.",
+                f"Exchange holds {exchange_base:.8f} {instrument.base_ccy} across "
+                f"{len(live)} position(s) but the ledger records {ledger_qty:.8f}. Trading "
+                "continues with the ledger as the authority for attribution; review "
+                "manually if this persists.",
             )
             self.repos.system.event(
                 "state_mismatch",
-                "exchange holding differs from ledger",
+                "exchange position differs from ledger",
                 level="WARNING",
                 experiment_id=self.experiment.require_state().experiment_id,
-                payload={"exchange": base_holding, "ledger": ledger_qty},
+                payload={"exchange": exchange_base, "ledger": ledger_qty},
             )
+        for position in live:
+            if position.margin_ratio is not None:
+                self._latest_margin_ratio = position.margin_ratio
 
         self.breakers.reset_counters()
         log.info(
@@ -561,21 +590,20 @@ class Orchestrator:
 
     async def _start_streams(self, *, public_only: bool = False) -> None:
         assert self.store and self.discovery
-        category = self.discovery.capabilities.primary_category or Category.SPOT
 
         if self.config.exchange.public_ws_enabled:
             self.public_stream = PublicMarketStream(
-                category=category.value,
-                symbol=self.config.market.primary_symbol,
+                inst_id=self._inst_id,
                 timeframes=list(self.config.market.timeframes),
                 orderbook_depth=self.config.exchange.orderbook_depth,
                 ping_interval=self.config.exchange.ws_ping_interval_seconds,
                 max_backoff=self.config.exchange.ws_reconnect_max_backoff_seconds,
             )
-            self.public_stream.on_kline(self._on_kline)
+            self.public_stream.on_candle(self._on_candle)
             self.public_stream.on_ticker(self._on_ticker)
             self.public_stream.on_orderbook(self._on_orderbook)
             self.public_stream.on_trades(self._on_trades)
+            self.public_stream.on_funding(self._on_funding)
             await self.public_stream.start()
             await self.public_stream.wait_connected(timeout=20)
 
@@ -583,27 +611,27 @@ class Orchestrator:
             self.private_stream = PrivateAccountStream(
                 api_key=self.credentials.api_key,
                 api_secret=self.credentials.api_secret,
+                passphrase=self.credentials.passphrase,
                 ping_interval=self.config.exchange.ws_ping_interval_seconds,
                 max_backoff=self.config.exchange.ws_reconnect_max_backoff_seconds,
-                include_position=category is not Category.SPOT,
             )
             self.private_stream.on_execution(self._on_execution)
             self.private_stream.on_wallet(self._on_wallet)
+            self.private_stream.on_position(self._on_position)
             await self.private_stream.start()
 
     # --- stream handlers --------------------------------------------------
 
-    async def _on_kline(self, interval: str, payload: dict[str, Any]) -> None:
+    async def _on_candle(self, interval: str, candle: Candle) -> None:
         assert self.store
-        candle = Candle.from_ws(payload, interval)
         is_new = self.store.update_candle(interval, candle)
         if candle.confirmed and is_new:
             with contextlib.suppress(asyncio.QueueFull):
                 self._bar_queue.put_nowait((interval, candle))
 
-    async def _on_ticker(self, data: dict[str, Any]) -> None:
+    async def _on_ticker(self, ticker: Ticker) -> None:
         assert self.store
-        self.store.update_ticker_from_ws(data)
+        self.store.update_ticker(ticker)
         price = self.store.last_price
         if price > 0:
             trip = self.breakers.check_price(price)
@@ -620,25 +648,76 @@ class Orchestrator:
         assert self.store
         self.store.update_trades(trades)
 
+    async def _on_funding(self, item: dict[str, Any]) -> None:
+        """Track the live funding rate and next funding time for the X-Perp."""
+        if item.get("channel") == "funding-rate":
+            with contextlib.suppress(TypeError, ValueError):
+                self._latest_funding_rate = float(item.get("fundingRate") or 0.0)
+                next_ms = item.get("nextFundingTime") or item.get("fundingTime")
+                if next_ms:
+                    self._next_funding_ms = int(next_ms)
+
     async def _on_execution(self, data: list[dict[str, Any]]) -> None:
         if self.executor is None:
             return
         for item in data:
-            self.executor.record_fill(Execution.from_response(item))
+            self.executor.record_fill(Execution.from_order_update(item))
 
     async def _on_wallet(self, data: list[dict[str, Any]]) -> None:
+        """Private ``account`` channel — same shape as the REST balance data."""
+        from ..utils.timeutil import now_ms
+
         for account in data:
-            equity = account.get("totalEquity")
-            if equity:
-                try:
-                    self._equity = float(equity)
-                    self._peak_equity = max(self._peak_equity, self._equity)
-                except (TypeError, ValueError):
-                    continue
-            available = account.get("totalAvailableBalance")
-            if available:
-                with contextlib.suppress(TypeError, ValueError):
-                    self._available = float(available)
+            try:
+                balance = WalletBalance.from_response(account, ts_ms=now_ms())
+            except (TypeError, ValueError):
+                continue
+            if balance.total_equity > 0:
+                self._equity = balance.total_equity
+                self._peak_equity = max(self._peak_equity, self._equity)
+            if balance.total_available > 0:
+                self._available = balance.total_available
+
+    async def _on_position(self, data: list[dict[str, Any]]) -> None:
+        """Private ``positions`` channel — liquidation-protection monitoring."""
+        for item in data:
+            if item.get("instId") != self._inst_id:
+                continue
+            ratio = item.get("mgnRatio")
+            if ratio in (None, ""):
+                continue
+            with contextlib.suppress(TypeError, ValueError):
+                self._latest_margin_ratio = float(ratio)
+                trip = self.breakers.check_liquidation_risk(
+                    margin_ratio=self._latest_margin_ratio, inst_id=self._inst_id
+                )
+                if trip is not None:
+                    await self._flatten_for_liquidation_protection(trip.reason)
+
+    async def _flatten_for_liquidation_protection(self, reason: str) -> None:
+        """Close every live position at market — margin ratio hit the floor."""
+        if not (self.ledger and self.executor and self.store):
+            return
+        price = self.store.last_price
+        for position in self.ledger.open_positions():
+            result = await self.executor.submit_exit(
+                position,
+                exit_reason="liquidation_protection",
+                capabilities=self.discovery.capabilities,
+            )
+            if result.success and price > 0:
+                trade = self.ledger.close(
+                    position,
+                    exit_price=price,
+                    exit_reason="liquidation_protection",
+                    exit_order_id=result.client_order_id,
+                    fees=0.0,
+                )
+                log.critical(
+                    "SAFETY",
+                    f"Flattened {position.strategy_id} for liquidation protection "
+                    f"({trade['r_multiple']:+.2f}R): {reason}",
+                )
 
     # --- bar processing ---------------------------------------------------
 
@@ -797,11 +876,50 @@ class Orchestrator:
         return signal
 
     async def _allocate_demo(self, candidates: list[tuple[str, StrategySignal]]) -> None:
-        """Let the allocator choose one candidate for a real demo order."""
+        """Run the decision layers, then let the allocator pick one real order."""
         assert self.allocator and self.executor and self.ledger and self.store
 
+        # --- decision engine layers 1–7 (per candidate, journaled) --------
+        risk_state = self.risk_state.evaluate(
+            equity=self._equity, peak_equity=self._peak_equity
+        )
+        health = self.store.health()
+        context = self._build_context()
+        surviving: list[tuple[str, StrategySignal]] = []
+        if self.decision is not None and context is not None:
+            for strategy_id, signal in candidates:
+                strategy = self.registry.get(strategy_id) if self.registry else None
+                if strategy is None:
+                    continue
+                setup_uid = make_setup_id(
+                    strategy_id, signal.symbol, signal.timeframe, signal.bar_open_ms,
+                    signal.setup_key,
+                )
+                signal_uid = make_signal_id(
+                    strategy_id, signal.strategy_version, signal.symbol, signal.timeframe,
+                    signal.bar_open_ms, signal.direction.value,
+                )
+                outcome = self.decision.evaluate(
+                    strategy,
+                    signal,
+                    context,
+                    data_healthy=health.healthy,
+                    data_detail=health.describe(),
+                    risk_state=risk_state,
+                    signal_id=signal_uid,
+                    setup_id=setup_uid,
+                )
+                if outcome.accepted:
+                    surviving.append((strategy_id, signal))
+                else:
+                    log.info("DECISION", f"{strategy_id}: {outcome.describe()}")
+        else:
+            surviving = candidates
+        if not surviving:
+            return
+
         decision = self.allocator.allocate(
-            candidates,
+            surviving,
             regime=self._current_regime.regime.value if self._current_regime else "UNCERTAIN",
             position_open=self.ledger.has_open_position,
         )
@@ -841,6 +959,7 @@ class Orchestrator:
             news_size_factor=news_state.size_factor if news_state else 1.0,
             news_state=news_state.label if news_state else None,
             volatility_pct=features.atr_pct if features else None,
+            risk_state=risk_state.state,
         )
         if result.success:
             self.allocator.confirm_allocation(strategy_id)
@@ -1004,8 +1123,10 @@ class Orchestrator:
     # =================================================================
 
     async def _health_loop(self) -> None:
-        """Watch data freshness, API errors, and re-verify demo status."""
+        """Watch data freshness, API errors, clock drift, and re-verify demo status."""
         last_verification = now_utc()
+        last_clock_sync = now_utc()
+        last_funding_poll = now_utc()
         while self._running:
             await asyncio.sleep(20)
             try:
@@ -1035,6 +1156,30 @@ class Orchestrator:
                 if self.client:
                     self.breakers.check_api_errors(self.client.consecutive_errors)
 
+                # Clock drift: re-measure on a schedule; excessive drift trips
+                # a breaker (pausing orders) and revokes demo verification
+                # until a clean re-verification passes.
+                if (
+                    self.client
+                    and (now_utc() - last_clock_sync).total_seconds()
+                    >= self.config.safety.clock_resync_interval_minutes * 60
+                ):
+                    with contextlib.suppress(ApiError, TransportError):
+                        await self.client.sync_clock()
+                    last_clock_sync = now_utc()
+                    trip = self.breakers.check_clock_drift(self.client.clock_offset_ms)
+                    if trip is not None and self.guard:
+                        self.guard.revoke(trip.reason)
+
+                # Funding bills: poll and journal — funding is part of PnL.
+                if (
+                    self.guard
+                    and self.guard.orders_permitted()
+                    and (now_utc() - last_funding_poll).total_seconds() >= 600
+                ):
+                    await self._poll_funding(experiment_id)
+                    last_funding_poll = now_utc()
+
                 if (
                     self.guard
                     and self.credentials
@@ -1046,12 +1191,47 @@ class Orchestrator:
                     if not verification.verified:
                         await self.notifications.notify(
                             "SAFETY LOCK",
-                            "Bybit demo verification failed on re-check — order submission disabled.",
+                            "OKX demo verification failed on re-check — order submission disabled.",
                         )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - the health loop must never die
                 log.error("SAFETY", f"Health loop error: {type(exc).__name__}: {exc}")
+
+    async def _poll_funding(self, experiment_id: str) -> None:
+        """Record realised funding payments and attribute them to positions."""
+        if not self.client:
+            return
+        try:
+            bills = await self.client.get_funding_bills(limit=50)
+        except (ApiError, TransportError) as exc:
+            log.debug("OKX", f"Funding-bill poll failed: {exc}")
+            return
+        open_position = self.ledger.current() if self.ledger else None
+        for bill in bills:
+            if bill.get("instId") != self._inst_id:
+                continue
+            bill_id = bill.get("billId")
+            if not bill_id:
+                continue
+            amount = float(bill.get("pnl") or bill.get("balChg") or 0.0)
+            inserted = self.repos.funding.record(
+                {
+                    "bill_id": str(bill_id),
+                    "experiment_id": experiment_id,
+                    "ts_utc": iso(now_utc()),
+                    "inst_id": self._inst_id,
+                    "amount": amount,
+                    "currency": bill.get("ccy"),
+                    "position_id": open_position.position_id if open_position else None,
+                    "strategy_id": open_position.strategy_id if open_position else None,
+                    "raw": bill,
+                }
+            )
+            if inserted and open_position is not None:
+                # Funding *paid* increases the position's cost; received reduces it.
+                self.repos.positions.add_funding_fee(open_position.position_id, -amount)
+                open_position.fees += max(0.0, -amount)
 
     async def _recover_after_outage(self) -> None:
         """Refill missing candles and re-reconcile after connectivity returns."""
@@ -1179,6 +1359,8 @@ class Orchestrator:
                 state = self.experiment.require_state()
                 if state.day > self._last_report_day and self.reports:
                     self._last_report_day = state.day
+                    # New UTC experiment day: reset the daily-loss baseline.
+                    self.risk_state.start_of_day(self._equity)
                     await self.db.run(self.reports.daily_report, state)
             except asyncio.CancelledError:
                 raise
@@ -1290,7 +1472,7 @@ class Orchestrator:
         if self.config.experiment.auto_transition_to_champion and selection.champion_id:
             log.info(
                 "CHAMPION",
-                f"Transitioning to BYBIT_DEMO_CHAMPION — {selection.champion_id} now controls "
+                f"Transitioning to OKX_DEMO_CHAMPION — {selection.champion_id} now controls "
                 "actual demo execution; challengers continue in shadow mode.",
             )
             self.repos.system.event(
@@ -1382,11 +1564,11 @@ class Orchestrator:
                         split,
                         config=self.config.backtesting,
                         regime_config=self.config.regime,
-                        symbol=self.config.market.primary_symbol,
+                        symbol=self._inst_id,
                     )
                     evidence.historical = segments.get("oos")
                     evidence.walk_forward = await self.db.run(
-                        analyzer.run, strategy, candles, symbol=self.config.market.primary_symbol
+                        analyzer.run, strategy, candles, symbol=self._inst_id
                     )
                 except Exception as exc:  # noqa: BLE001 - a failed backtest must not stop ranking
                     log.warning(
@@ -1454,6 +1636,28 @@ class Orchestrator:
         health = self.store.health() if self.store else None
         verification = self.guard.last_verification if self.guard else None
 
+        instrument_panel: dict[str, Any] = {}
+        if self.discovery is not None:
+            try:
+                spec = self.discovery.capabilities.primary
+                instrument_panel = {
+                    "inst_id": spec.inst_id,
+                    "inst_type": spec.inst_type.value,
+                    "ct_type": spec.ct_type,
+                    "ct_val": str(spec.ct_val),
+                    "ct_val_ccy": spec.ct_val_ccy,
+                    "ct_mult": str(spec.ct_mult),
+                    "lot_size": str(spec.lot_size),
+                    "min_size": str(spec.min_size),
+                    "tick_size": str(spec.tick_size),
+                    "max_leverage": str(spec.max_leverage),
+                    "settle_ccy": spec.settle_ccy,
+                    "position_mode": self._position_mode.value,
+                    "margin_mode": "isolated",
+                }
+            except Exception:  # noqa: BLE001 - discovery may not have run yet
+                instrument_panel = {"inst_id": self._inst_id or "not discovered"}
+
         return {
             "system": {
                 "running": self._running,
@@ -1474,6 +1678,7 @@ class Orchestrator:
                 "safety": self.breakers.snapshot(),
             },
             "experiment": state.as_dict() if state else None,
+            "instrument": instrument_panel,
             "demo_account": {
                 "equity": round(self._equity, 2),
                 "available": round(self._available, 2),
@@ -1484,6 +1689,19 @@ class Orchestrator:
                     safe_div(self._peak_equity - self._equity, self._peak_equity) * 100, 2
                 ),
                 "positions": self.ledger.snapshot() if self.ledger else [],
+                "margin_ratio": self._latest_margin_ratio,
+                "funding_rate": self._latest_funding_rate,
+                "next_funding_ms": self._next_funding_ms,
+                "risk_state": self.risk_state.current.as_dict(),
+            },
+            "decision": {
+                "engine": self.decision.stats() if self.decision else {},
+                "rejected_recent": (
+                    self.repos.rejected.recent(10) if self.repos else []
+                ),
+                "leverage_recent": (
+                    self.repos.leverage.recent(10) if self.repos else []
+                ),
             },
             "market": self.store.snapshot() if self.store else {},
             "regime": {

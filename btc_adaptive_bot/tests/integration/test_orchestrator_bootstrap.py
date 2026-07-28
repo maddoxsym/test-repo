@@ -20,9 +20,21 @@ import pytest
 
 from btcbot.config.loader import Credentials, LoadedConfig
 from btcbot.config.schema import AppConfig
-from btcbot.exchange.models import Candle, Category, InstrumentSpec, Ticker, WalletBalance
+from btcbot.exchange.models import (
+    AccountConfig,
+    Candle,
+    InstrumentSpec,
+    InstType,
+    PositionMode,
+    Ticker,
+    WalletBalance,
+)
 from btcbot.utils.timeutil import now_ms
 from tests.integration.test_dry_run_pipeline import realistic_series
+
+
+def _credentials() -> Credentials:
+    return Credentials(api_key="k" * 20, api_secret="s" * 20, passphrase="p" * 12)
 
 pytestmark = pytest.mark.integration
 
@@ -30,11 +42,13 @@ pytestmark = pytest.mark.integration
 class MockRestClient:
     """Serves deterministic market data; records what was asked for."""
 
-    def __init__(self, spot_instrument: InstrumentSpec, *, equity: float = 10_000.0) -> None:
-        self.base_url = "https://api-demo.bybit.com"
-        self._instrument = spot_instrument
+    def __init__(self, instrument: InstrumentSpec, *, equity: float = 10_000.0) -> None:
+        self.base_url = "https://eea.okx.com"
+        self._instrument = instrument
         self._equity = equity
         self.consecutive_errors = 0
+        self.clock_offset_ms = 12
+        self.clock_synced = True
         self.closed = False
         self.calls: list[str] = []
         self._series: dict[str, list[Candle]] = {
@@ -46,27 +60,31 @@ class MockRestClient:
     def has_credentials(self) -> bool:
         return True
 
+    def demo_header_enforced(self) -> bool:
+        return True
+
+    def clock_drift_exceeds(self, max_drift_ms: int) -> bool:
+        return abs(self.clock_offset_ms) > max_drift_ms
+
     async def sync_clock(self) -> int:
         self.calls.append("sync_clock")
-        return 12
+        return self.clock_offset_ms
 
-    async def get_instruments(self, category: Category, symbol=None):
-        self.calls.append(f"instruments:{category.value}")
-        if category is Category.SPOT:
+    async def get_instruments(self, inst_type=InstType.SWAP, *, inst_id=None):
+        self.calls.append(f"instruments:{inst_type.value}")
+        if inst_type is InstType.SWAP:
             return [self._instrument]
-        return []   # derivatives genuinely unavailable on this account
+        return []
 
-    async def get_ticker(self, symbol: str, *, category=Category.SPOT) -> Ticker:
+    async def get_ticker(self, inst_id: str) -> Ticker:
         self.calls.append("ticker")
         last = self._series["1"][-1].close
         return Ticker(
-            symbol=symbol, last_price=last, bid_price=last - 0.5, ask_price=last + 0.5,
+            inst_id=inst_id, last_price=last, bid_price=last - 0.5, ask_price=last + 0.5,
             volume_24h=12_000.0, turnover_24h=6e8, price_24h_pct=0.01, ts_ms=now_ms(),
         )
 
-    async def get_klines(
-        self, symbol, interval, *, category=Category.SPOT, start_ms=None, end_ms=None, limit=200
-    ):
+    async def get_klines(self, inst_id, interval, *, start_ms=None, end_ms=None, limit=300):
         self.calls.append(f"klines:{interval}")
         candles = self._series.get(interval, [])
         if start_ms is not None:
@@ -75,36 +93,38 @@ class MockRestClient:
             candles = [c for c in candles if c.open_ms <= end_ms]
         return candles[-limit:]
 
-    async def get_wallet_balance(self, account_type: str = "UNIFIED") -> WalletBalance:
+    async def get_wallet_balance(self) -> WalletBalance:
         self.calls.append("balance")
         return WalletBalance(
-            account_type=account_type,
             total_equity=self._equity,
             total_available=self._equity,
-            total_wallet_balance=self._equity,
             unrealized_pnl=0.0,
-            coins={"USDT": {"walletBalance": self._equity, "availableToWithdraw": self._equity}},
+            coins={"USDT": {"eq": self._equity, "availEq": self._equity,
+                            "eqUsd": self._equity}},
             ts_ms=now_ms(),
         )
 
-    async def get_account_info(self):
-        self.calls.append("account_info")
-        return {"unifiedMarginStatus": 6, "marginMode": "REGULAR_MARGIN"}
+    async def get_account_config(self) -> AccountConfig:
+        self.calls.append("account_config")
+        return AccountConfig(
+            uid="demo-123", account_level="2", position_mode=PositionMode.NET,
+            raw={"uid": "demo-123", "acctLv": "2", "posMode": "net_mode"},
+        )
 
-    async def get_api_key_info(self):
-        return {"userID": "demo-123", "readOnly": 0, "permissions": {"Spot": ["SpotTrade"]}}
-
-    async def probe_demo_endpoint(self):
-        return {"retCode": 0, "retMsg": "OK"}
-
-    async def get_open_orders(self, symbol, *, category):
+    async def get_positions(self, inst_id=None):
         return []
 
-    async def get_executions(self, symbol, *, category, limit=100, start_ms=None):
+    async def get_open_orders(self, inst_id):
         return []
 
-    async def cancel_all(self, symbol, *, category):
-        return {}
+    async def get_executions(self, inst_id, *, limit=100, start_ms=None):
+        return []
+
+    async def get_funding_bills(self, *, limit=100):
+        return []
+
+    async def cancel_all(self, inst_id):
+        return {"cancelled": 0, "failed": []}
 
     async def close(self) -> None:
         self.closed = True
@@ -132,10 +152,10 @@ def loaded_config(tmp_path) -> LoadedConfig:
             "export_dir": str(tmp_path / "reports" / "exports"),
         },
         news={"enabled": False, "providers": []},
-        # The mainnet negative control needs real outbound network access to
-        # api.bybit.com; offline it correctly reports "inconclusive" and blocks
-        # trading. That behaviour is covered by test_safety_lock.py, so it is
-        # switched off here to keep this test about bootstrap wiring.
+        # The live-environment negative control needs real outbound network
+        # access to eea.okx.com; offline it correctly reports "inconclusive"
+        # and blocks trading. That behaviour is covered by test_safety_lock.py,
+        # so it is switched off here to keep this test about bootstrap wiring.
         safety={"mainnet_negative_control": False},
         # Keep the strategy set small so the test stays quick.
         strategies={"enabled": ["ema_trend_cross_15m", "donchian_breakout_15m",
@@ -150,20 +170,20 @@ def loaded_config(tmp_path) -> LoadedConfig:
 def _patch_client(monkeypatch, instrument, **kwargs) -> MockRestClient:
     mock = MockRestClient(instrument, **kwargs)
     monkeypatch.setattr(
-        "btcbot.app.orchestrator.BybitDemoClient", lambda **_: mock
+        "btcbot.app.orchestrator.OkxDemoClient", lambda **_: mock
     )
     return mock
 
 
 class TestBootstrap:
     async def test_bootstrap_completes_every_precondition(
-        self, monkeypatch, loaded_config, spot_instrument
+        self, monkeypatch, loaded_config, perp_instrument
     ):
         from btcbot.app.orchestrator import Orchestrator
 
-        mock = _patch_client(monkeypatch, spot_instrument)
+        mock = _patch_client(monkeypatch, perp_instrument)
         orchestrator = Orchestrator(
-            loaded_config, Credentials(api_key="k" * 20, api_secret="s" * 20)
+            loaded_config, _credentials()
         )
         try:
             preconditions = await orchestrator.bootstrap()
@@ -179,11 +199,11 @@ class TestBootstrap:
             assert math.isclose(orchestrator._equity, 10_000.0)   # noqa: SLF001
             assert "balance" in mock.calls
 
-            # Capability discovery ran and found spot only.
+            # Instrument discovery ran and found the X-Perp — shorts native.
             capabilities = orchestrator.discovery.capabilities
-            assert capabilities.primary_category is Category.SPOT
-            assert not capabilities.supports_short_on_exchange
-            assert any("short" in note for note in capabilities.notes)
+            assert capabilities.primary.inst_type is InstType.SWAP
+            assert capabilities.supports_short_on_exchange
+            assert orchestrator._inst_id == capabilities.primary.inst_id  # noqa: SLF001
 
             # Backfill populated the live series.
             for timeframe in ("5", "15", "60", "240"):
@@ -194,11 +214,11 @@ class TestBootstrap:
             await orchestrator.shutdown()
 
     async def test_bootstrap_without_credentials_leaves_demo_unverified(
-        self, monkeypatch, loaded_config, spot_instrument
+        self, monkeypatch, loaded_config, perp_instrument
     ):
         from btcbot.app.orchestrator import Orchestrator
 
-        _patch_client(monkeypatch, spot_instrument)
+        _patch_client(monkeypatch, perp_instrument)
         orchestrator = Orchestrator(loaded_config, None)
         try:
             preconditions = await orchestrator.bootstrap()
@@ -210,14 +230,14 @@ class TestBootstrap:
             await orchestrator.shutdown()
 
     async def test_actual_balance_is_used_even_when_it_differs(
-        self, monkeypatch, loaded_config, spot_instrument
+        self, monkeypatch, loaded_config, perp_instrument
     ):
         """The brief: never fake the value; use the real demo balance."""
         from btcbot.app.orchestrator import Orchestrator
 
-        _patch_client(monkeypatch, spot_instrument, equity=7_432.19)
+        _patch_client(monkeypatch, perp_instrument, equity=7_432.19)
         orchestrator = Orchestrator(
-            loaded_config, Credentials(api_key="k" * 20, api_secret="s" * 20)
+            loaded_config, _credentials()
         )
         try:
             await orchestrator.bootstrap()
@@ -227,13 +247,13 @@ class TestBootstrap:
             await orchestrator.shutdown()
 
     async def test_strategies_are_registered_in_the_database(
-        self, monkeypatch, loaded_config, spot_instrument
+        self, monkeypatch, loaded_config, perp_instrument
     ):
         from btcbot.app.orchestrator import Orchestrator
 
-        _patch_client(monkeypatch, spot_instrument)
+        _patch_client(monkeypatch, perp_instrument)
         orchestrator = Orchestrator(
-            loaded_config, Credentials(api_key="k" * 20, api_secret="s" * 20)
+            loaded_config, _credentials()
         )
         try:
             await orchestrator.bootstrap()
@@ -250,15 +270,15 @@ class TestBootstrap:
 
 class TestDryRunDoesNotStartTheTimer:
     async def test_dry_run_never_creates_an_experiment(
-        self, monkeypatch, loaded_config, spot_instrument
+        self, monkeypatch, loaded_config, perp_instrument
     ):
         """The single most important dry-run guarantee."""
         from btcbot.app.orchestrator import Orchestrator
 
-        _patch_client(monkeypatch, spot_instrument)
+        _patch_client(monkeypatch, perp_instrument)
         orchestrator = Orchestrator(
             loaded_config,
-            Credentials(api_key="k" * 20, api_secret="s" * 20),
+            _credentials(),
             dry_run=True,
         )
         # Skip the websocket layer; this test is about the timer, not streaming.
@@ -285,14 +305,14 @@ class TestDryRunDoesNotStartTheTimer:
             )
 
     async def test_dry_run_observes_market_data_and_regime(
-        self, monkeypatch, loaded_config, spot_instrument
+        self, monkeypatch, loaded_config, perp_instrument
     ):
         from btcbot.app.orchestrator import Orchestrator
 
-        _patch_client(monkeypatch, spot_instrument)
+        _patch_client(monkeypatch, perp_instrument)
         orchestrator = Orchestrator(
             loaded_config,
-            Credentials(api_key="k" * 20, api_secret="s" * 20),
+            _credentials(),
             dry_run=True,
         )
         monkeypatch.setattr(orchestrator, "_start_streams", _noop)
@@ -311,16 +331,16 @@ class TestDryRunDoesNotStartTheTimer:
             await orchestrator.shutdown()
 
     async def test_dashboard_state_is_available_during_dry_run(
-        self, monkeypatch, loaded_config, spot_instrument
+        self, monkeypatch, loaded_config, perp_instrument
     ):
         import json
 
         from btcbot.app.orchestrator import Orchestrator
 
-        _patch_client(monkeypatch, spot_instrument)
+        _patch_client(monkeypatch, perp_instrument)
         orchestrator = Orchestrator(
             loaded_config,
-            Credentials(api_key="k" * 20, api_secret="s" * 20),
+            _credentials(),
             dry_run=True,
         )
         try:
@@ -329,6 +349,10 @@ class TestDryRunDoesNotStartTheTimer:
             assert state["system"]["dry_run"] is True
             assert state["experiment"] is None
             assert state["market"]["last_price"] > 0
+            # The instrument panel reflects the discovered contract spec.
+            assert state["instrument"]["inst_id"] == orchestrator._inst_id  # noqa: SLF001
+            assert state["instrument"]["margin_mode"] == "isolated"
+            assert state["demo_account"]["risk_state"]["state"]
             json.dumps(state, default=str)
         finally:
             await orchestrator.shutdown()
@@ -336,13 +360,13 @@ class TestDryRunDoesNotStartTheTimer:
 
 class TestResearchModeGating:
     async def test_research_refuses_to_start_unverified(
-        self, monkeypatch, loaded_config, spot_instrument
+        self, monkeypatch, loaded_config, perp_instrument
     ):
         """No credentials ⇒ no experiment, and a clear refusal."""
         from btcbot.app.orchestrator import Orchestrator
         from btcbot.utils.errors import DemoVerificationError
 
-        _patch_client(monkeypatch, spot_instrument)
+        _patch_client(monkeypatch, perp_instrument)
         orchestrator = Orchestrator(loaded_config, None)
         try:
             with pytest.raises(DemoVerificationError) as exc:
@@ -352,12 +376,12 @@ class TestResearchModeGating:
         finally:
             await orchestrator.shutdown()
 
-    async def test_shutdown_is_idempotent(self, monkeypatch, loaded_config, spot_instrument):
+    async def test_shutdown_is_idempotent(self, monkeypatch, loaded_config, perp_instrument):
         from btcbot.app.orchestrator import Orchestrator
 
-        mock = _patch_client(monkeypatch, spot_instrument)
+        mock = _patch_client(monkeypatch, perp_instrument)
         orchestrator = Orchestrator(
-            loaded_config, Credentials(api_key="k" * 20, api_secret="s" * 20)
+            loaded_config, _credentials()
         )
         await orchestrator.bootstrap()
         orchestrator._running = True     # noqa: SLF001

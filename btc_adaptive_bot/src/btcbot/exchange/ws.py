@@ -1,13 +1,24 @@
-"""WebSocket clients: public market data and private account streams.
+"""WebSocket clients: public market data, business (candles), private account.
 
-Both share :class:`_ReconnectingSocket`, which handles the operational realities
-of a 14-day unattended run: heartbeats, exponential backoff with jitter,
-resubscription after reconnect, and per-topic freshness tracking.
+All three connect to the **EEA demo** WS hosts pinned in ``endpoints.py`` —
+unlike REST, OKX separates demo and live by hostname (``wseeapap`` vs
+``wseea``), and the allow-list check is exact-string, never substring.
 
-Public data comes from the mainnet public stream (Bybit documents that the demo
-module has no public stream and that mainnet public data is identical). That
-connection is unauthenticated and read-only. Private order/execution/wallet
-updates come from the demo private stream.
+OKX WS protocol specifics implemented here:
+
+* Subscriptions are argument objects: ``{"op": "subscribe", "args":
+  [{"channel": "tickers", "instId": …}]}``.
+* Candlestick channels (``candle1m`` …) live on the **business** endpoint.
+* Keepalive is application-level: the client sends the literal text ``ping``
+  and the server answers ``pong`` (raw text, not JSON). Protocol-level pings
+  are disabled.
+* The private stream authenticates with an ``op: login`` frame whose
+  signature uses epoch-seconds (see ``signing.sign_ws_login``), then
+  subscribes to ``orders`` / ``account`` / ``positions``.
+
+Shared machinery in :class:`_ReconnectingSocket` handles the operational
+realities of a 14-day unattended run: heartbeats, exponential backoff with
+jitter, resubscription after reconnect, and per-channel freshness tracking.
 """
 
 from __future__ import annotations
@@ -16,7 +27,6 @@ import asyncio
 import contextlib
 import json
 import random
-from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -24,19 +34,32 @@ from typing import Any
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
+from ..utils.errors import MainnetRejectedError
 from ..utils.logging import get_logger
 from ..utils.timeutil import now_ms
-from .endpoints import DEMO_WS_PRIVATE, public_ws_url
-from .signing import sign_ws_auth
+from .endpoints import (
+    DEMO_WS_BUSINESS,
+    DEMO_WS_PRIVATE,
+    DEMO_WS_PUBLIC,
+    candle_channel,
+    from_okx_bar,
+    is_allowed_ws_url,
+)
+from .models import Candle, Ticker
+from .signing import sign_ws_login
 
 log = get_logger(__name__)
 
 MessageHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
+# Send an application-level ping after this much idle time; OKX disconnects
+# clients that stay silent for 30 s.
+PING_IDLE_SECONDS = 20.0
+
 
 @dataclass(slots=True)
 class StreamHealth:
-    """Freshness and integrity bookkeeping for one topic."""
+    """Freshness and integrity bookkeeping for one channel."""
 
     topic: str
     last_updated_ms: int = 0
@@ -55,17 +78,23 @@ class StreamHealth:
 
 
 class _ReconnectingSocket:
-    """A websocket connection that maintains itself."""
+    """A websocket connection that maintains itself (OKX text-ping protocol)."""
 
     def __init__(
         self,
         url: str,
         *,
         name: str,
-        ping_interval: float = 20.0,
+        ping_interval: float = PING_IDLE_SECONDS,
         max_backoff: float = 60.0,
         on_connect: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
+        if not is_allowed_ws_url(url):
+            # Same structural guarantee as the REST client: a socket to a
+            # non-demo host cannot even be constructed.
+            raise MainnetRejectedError(
+                f"refusing to open a websocket to {url!r} — not an EEA demo endpoint"
+            )
         self.url = url
         self.name = name
         self._ping_interval = ping_interval
@@ -73,9 +102,11 @@ class _ReconnectingSocket:
         self._on_connect = on_connect
         self._ws: Any = None
         self._task: asyncio.Task[None] | None = None
+        self._ping_task: asyncio.Task[None] | None = None
         self._running = False
         self._connected = asyncio.Event()
         self._handlers: list[MessageHandler] = []
+        self._last_rx_ms = 0
         self.reconnects = 0
         self.last_error: str | None = None
         self.connected_since_ms: int | None = None
@@ -95,11 +126,13 @@ class _ReconnectingSocket:
 
     async def stop(self) -> None:
         self._running = False
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
+        for task in (self._ping_task, self._task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._ping_task = None
+        self._task = None
         if self._ws is not None:
             with contextlib.suppress(Exception):
                 await self._ws.close()
@@ -118,42 +151,66 @@ class _ReconnectingSocket:
             return False
         return True
 
+    async def _ping_loop(self) -> None:
+        """OKX keepalive: literal text ``ping`` when the line has been idle."""
+        while True:
+            await asyncio.sleep(self._ping_interval / 2)
+            if self._ws is None or not self.is_connected:
+                continue
+            idle = (now_ms() - self._last_rx_ms) / 1000.0
+            if idle >= self._ping_interval / 2:
+                with contextlib.suppress(Exception):
+                    await self._ws.send("ping")
+
     async def _run(self) -> None:
         attempt = 0
         while self._running:
             try:
                 async with websockets.connect(
                     self.url,
-                    ping_interval=self._ping_interval,
-                    ping_timeout=self._ping_interval * 2,
+                    ping_interval=None,  # OKX uses text ping/pong, not protocol pings
                     close_timeout=5,
                     max_queue=512,
                 ) as socket:
                     self._ws = socket
                     self._connected.set()
                     self.connected_since_ms = now_ms()
+                    self._last_rx_ms = now_ms()
                     attempt = 0
                     self.last_error = None
                     log.info("DATA", f"{self.name} websocket connected")
 
-                    if self._on_connect is not None:
-                        await self._on_connect()
+                    self._ping_task = asyncio.create_task(
+                        self._ping_loop(), name=f"ws-ping-{self.name}"
+                    )
+                    try:
+                        if self._on_connect is not None:
+                            await self._on_connect()
 
-                    async for raw in socket:
-                        try:
-                            message = json.loads(raw)
-                        except json.JSONDecodeError:
-                            log.debug("DATA", f"{self.name}: dropped non-JSON frame")
-                            continue
-                        for handler in self._handlers:
+                        async for raw in socket:
+                            self._last_rx_ms = now_ms()
+                            if raw == "pong":
+                                continue
                             try:
-                                await handler(message)
-                            except Exception as exc:  # noqa: BLE001 - one bad handler must not kill the feed
-                                log.error(
-                                    "DATA",
-                                    f"{self.name} handler error: {type(exc).__name__}: {exc}",
-                                    exc_info=True,
-                                )
+                                message = json.loads(raw)
+                            except json.JSONDecodeError:
+                                log.debug("DATA", f"{self.name}: dropped non-JSON frame")
+                                continue
+                            for handler in self._handlers:
+                                try:
+                                    await handler(message)
+                                except Exception as exc:  # noqa: BLE001 - one bad handler must not kill the feed
+                                    log.error(
+                                        "DATA",
+                                        f"{self.name} handler error: {type(exc).__name__}: {exc}",
+                                        exc_info=True,
+                                    )
+                    finally:
+                        if self._ping_task is not None:
+                            self._ping_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await self._ping_task
+                            self._ping_task = None
 
             except asyncio.CancelledError:
                 raise
@@ -184,50 +241,75 @@ class _ReconnectingSocket:
             await asyncio.sleep(delay)
 
 
+def _event_of(message: dict[str, Any]) -> str | None:
+    event = message.get("event")
+    return event if isinstance(event, str) else None
+
+
+def _channel_of(message: dict[str, Any]) -> str | None:
+    arg = message.get("arg")
+    if isinstance(arg, dict):
+        channel = arg.get("channel")
+        return channel if isinstance(channel, str) else None
+    return None
+
+
 class PublicMarketStream:
-    """Public kline / ticker / orderbook / trade streams (unauthenticated)."""
+    """Public market data for one instrument.
+
+    Runs **two** demo sockets: the public endpoint (tickers, books, trades,
+    funding rate, mark price, open interest) and the business endpoint, which
+    is where OKX serves candlestick channels.
+    """
 
     def __init__(
         self,
         *,
-        category: str,
-        symbol: str,
+        inst_id: str,
         timeframes: list[str],
         orderbook_depth: int = 50,
-        ping_interval: float = 20.0,
+        ping_interval: float = PING_IDLE_SECONDS,
         max_backoff: float = 60.0,
     ) -> None:
-        self.symbol = symbol
-        self.category = category
+        self.inst_id = inst_id
         self.timeframes = timeframes
         self.orderbook_depth = orderbook_depth
-        self.health: dict[str, StreamHealth] = defaultdict(lambda: StreamHealth(topic="unknown"))
-        self._socket = _ReconnectingSocket(
-            public_ws_url(category),
+        self.health: dict[str, StreamHealth] = {}
+        self._public = _ReconnectingSocket(
+            DEMO_WS_PUBLIC,
             name="public",
             ping_interval=ping_interval,
             max_backoff=max_backoff,
-            on_connect=self._subscribe,
+            on_connect=self._subscribe_public,
         )
-        self._socket.add_handler(self._dispatch)
-        self._kline_handlers: list[Callable[[str, dict[str, Any]], Awaitable[None]]] = []
-        self._ticker_handlers: list[Callable[[dict[str, Any]], Awaitable[None]]] = []
+        self._business = _ReconnectingSocket(
+            DEMO_WS_BUSINESS,
+            name="business",
+            ping_interval=ping_interval,
+            max_backoff=max_backoff,
+            on_connect=self._subscribe_business,
+        )
+        self._public.add_handler(self._dispatch)
+        self._business.add_handler(self._dispatch)
+        self._candle_handlers: list[Callable[[str, Candle], Awaitable[None]]] = []
+        self._ticker_handlers: list[Callable[[Ticker], Awaitable[None]]] = []
         self._orderbook_handlers: list[Callable[[dict[str, Any], str], Awaitable[None]]] = []
         self._trade_handlers: list[Callable[[list[dict[str, Any]]], Awaitable[None]]] = []
-        self._seen_kline_bars: dict[str, int] = {}
+        self._funding_handlers: list[Callable[[dict[str, Any]], Awaitable[None]]] = []
+        self._seen_candle_bars: dict[str, int] = {}
 
     @property
     def is_connected(self) -> bool:
-        return self._socket.is_connected
+        return self._public.is_connected and self._business.is_connected
 
     @property
     def reconnects(self) -> int:
-        return self._socket.reconnects
+        return self._public.reconnects + self._business.reconnects
 
-    def on_kline(self, handler: Callable[[str, dict[str, Any]], Awaitable[None]]) -> None:
-        self._kline_handlers.append(handler)
+    def on_candle(self, handler: Callable[[str, Candle], Awaitable[None]]) -> None:
+        self._candle_handlers.append(handler)
 
-    def on_ticker(self, handler: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+    def on_ticker(self, handler: Callable[[Ticker], Awaitable[None]]) -> None:
         self._ticker_handlers.append(handler)
 
     def on_orderbook(self, handler: Callable[[dict[str, Any], str], Awaitable[None]]) -> None:
@@ -236,105 +318,135 @@ class PublicMarketStream:
     def on_trades(self, handler: Callable[[list[dict[str, Any]]], Awaitable[None]]) -> None:
         self._trade_handlers.append(handler)
 
+    def on_funding(self, handler: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        self._funding_handlers.append(handler)
+
     async def start(self) -> None:
-        await self._socket.start()
+        await self._public.start()
+        await self._business.start()
 
     async def stop(self) -> None:
-        await self._socket.stop()
+        await self._public.stop()
+        await self._business.stop()
 
     async def wait_connected(self, timeout: float = 30.0) -> bool:
-        return await self._socket.wait_connected(timeout)
+        ok_public = await self._public.wait_connected(timeout)
+        ok_business = await self._business.wait_connected(timeout)
+        return ok_public and ok_business
 
-    def topics(self) -> list[str]:
-        topics = [f"kline.{tf}.{self.symbol}" for tf in self.timeframes]
-        topics.append(f"tickers.{self.symbol}")
-        topics.append(f"orderbook.{self.orderbook_depth}.{self.symbol}")
-        topics.append(f"publicTrade.{self.symbol}")
-        return topics
+    def public_channels(self) -> list[dict[str, str]]:
+        return [
+            {"channel": "tickers", "instId": self.inst_id},
+            {"channel": "books", "instId": self.inst_id},
+            {"channel": "trades", "instId": self.inst_id},
+            {"channel": "funding-rate", "instId": self.inst_id},
+            {"channel": "mark-price", "instId": self.inst_id},
+        ]
 
-    async def _subscribe(self) -> None:
+    def business_channels(self) -> list[dict[str, str]]:
+        return [
+            {"channel": candle_channel(tf), "instId": self.inst_id} for tf in self.timeframes
+        ]
+
+    async def _subscribe_public(self) -> None:
         """(Re)subscribe on every connect — including after a reconnect."""
-        topics = self.topics()
-        await self._socket.send({"op": "subscribe", "args": topics})
-        log.info("DATA", f"Subscribed to {len(topics)} public topics for {self.symbol}")
+        args = self.public_channels()
+        await self._public.send({"op": "subscribe", "args": args})
+        log.info("DATA", f"Subscribed to {len(args)} public channels for {self.inst_id}")
+
+    async def _subscribe_business(self) -> None:
+        args = self.business_channels()
+        await self._business.send({"op": "subscribe", "args": args})
+        log.info("DATA", f"Subscribed to {len(args)} candle channels for {self.inst_id}")
 
     async def _dispatch(self, message: dict[str, Any]) -> None:
-        if message.get("op") in {"subscribe", "pong"} or "success" in message:
-            if message.get("success") is False:
-                log.warning("DATA", f"Public subscription rejected: {message.get('ret_msg')}")
+        event = _event_of(message)
+        if event is not None:
+            if event == "error":
+                log.warning(
+                    "DATA",
+                    f"Public subscription error: code={message.get('code')} {message.get('msg')}",
+                )
             return
 
-        topic = message.get("topic")
-        if not isinstance(topic, str):
+        channel = _channel_of(message)
+        if channel is None:
             return
 
-        health = self.health.get(topic)
-        if health is None or health.topic == "unknown":
-            health = StreamHealth(topic=topic)
-            self.health[topic] = health
-        health.last_updated_ms = int(message.get("ts") or now_ms())
+        health = self.health.setdefault(channel, StreamHealth(topic=channel))
+        health.last_updated_ms = now_ms()
         health.message_count += 1
 
-        if topic.startswith("kline."):
-            await self._handle_kline(topic, message, health)
-        elif topic.startswith("tickers."):
-            for handler in self._ticker_handlers:
-                await handler(message.get("data", {}) or {})
-        elif topic.startswith("orderbook."):
-            await self._handle_orderbook(message, health)
-        elif topic.startswith("publicTrade."):
+        data = message.get("data", []) or []
+        if channel.startswith("candle"):
+            await self._handle_candles(channel, data, health)
+        elif channel == "tickers":
+            for item in data:
+                ticker = Ticker.from_response(item, ts_ms=int(item.get("ts") or now_ms()))
+                for handler in self._ticker_handlers:
+                    await handler(ticker)
+        elif channel == "books":
+            await self._handle_orderbook(message, data, health)
+        elif channel == "trades":
             for handler in self._trade_handlers:
-                await handler(message.get("data", []) or [])
+                await handler(data)
+        elif channel in {"funding-rate", "mark-price"}:
+            for item in data:
+                for handler in self._funding_handlers:
+                    await handler({"channel": channel, **item})
 
-    async def _handle_kline(
-        self, topic: str, message: dict[str, Any], health: StreamHealth
+    async def _handle_candles(
+        self, channel: str, data: list[list[str]], health: StreamHealth
     ) -> None:
-        interval = topic.split(".")[1]
-        for item in message.get("data", []) or []:
+        interval = from_okx_bar(channel.removeprefix("candle"))
+        for row in data:
+            candle = Candle.from_okx_row(row, interval)
             # Duplicate detection: the same closed bar can arrive twice across a
-            # reconnect. Only the first confirmation of a bar is forwarded.
-            if item.get("confirm"):
-                key = f"{interval}:{item.get('start')}"
-                previous = self._seen_kline_bars.get(interval)
-                bar_start = int(item.get("start", 0))
-                if previous is not None and bar_start <= previous:
+            # reconnect. Only the first confirmation of a bar advances the cursor.
+            if candle.confirmed:
+                previous = self._seen_candle_bars.get(interval)
+                if previous is not None and candle.open_ms <= previous:
                     health.duplicate_count += 1
                     continue
-                self._seen_kline_bars[interval] = bar_start
+                self._seen_candle_bars[interval] = candle.open_ms
                 if previous is not None:
                     from ..utils.timeutil import interval_ms
 
                     expected = previous + interval_ms(interval)
-                    if bar_start > expected:
+                    if candle.open_ms > expected:
                         health.sequence_gaps += 1
                         log.warning(
                             "DATA",
-                            f"Missing {interval}m candle(s) between {previous} and {bar_start} "
-                            "— will be repaired from REST",
-                            topic=key,
+                            f"Missing {interval} candle(s) between {previous} and "
+                            f"{candle.open_ms} — will be repaired from REST",
+                            channel=channel,
                         )
-            for handler in self._kline_handlers:
-                await handler(interval, item)
+            for handler in self._candle_handlers:
+                await handler(interval, candle)
 
-    async def _handle_orderbook(self, message: dict[str, Any], health: StreamHealth) -> None:
-        data = message.get("data", {}) or {}
-        msg_type = message.get("type", "delta")
-        # Bybit orderbook messages carry `u` (update id) and `seq`; a gap means
-        # our local book may be wrong, so we flag it and wait for a snapshot.
-        sequence = data.get("u")
-        if isinstance(sequence, int):
-            if (
-                health.last_sequence is not None
-                and msg_type == "delta"
-                and sequence != health.last_sequence + 1
-            ):
-                health.sequence_gaps += 1
-            health.last_sequence = sequence
-        for handler in self._orderbook_handlers:
-            await handler(data, msg_type)
+    async def _handle_orderbook(
+        self, message: dict[str, Any], data: list[dict[str, Any]], health: StreamHealth
+    ) -> None:
+        action = message.get("action", "snapshot")
+        for book in data:
+            # OKX books carry seqId/prevSeqId; a mismatch means our local book
+            # may be wrong, so we flag it and wait for the next snapshot.
+            seq = book.get("seqId")
+            prev_seq = book.get("prevSeqId")
+            if isinstance(seq, int):
+                if (
+                    health.last_sequence is not None
+                    and action == "update"
+                    and isinstance(prev_seq, int)
+                    and prev_seq != health.last_sequence
+                ):
+                    health.sequence_gaps += 1
+                health.last_sequence = seq
+            for handler in self._orderbook_handlers:
+                await handler(book, action)
 
     def worst_staleness_seconds(self) -> float:
-        """Age of the least-recently-updated subscribed topic."""
+        """Age of the least-recently-updated subscribed channel."""
         if not self.health:
             return float("inf")
         return max(h.age_seconds() for h in self.health.values())
@@ -352,27 +464,28 @@ class PublicMarketStream:
 
 
 class PrivateAccountStream:
-    """Private order / execution / wallet / position stream on the demo host."""
+    """Private orders / account / positions stream on the EEA demo host."""
 
     def __init__(
         self,
         *,
         api_key: str,
         api_secret: str,
-        ping_interval: float = 20.0,
+        passphrase: str,
+        ping_interval: float = PING_IDLE_SECONDS,
         max_backoff: float = 60.0,
-        include_position: bool = False,
     ) -> None:
         self._api_key = api_key
         self._api_secret = api_secret
-        self._include_position = include_position
+        self._passphrase = passphrase
+        self._logged_in = asyncio.Event()
         self.health: dict[str, StreamHealth] = {}
         self._socket = _ReconnectingSocket(
             DEMO_WS_PRIVATE,
             name="private",
             ping_interval=ping_interval,
             max_backoff=max_backoff,
-            on_connect=self._authenticate_and_subscribe,
+            on_connect=self._login,
         )
         self._socket.add_handler(self._dispatch)
         self._order_handlers: list[Callable[[list[dict[str, Any]]], Awaitable[None]]] = []
@@ -409,46 +522,67 @@ class PrivateAccountStream:
     async def wait_connected(self, timeout: float = 30.0) -> bool:
         return await self._socket.wait_connected(timeout)
 
-    async def _authenticate_and_subscribe(self) -> None:
-        expires = now_ms() + 10_000
-        await self._socket.send(
-            {"op": "auth", "args": sign_ws_auth(self._api_key, self._api_secret, expires)}
+    async def _login(self) -> None:
+        """Authenticate, then subscribe once the login event confirms."""
+        self._logged_in.clear()
+        login_args = sign_ws_login(
+            self._api_key,
+            self._api_secret,
+            self._passphrase,
+            epoch_seconds=now_ms() // 1000,
         )
-        topics = ["order", "execution", "wallet"]
-        if self._include_position:
-            topics.append("position")
-        await self._socket.send({"op": "subscribe", "args": topics})
-        log.info("DATA", f"Private stream subscribed: {', '.join(topics)}")
+        await self._socket.send({"op": "login", "args": [login_args]})
+        # Subscription happens in _dispatch when the login event arrives —
+        # OKX rejects subscriptions sent before login completes.
+
+    async def _subscribe(self) -> None:
+        channels = [
+            {"channel": "orders", "instType": "SWAP"},
+            {"channel": "account"},
+            {"channel": "positions", "instType": "SWAP"},
+        ]
+        await self._socket.send({"op": "subscribe", "args": channels})
+        log.info("DATA", "Private stream subscribed: orders, account, positions")
 
     async def _dispatch(self, message: dict[str, Any]) -> None:
-        op = message.get("op")
-        if op == "auth":
-            if message.get("success"):
+        event = _event_of(message)
+        if event == "login":
+            if str(message.get("code", "")) == "0":
                 log.info("DATA", "Private stream authenticated")
+                self._logged_in.set()
+                await self._subscribe()
             else:
-                log.error("DATA", f"Private stream auth failed: {message.get('ret_msg')}")
+                log.error("DATA", f"Private stream auth failed: {message.get('msg')}")
             return
-        if op in {"subscribe", "pong"}:
+        if event == "error":
+            log.error(
+                "DATA", f"Private stream error: code={message.get('code')} {message.get('msg')}"
+            )
+            return
+        if event is not None:
             return
 
-        topic = message.get("topic")
-        if not isinstance(topic, str):
+        channel = _channel_of(message)
+        if channel is None:
             return
 
-        health = self.health.setdefault(topic, StreamHealth(topic=topic))
-        health.last_updated_ms = int(message.get("creationTime") or now_ms())
+        health = self.health.setdefault(channel, StreamHealth(topic=channel))
+        health.last_updated_ms = now_ms()
         health.message_count += 1
 
         data = message.get("data", []) or []
-        if topic == "order":
+        if channel == "orders":
             for handler in self._order_handlers:
                 await handler(data)
-        elif topic == "execution":
-            for handler in self._execution_handlers:
-                await handler(data)
-        elif topic == "wallet":
+            # OKX delivers fills as fields on the order update; forward the
+            # updates that actually contain a fill as execution events.
+            fills = [item for item in data if float(item.get("fillSz") or 0.0) > 0.0]
+            if fills:
+                for handler in self._execution_handlers:
+                    await handler(fills)
+        elif channel == "account":
             for handler in self._wallet_handlers:
                 await handler(data)
-        elif topic == "position":
+        elif channel == "positions":
             for handler in self._position_handlers:
                 await handler(data)

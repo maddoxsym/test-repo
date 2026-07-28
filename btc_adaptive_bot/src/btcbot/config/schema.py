@@ -25,7 +25,7 @@ class StrictModel(BaseModel):
 
 
 class ExperimentConfig(StrictModel):
-    name: str = "BYBIT_DEMO_RESEARCH"
+    name: str = "OKX_DEMO_RESEARCH"
     research_duration_days: int = Field(14, ge=1, le=365)
     expected_demo_equity: float = Field(10_000.0, gt=0)
     outage_adjustment_policy: Literal["none", "extend_by_outage"] = "none"
@@ -34,11 +34,16 @@ class ExperimentConfig(StrictModel):
 
 
 class MarketConfig(StrictModel):
-    primary_symbol: str = "BTCUSDT"
-    enabled_categories: list[Literal["spot", "linear", "inverse"]] = ["spot"]
-    preferred_category: Literal["spot", "linear", "inverse"] = "spot"
-    quote_currency: str = "USDT"
+    """Which market to research.
+
+    Note what is *absent*: there is no ``instId`` field. The tradable X-Perp
+    is discovered at runtime from the exchange's instrument list (see
+    ``exchange/instruments.py``) — a hardcoded instrument ID would silently
+    break the day OKX renames or re-lists the contract.
+    """
+
     base_currency: str = "BTC"
+    settle_currency_preference: list[str] = ["USDT", "USDC", "USD"]
     timeframes: list[str] = ["1", "3", "5", "15", "30", "60", "240"]
     regime_timeframe: str = "60"
     regime_context_timeframe: str = "240"
@@ -50,25 +55,21 @@ class MarketConfig(StrictModel):
         for item in items:
             if item not in SUPPORTED_INTERVALS:
                 raise ValueError(
-                    f"{item!r} is not a Bybit kline interval; valid: {', '.join(SUPPORTED_INTERVALS)}"
+                    f"{item!r} is not a supported timeframe; valid: {', '.join(SUPPORTED_INTERVALS)}"
                 )
         return value
 
-    @field_validator("primary_symbol")
+    @field_validator("base_currency")
     @classmethod
-    def _uppercase_symbol(cls, value: str) -> str:
-        # Bybit documents symbols as "uppercase only".
+    def _uppercase_ccy(cls, value: str) -> str:
         if value != value.upper():
-            raise ValueError(f"symbol must be uppercase, got {value!r}")
+            raise ValueError(f"currency must be uppercase, got {value!r}")
         return value
 
     @model_validator(mode="after")
-    def _preferred_is_enabled(self) -> MarketConfig:
-        if self.preferred_category not in self.enabled_categories:
-            raise ValueError(
-                f"preferred_category {self.preferred_category!r} is not in enabled_categories "
-                f"{self.enabled_categories}"
-            )
+    def _cross_checks(self) -> MarketConfig:
+        if not self.settle_currency_preference:
+            raise ValueError("settle_currency_preference cannot be empty")
         if self.regime_timeframe not in self.timeframes:
             raise ValueError(
                 f"regime_timeframe {self.regime_timeframe!r} must be one of timeframes {self.timeframes}"
@@ -77,15 +78,14 @@ class MarketConfig(StrictModel):
 
 
 class ExchangeConfig(StrictModel):
-    recv_window_ms: int = Field(5000, ge=1000, le=60_000)
     request_timeout_seconds: float = Field(15.0, gt=0, le=120)
     max_retries: int = Field(4, ge=0, le=10)
     retry_backoff_base_seconds: float = Field(0.75, gt=0, le=10)
     instrument_refresh_minutes: int = Field(60, ge=1, le=1440)
     public_ws_enabled: bool = True
     private_ws_enabled: bool = True
-    orderbook_depth: Literal[1, 50, 200, 500] = 50
-    ws_ping_interval_seconds: float = Field(20.0, gt=0, le=120)
+    orderbook_depth: int = Field(50, ge=1, le=400)
+    ws_ping_interval_seconds: float = Field(20.0, gt=0, le=25)
     ws_reconnect_max_backoff_seconds: float = Field(60.0, gt=0, le=600)
 
 
@@ -108,11 +108,44 @@ class DataConfig(StrictModel):
     def _known(cls, value: list[str]) -> list[str]:
         for item in value:
             if item not in SUPPORTED_INTERVALS:
-                raise ValueError(f"{item!r} is not a Bybit kline interval")
+                raise ValueError(f"{item!r} is not a supported timeframe")
         return value
 
 
+class LeverageConfig(StrictModel):
+    """Bounds for the DYNAMIC_LEVERAGE_ENGINE.
+
+    The engine chooses leverage per entry from confidence, volatility, regime,
+    and drawdown — but always inside these bounds, and the 10x ceiling is a
+    hard schema constraint, not merely a default.
+    """
+
+    min_leverage: float = Field(1.0, ge=1.0, le=10.0)
+    max_leverage: float = Field(10.0, ge=1.0, le=10.0)
+    base_leverage: float = Field(2.0, ge=1.0, le=10.0)
+    high_vol_leverage_cap: float = Field(3.0, ge=1.0, le=10.0)
+    defensive_leverage_cap: float = Field(2.0, ge=1.0, le=10.0)
+    # Liquidation protection: the estimated liquidation distance must be at
+    # least this multiple of the stop distance, or the entry is refused.
+    liq_buffer_stop_ratio: float = Field(3.0, ge=1.5, le=20.0)
+    # Margin protection: initial margin for a position may not exceed this
+    # fraction of the available balance.
+    margin_utilization_cap: float = Field(0.5, gt=0, le=1.0)
+
+    @model_validator(mode="after")
+    def _ordering(self) -> LeverageConfig:
+        if self.min_leverage > self.max_leverage:
+            raise ValueError("min_leverage cannot exceed max_leverage")
+        if not (self.min_leverage <= self.base_leverage <= self.max_leverage):
+            raise ValueError("base_leverage must lie within [min_leverage, max_leverage]")
+        return self
+
+
 class RiskConfig(StrictModel):
+    # Present for transparency; may not be changed — this system never falls
+    # back to cross margin, silently or otherwise.
+    margin_mode: Literal["isolated"] = "isolated"
+    leverage: LeverageConfig = LeverageConfig()
     normal_risk_pct: float = Field(0.0075, gt=0, le=0.05)
     min_risk_pct: float = Field(0.005, gt=0, le=0.05)
     max_risk_pct: float = Field(0.02, gt=0, le=0.05)
@@ -312,6 +345,13 @@ class ChampionConfig(StrictModel):
 class SafetyConfig(StrictModel):
     mainnet_negative_control: bool = True
     reverify_interval_minutes: int = Field(60, ge=1, le=1440)
+    # Clock drift: OKX rejects requests whose timestamp strays too far from
+    # server time. Beyond this measured drift, authenticated trading pauses.
+    max_clock_drift_ms: int = Field(5000, ge=500, le=30_000)
+    clock_resync_interval_minutes: int = Field(10, ge=1, le=1440)
+    # Liquidation-risk breaker: flatten and pause when a live position's
+    # margin ratio falls to this multiple of the exchange's maintenance level.
+    liquidation_margin_ratio_floor: float = Field(3.0, ge=1.1, le=100.0)
     max_consecutive_api_errors: int = Field(12, ge=1, le=1000)
     max_orders_per_minute: int = Field(6, ge=1, le=120)
     price_sanity_min: float = Field(1000.0, gt=0)

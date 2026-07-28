@@ -1,5 +1,5 @@
 # ============================================================
-#  Champion profile — post-Day-14 operation on the SAME Bybit Demo account.
+#  Champion profile — post-Day-14 operation on the SAME OKX Demo account.
 #  The selected champion controls actual demo execution; challengers keep
 #  running in shadow mode and can earn promotion on evidence.
 #  Used by ./scripts/run_champion.sh
@@ -7,7 +7,7 @@
 extends: default.yaml
 
 experiment:
-  name: BYBIT_DEMO_CHAMPION
+  name: OKX_DEMO_CHAMPION
   # Champion mode is open-ended; the 14-day countdown belongs to the research
   # experiment and is not restarted here.
   research_duration_days: 14

@@ -93,27 +93,35 @@ def config() -> AppConfig:
 
 @pytest.fixture
 def store(config) -> MarketDataStore:
+    from btcbot.exchange.models import Ticker
+
     market = MarketDataStore(
-        "BTCUSDT", list(TIMEFRAMES), candle_buffer=config.data.candle_buffer
+        "BTC-USDT-SWAP", list(TIMEFRAMES), candle_buffer=config.data.candle_buffer
     )
     for index, timeframe in enumerate(TIMEFRAMES):
         market.series[timeframe].extend(realistic_series(timeframe, seed=100 + index))
-    market.update_ticker_from_ws(
-        {
-            "symbol": "BTCUSDT", "lastPrice": "50000.0", "bid1Price": "49999.5",
-            "ask1Price": "50000.5", "volume24h": "12000", "turnover24h": "600000000",
-            "price24hPcnt": "0.01",
-        }
+    market.update_ticker(
+        Ticker.from_response(
+            {
+                "instId": "BTC-USDT-SWAP", "last": "50000.0", "bidPx": "49999.5",
+                "askPx": "50000.5", "vol24h": "12000", "volCcy24h": "600000000",
+                "open24h": "49500.0", "ts": str(now_ms()),
+            },
+            ts_ms=now_ms(),
+        )
     )
     market.update_orderbook(
         {
-            "b": [[str(49_999.5 - i), "1.5"] for i in range(20)],
-            "a": [[str(50_000.5 + i), "1.2"] for i in range(20)],
+            "bids": [[str(49_999.5 - i), "1.5", "0", "3"] for i in range(20)],
+            "asks": [[str(50_000.5 + i), "1.2", "0", "2"] for i in range(20)],
         },
         "snapshot",
     )
     market.update_trades(
-        [{"T": now_ms() - i * 100, "S": "Buy" if i % 3 else "Sell", "v": "0.3"} for i in range(60)]
+        [
+            {"ts": now_ms() - i * 100, "side": "buy" if i % 3 else "sell", "sz": "0.3"}
+            for i in range(60)
+        ]
     )
     return market
 
@@ -422,7 +430,8 @@ class TestFinalReportRendering:
             starting_demo_equity=10_000.0,
             enabled_strategies=["s1", "s2"],
             strategy_versions={"s1": "1.0", "s2": "1.0"},
-            demo_category="spot",
+            demo_category="SWAP",
+            primary_symbol="BTC-USDT-SWAP",
         )
 
         def evidence(strategy_id: str, r: float, trades: int) -> StrategyEvidence:

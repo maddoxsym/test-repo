@@ -460,16 +460,25 @@ class DemoOrderRepository(BaseRepository):
                     strategy_id, strategy_version, signal_ts_utc, submitted_ts_utc, symbol,
                     category, side, order_type, intent, quantity, quantity_str, price,
                     estimated_notional, stop_price, target_price, estimated_risk_pct, regime,
-                    confidence, status, sizing_reasoning, created_at, updated_at
+                    confidence, status, sizing_reasoning, pos_side, td_mode, leverage,
+                    contracts, created_at, updated_at
                 ) VALUES (
                     :client_order_id, NULL, :experiment_id, :signal_id, :setup_id,
                     :strategy_id, :strategy_version, :signal_ts_utc, :submitted_ts_utc, :symbol,
                     :category, :side, :order_type, :intent, :quantity, :quantity_str, :price,
                     :estimated_notional, :stop_price, :target_price, :estimated_risk_pct, :regime,
-                    :confidence, 'submitted', :sizing_reasoning, :now, :now
+                    :confidence, 'submitted', :sizing_reasoning, :pos_side, :td_mode, :leverage,
+                    :contracts, :now, :now
                 )
                 """,
-                {**order, "now": iso(now_utc())},
+                {
+                    "pos_side": None,
+                    "td_mode": None,
+                    "leverage": None,
+                    "contracts": None,
+                    **order,
+                    "now": iso(now_utc()),
+                },
             )
             return True
         except DatabaseError as exc:
@@ -582,15 +591,32 @@ class PositionRepository(BaseRepository):
                 position_id, experiment_id, strategy_id, strategy_version, setup_id, signal_id,
                 symbol, category, direction, reason, opened_ts_utc, entry_price, quantity,
                 remaining_qty, stop_price, target_price, planned_exit, entry_order_id, fees,
-                entry_regime, news_state, confidence, is_open, created_at, updated_at
+                entry_regime, news_state, confidence, leverage, margin_mode, contracts,
+                liq_price_at_entry, is_open, created_at, updated_at
             ) VALUES (
                 :position_id, :experiment_id, :strategy_id, :strategy_version, :setup_id,
                 :signal_id, :symbol, :category, :direction, :reason, :opened_ts_utc, :entry_price,
                 :quantity, :remaining_qty, :stop_price, :target_price, :planned_exit,
-                :entry_order_id, :fees, :entry_regime, :news_state, :confidence, 1, :now, :now
+                :entry_order_id, :fees, :entry_regime, :news_state, :confidence, :leverage,
+                :margin_mode, :contracts, :liq_price_at_entry, 1, :now, :now
             )
             """,
-            {**position, "now": iso(now_utc())},
+            {
+                "leverage": 1.0,
+                "margin_mode": "isolated",
+                "contracts": None,
+                "liq_price_at_entry": None,
+                **position,
+                "now": iso(now_utc()),
+            },
+        )
+
+    def add_funding_fee(self, position_id: str, amount: float) -> None:
+        """Accumulate a funding payment onto the position (signed; + = paid)."""
+        self.db.execute(
+            "UPDATE positions SET funding_fees = funding_fees + ?, updated_at = ? "
+            "WHERE position_id = ?",
+            (amount, iso(now_utc()), position_id),
         )
 
     def close(self, position_id: str, closure: dict[str, Any]) -> None:
@@ -1165,6 +1191,153 @@ class SystemRepository(BaseRepository):
         )
 
 
+# ------------------------------------------------------------ okx perp entities
+
+
+class LeverageDecisionRepository(BaseRepository):
+    """Audit trail of every DYNAMIC_LEVERAGE_ENGINE decision."""
+
+    def record(self, decision: dict[str, Any]) -> None:
+        self.db.execute(
+            """
+            INSERT INTO leverage_decisions (
+                experiment_id, ts_utc, setup_id, strategy_id, inst_id, direction, approved,
+                leverage, confidence, volatility_pct, regime, regime_confidence, drawdown_pct,
+                risk_state, stop_distance_pct, est_liq_distance_pct, liq_buffer_ratio,
+                confirmed_by_exchange, reason, reasoning, adjustments
+            ) VALUES (
+                :experiment_id, :ts_utc, :setup_id, :strategy_id, :inst_id, :direction,
+                :approved, :leverage, :confidence, :volatility_pct, :regime,
+                :regime_confidence, :drawdown_pct, :risk_state, :stop_distance_pct,
+                :est_liq_distance_pct, :liq_buffer_ratio, :confirmed_by_exchange,
+                :reason, :reasoning, :adjustments
+            )
+            """,
+            {
+                **decision,
+                "reasoning": _json(decision.get("reasoning")),
+                "adjustments": _json(decision.get("adjustments")),
+            },
+        )
+
+    def mark_confirmed(self, setup_id: str) -> None:
+        self.db.execute(
+            "UPDATE leverage_decisions SET confirmed_by_exchange = 1 WHERE setup_id = ?",
+            (setup_id,),
+        )
+
+    def recent(self, limit: int = 25) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM leverage_decisions ORDER BY id DESC LIMIT ?", (limit,)
+        )
+        return [dict(row) for row in rows]
+
+
+class RejectedSignalRepository(BaseRepository):
+    """Per-layer journal of every signal the decision engine refused."""
+
+    def record(self, rejection: dict[str, Any]) -> None:
+        self.db.execute(
+            """
+            INSERT INTO rejected_signals (
+                experiment_id, ts_utc, signal_id, setup_id, strategy_id, strategy_version,
+                inst_id, direction, layer_index, layer_name, reason, detail, regime, confidence
+            ) VALUES (
+                :experiment_id, :ts_utc, :signal_id, :setup_id, :strategy_id,
+                :strategy_version, :inst_id, :direction, :layer_index, :layer_name,
+                :reason, :detail, :regime, :confidence
+            )
+            """,
+            {
+                "signal_id": None,
+                "setup_id": None,
+                "strategy_version": None,
+                "inst_id": None,
+                "direction": None,
+                "regime": None,
+                "confidence": None,
+                **rejection,
+                "detail": _json(rejection.get("detail")),
+            },
+        )
+
+    def recent(self, limit: int = 50, *, experiment_id: str | None = None) -> list[dict[str, Any]]:
+        if experiment_id:
+            rows = self.db.query(
+                "SELECT * FROM rejected_signals WHERE experiment_id = ? ORDER BY id DESC LIMIT ?",
+                (experiment_id, limit),
+            )
+        else:
+            rows = self.db.query(
+                "SELECT * FROM rejected_signals ORDER BY id DESC LIMIT ?", (limit,)
+            )
+        return [dict(row) for row in rows]
+
+    def counts_by_layer(self, experiment_id: str) -> dict[str, int]:
+        rows = self.db.query(
+            "SELECT layer_name, COUNT(*) AS n FROM rejected_signals "
+            "WHERE experiment_id = ? GROUP BY layer_name",
+            (experiment_id,),
+        )
+        return {row["layer_name"]: int(row["n"]) for row in rows}
+
+
+class FundingRepository(BaseRepository):
+    """Realised funding payments — part of every PnL figure."""
+
+    def record(self, event: dict[str, Any]) -> bool:
+        """Insert one funding bill; returns False when already recorded."""
+        try:
+            self.db.execute(
+                """
+                INSERT INTO funding_events (
+                    bill_id, experiment_id, ts_utc, inst_id, amount, currency,
+                    funding_rate, position_id, strategy_id, raw
+                ) VALUES (
+                    :bill_id, :experiment_id, :ts_utc, :inst_id, :amount, :currency,
+                    :funding_rate, :position_id, :strategy_id, :raw
+                )
+                """,
+                {
+                    "currency": None,
+                    "funding_rate": None,
+                    "position_id": None,
+                    "strategy_id": None,
+                    **event,
+                    "raw": _json(event.get("raw")),
+                },
+            )
+        except DatabaseError as exc:
+            if "UNIQUE" in str(exc):
+                return False
+            raise
+        return True
+
+    def total_for_position(self, position_id: str) -> float:
+        return float(
+            self.db.scalar(
+                "SELECT COALESCE(SUM(amount), 0) FROM funding_events WHERE position_id = ?",
+                (position_id,),
+                default=0.0,
+            )
+        )
+
+    def total_for_experiment(self, experiment_id: str) -> float:
+        return float(
+            self.db.scalar(
+                "SELECT COALESCE(SUM(amount), 0) FROM funding_events WHERE experiment_id = ?",
+                (experiment_id,),
+                default=0.0,
+            )
+        )
+
+    def recent(self, limit: int = 25) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM funding_events ORDER BY ts_utc DESC LIMIT ?", (limit,)
+        )
+        return [dict(row) for row in rows]
+
+
 class Repositories:
     """Convenience bundle passed around the engine."""
 
@@ -1183,3 +1356,6 @@ class Repositories:
         self.allocator = AllocatorRepository(db)
         self.champion = ChampionRepository(db)
         self.system = SystemRepository(db)
+        self.leverage = LeverageDecisionRepository(db)
+        self.rejected = RejectedSignalRepository(db)
+        self.funding = FundingRepository(db)

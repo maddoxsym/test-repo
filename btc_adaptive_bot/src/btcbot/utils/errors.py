@@ -31,15 +31,16 @@ class SafetyError(BtcBotError):
 
 
 class MainnetRejectedError(SafetyError):
-    """A non-demo host was supplied to an authenticated client.
+    """A non-demo host or live-environment endpoint was supplied to a client.
 
     Raised at construction time, before any network call can happen. This is the
-    structural guarantee that real-money trading is unreachable.
+    structural guarantee that real-money (live-environment) trading is
+    unreachable.
     """
 
 
 class DemoVerificationError(SafetyError):
-    """The Bybit demo environment could not be positively verified."""
+    """The OKX demo environment could not be positively verified."""
 
 
 class SafeModeError(SafetyError):
@@ -58,13 +59,16 @@ class ExchangeError(BtcBotError):
 
 
 class ApiError(ExchangeError):
-    """Bybit returned a non-zero ``retCode``."""
+    """The exchange returned a non-zero error code.
+
+    ``ret_code`` carries OKX's numeric ``code`` (or per-order ``sCode``).
+    """
 
     def __init__(self, ret_code: int, ret_msg: str, endpoint: str = "") -> None:
         self.ret_code = ret_code
         self.ret_msg = ret_msg
         self.endpoint = endpoint
-        super().__init__(f"bybit retCode={ret_code} retMsg={ret_msg!r} endpoint={endpoint}")
+        super().__init__(f"okx code={ret_code} msg={ret_msg!r} endpoint={endpoint}")
 
 
 class RateLimitError(ExchangeError):

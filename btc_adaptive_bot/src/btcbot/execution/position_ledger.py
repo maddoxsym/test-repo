@@ -63,6 +63,10 @@ class LedgerPosition:
     break_even_applied: bool = False
     partial_taken: bool = False
     atr_at_entry: float = 0.0
+    leverage: float = 1.0
+    margin_mode: str = "isolated"
+    contracts: float | None = None
+    liq_price_at_entry: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -138,6 +142,12 @@ class PositionLedger:
                 fees=float(row.get("fees") or 0.0),
                 mfe=float(row.get("mfe") or 0.0),
                 mae=float(row.get("mae") or 0.0),
+                leverage=float(row.get("leverage") or 1.0),
+                margin_mode=row.get("margin_mode") or "isolated",
+                contracts=float(row["contracts"]) if row.get("contracts") else None,
+                liq_price_at_entry=(
+                    float(row["liq_price_at_entry"]) if row.get("liq_price_at_entry") else None
+                ),
             )
             self._open[position.position_id] = position
             restored.append(position)
@@ -160,6 +170,9 @@ class PositionLedger:
         entry_order_id: str,
         news_state: str | None,
         atr: float,
+        leverage: float = 1.0,
+        contracts: float | None = None,
+        liq_price_at_entry: float | None = None,
     ) -> LedgerPosition:
         """Record a newly opened real position."""
         position = LedgerPosition(
@@ -187,6 +200,9 @@ class PositionLedger:
             entry_order_id=entry_order_id,
             exit_policy=signal.exit_policy,
             atr_at_entry=atr,
+            leverage=leverage,
+            contracts=contracts,
+            liq_price_at_entry=liq_price_at_entry,
         )
         self.repo.open(
             {
@@ -212,6 +228,10 @@ class PositionLedger:
                 "entry_regime": position.entry_regime,
                 "news_state": position.news_state,
                 "confidence": position.confidence,
+                "leverage": position.leverage,
+                "margin_mode": position.margin_mode,
+                "contracts": position.contracts,
+                "liq_price_at_entry": position.liq_price_at_entry,
             }
         )
         self._open[position.position_id] = position

@@ -5,10 +5,11 @@ Two distinct jobs live here:
 1. **Deduplication keys** — deterministic hashes that let the system recognise
    "this is the same setup I already acted on" across restarts. These prevent
    duplicate orders after a crash/reconnect.
-2. **Client order IDs** — Bybit's ``orderLinkId`` is capped at **36 characters**
-   (verified in docs/v5/order/create-order.mdx) and must be unique. That is far
-   too small for full attribution, so we pack a short routable prefix into the ID
-   and keep the complete attribution record in SQLite keyed by that ID.
+2. **Client order IDs** — OKX's ``clOrdId`` is capped at **32 characters** of
+   case-sensitive letters and digits only (no dashes or underscores) and must
+   be unique. That is far too small for full attribution, so we pack a short
+   routable prefix into the ID and keep the complete attribution record in
+   SQLite keyed by that ID.
 """
 
 from __future__ import annotations
@@ -17,10 +18,9 @@ import hashlib
 import re
 import uuid
 
-# Bybit: "Combinations of numbers, letters (upper and lower cases), dashes,
-# and underscores are supported", max 36 characters.
-ORDER_LINK_ID_MAX_LEN = 36
-_ORDER_LINK_ID_ALLOWED = re.compile(r"^[A-Za-z0-9_-]{1,36}$")
+# OKX: "A combination of case-sensitive alphanumerics", 1–32 characters.
+ORDER_LINK_ID_MAX_LEN = 32
+_ORDER_LINK_ID_ALLOWED = re.compile(r"^[A-Za-z0-9]{1,32}$")
 
 _ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -102,22 +102,23 @@ def client_order_id(
     setup_id_value: str,
     signal_ts_ms: int,
 ) -> str:
-    """Build a Bybit-legal ``orderLinkId`` (≤36 chars) carrying attribution.
+    """Build an OKX-legal ``clOrdId`` (≤32 chars, alphanumerics only) carrying
+    attribution.
 
-    Layout (exactly 36 chars):
+    Layout (exactly 32 chars, no separators — OKX forbids dashes/underscores):
 
-    ``b`` + exp(4) + ``-`` + strat(6) + ``-`` + ver(2) + ``-`` + setup(6) + ``-`` + ts(6) + rand(7)
+    ``b`` + exp(4) + strat(6) + ver(2) + setup(6) + ts(6) + rand(7)
 
-    Every component is base36 so the result matches Bybit's allowed character
-    set. The ID is *routable* — the setup and strategy slugs let an operator
-    eyeball which strategy owns an order in the Bybit UI — while the exhaustive
+    Every component is base36 so the result matches OKX's allowed character
+    set. The ID is *routable* — the fixed field offsets let an operator match
+    an order in the OKX UI back to its strategy — while the exhaustive
     attribution (full strategy ID, version, setup ID, experiment ID, signal
     timestamp) lives in the ``demo_orders`` table keyed on this value.
 
     Field widths are chosen so uniqueness is not left to chance: epoch seconds
     fit in 6 base-36 chars (36^6 ≈ 2.2e9, good past the year 2038), which leaves
-    7 chars — about 7.8e10 values — for the random block. Bybit requires
-    ``orderLinkId`` to be unique, and a birthday collision across a 14-day run
+    7 chars — about 7.8e10 values — for the random block. OKX requires
+    ``clOrdId`` to be unique, and a birthday collision across a 14-day run
     must be negligible, so the random field is deliberately generous rather than
     merely "probably fine". The duplicate *guard*, not the ID, is what prevents
     unintended repeats; this only prevents accidental ID reuse.
@@ -125,13 +126,9 @@ def client_order_id(
     parts = (
         "b",
         _slug(experiment_id_value, 4),
-        "-",
         _slug(strategy_id, 6),
-        "-",
         _slug(strategy_version, 2),
-        "-",
         _slug(setup_id_value, 6),
-        "-",
         _b36(max(0, signal_ts_ms) // 1000, 6),
         _b36(uuid.uuid4().int % (36**7), 7),
     )
@@ -139,12 +136,12 @@ def client_order_id(
     if len(candidate) > ORDER_LINK_ID_MAX_LEN:  # pragma: no cover - guarded by construction
         candidate = candidate[:ORDER_LINK_ID_MAX_LEN]
     if not _ORDER_LINK_ID_ALLOWED.match(candidate):  # pragma: no cover - defensive
-        raise ValueError(f"generated orderLinkId is not Bybit-legal: {candidate!r}")
+        raise ValueError(f"generated clOrdId is not OKX-legal: {candidate!r}")
     return candidate
 
 
 def is_valid_client_order_id(value: str) -> bool:
-    """Whether ``value`` satisfies Bybit's documented ``orderLinkId`` rules."""
+    """Whether ``value`` satisfies OKX's documented ``clOrdId`` rules."""
     return bool(_ORDER_LINK_ID_ALLOWED.match(value))
 
 

@@ -8,6 +8,7 @@ database must keep opening cleanly across restarts.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..utils.errors import MigrationError
@@ -22,6 +23,17 @@ class Migration:
     version: int
     name: str
     sql: str
+    # Optional Python step, run after ``sql``. Used for operations SQLite
+    # cannot express idempotently in DDL (e.g. ADD COLUMN guarded by a
+    # table_info check).
+    python: Callable[[Database], None] | None = None
+
+
+def _add_column_if_missing(db: Database, table: str, column: str, decl: str) -> None:
+    """Idempotent ADD COLUMN — SQLite has no ``ADD COLUMN IF NOT EXISTS``."""
+    existing = {row["name"] for row in db.query(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 MIGRATIONS: tuple[Migration, ...] = (
@@ -169,9 +181,9 @@ MIGRATIONS: tuple[Migration, ...] = (
         CREATE INDEX IF NOT EXISTS idx_shadow_exit ON shadow_trades(exit_ts_utc);
         CREATE INDEX IF NOT EXISTS idx_shadow_experiment ON shadow_trades(experiment_id);
 
-        -- ============ actual Bybit demo execution (Layer 3) ============
+        -- ============ actual demo execution (Layer 3) ============
         CREATE TABLE IF NOT EXISTS demo_orders (
-            client_order_id  TEXT PRIMARY KEY,                 -- orderLinkId (<=36 chars)
+            client_order_id  TEXT PRIMARY KEY,                 -- exchange client order id
             exchange_order_id TEXT,
             experiment_id    TEXT NOT NULL,
             signal_id        TEXT,
@@ -508,7 +520,99 @@ MIGRATIONS: tuple[Migration, ...] = (
             ON confidence_calibration(strategy_id, ts_utc);
         """,
     ),
+    Migration(
+        version=4,
+        name="okx_perpetual_support",
+        sql="""
+        -- ============ leverage decisions (DYNAMIC_LEVERAGE_ENGINE audit) ============
+        -- One row per leverage decision, approved or not: what was chosen,
+        -- from which inputs, with the projected liquidation buffer.
+        CREATE TABLE IF NOT EXISTS leverage_decisions (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id      TEXT NOT NULL,
+            ts_utc             TEXT NOT NULL,
+            setup_id           TEXT NOT NULL,
+            strategy_id        TEXT NOT NULL,
+            inst_id            TEXT NOT NULL,
+            direction          TEXT NOT NULL,
+            approved           INTEGER NOT NULL,
+            leverage           REAL NOT NULL,
+            confidence         REAL NOT NULL,
+            volatility_pct     REAL,
+            regime             TEXT NOT NULL,
+            regime_confidence  REAL NOT NULL,
+            drawdown_pct       REAL NOT NULL,
+            risk_state         TEXT NOT NULL,
+            stop_distance_pct  REAL NOT NULL,
+            est_liq_distance_pct REAL NOT NULL,
+            liq_buffer_ratio   REAL NOT NULL,
+            confirmed_by_exchange INTEGER NOT NULL DEFAULT 0,
+            reason             TEXT NOT NULL,
+            reasoning          TEXT,                            -- JSON list
+            adjustments        TEXT                             -- JSON object
+        );
+        CREATE INDEX IF NOT EXISTS idx_leverage_setup ON leverage_decisions(setup_id);
+        CREATE INDEX IF NOT EXISTS idx_leverage_strategy
+            ON leverage_decisions(strategy_id, ts_utc);
+
+        -- ============ rejected signals (per-layer decision journal) ============
+        -- Every signal the decision engine refused, with the layer that refused
+        -- it and the full context — so "why didn't it trade?" is answerable.
+        CREATE TABLE IF NOT EXISTS rejected_signals (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id    TEXT NOT NULL,
+            ts_utc           TEXT NOT NULL,
+            signal_id        TEXT,
+            setup_id         TEXT,
+            strategy_id      TEXT NOT NULL,
+            strategy_version TEXT,
+            inst_id          TEXT,
+            direction        TEXT,
+            layer_index      INTEGER NOT NULL,
+            layer_name       TEXT NOT NULL,
+            reason           TEXT NOT NULL,
+            detail           TEXT,                              -- JSON context
+            regime           TEXT,
+            confidence       REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rejected_strategy
+            ON rejected_signals(strategy_id, ts_utc);
+        CREATE INDEX IF NOT EXISTS idx_rejected_layer ON rejected_signals(layer_name);
+
+        -- ============ funding events (perp settlement economics) ============
+        -- Realised funding payments, matched from the account bills. Funding is
+        -- part of every PnL figure and every strategy score.
+        CREATE TABLE IF NOT EXISTS funding_events (
+            bill_id          TEXT PRIMARY KEY,
+            experiment_id    TEXT NOT NULL,
+            ts_utc           TEXT NOT NULL,
+            inst_id          TEXT NOT NULL,
+            amount           REAL NOT NULL,                     -- signed: + received, - paid
+            currency         TEXT,
+            funding_rate     REAL,
+            position_id      TEXT,
+            strategy_id      TEXT,
+            raw              TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_funding_ts ON funding_events(ts_utc);
+        CREATE INDEX IF NOT EXISTS idx_funding_position ON funding_events(position_id);
+        """,
+        python=lambda db: _okx_columns(db),
+    ),
 )
+
+
+def _okx_columns(db: Database) -> None:
+    """Perp-specific columns on the existing order/position tables."""
+    _add_column_if_missing(db, "positions", "leverage", "REAL NOT NULL DEFAULT 1")
+    _add_column_if_missing(db, "positions", "margin_mode", "TEXT NOT NULL DEFAULT 'isolated'")
+    _add_column_if_missing(db, "positions", "contracts", "REAL")
+    _add_column_if_missing(db, "positions", "liq_price_at_entry", "REAL")
+    _add_column_if_missing(db, "positions", "funding_fees", "REAL NOT NULL DEFAULT 0")
+    _add_column_if_missing(db, "demo_orders", "pos_side", "TEXT")
+    _add_column_if_missing(db, "demo_orders", "td_mode", "TEXT")
+    _add_column_if_missing(db, "demo_orders", "leverage", "REAL")
+    _add_column_if_missing(db, "demo_orders", "contracts", "REAL")
 
 
 def _applied_versions(db: Database) -> set[int]:
@@ -542,6 +646,8 @@ def run_migrations(db: Database) -> int:
         # only written once the script has fully succeeded.
         try:
             db.executescript(migration.sql)
+            if migration.python is not None:
+                migration.python(db)
             db.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
                 (migration.version, migration.name, iso(now_utc())),

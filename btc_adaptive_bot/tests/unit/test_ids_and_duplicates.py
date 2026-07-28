@@ -63,8 +63,8 @@ class TestSetupIds:
 
 
 class TestClientOrderIds:
-    def test_respects_bybit_length_limit(self):
-        """Bybit documents orderLinkId as a maximum of 36 characters."""
+    def test_respects_okx_length_limit(self):
+        """OKX documents clOrdId as a maximum of 32 characters."""
         for index in range(200):
             oid = client_order_id(
                 f"exp_{index}", f"strategy_with_a_long_name_{index}", "1.0",
@@ -73,10 +73,11 @@ class TestClientOrderIds:
             assert len(oid) <= ORDER_LINK_ID_MAX_LEN, f"{oid} is {len(oid)} chars"
 
     def test_only_uses_legal_characters(self):
-        """Numbers, letters, dashes and underscores only."""
+        """Case-sensitive alphanumerics only — OKX forbids dashes/underscores."""
         for index in range(100):
             oid = client_order_id(f"e{index}", f"s{index}", "1.0", f"x{index}", 1_700_000_000_000)
-            assert is_valid_client_order_id(oid), f"{oid} is not Bybit-legal"
+            assert is_valid_client_order_id(oid), f"{oid} is not OKX-legal"
+            assert "-" not in oid and "_" not in oid
 
     def test_ids_are_unique_across_many_calls(self):
         ids = {
@@ -86,7 +87,7 @@ class TestClientOrderIds:
         assert len(ids) == 2_000, "client order IDs collided"
 
     def test_same_strategy_yields_a_stable_routable_slug(self):
-        """An operator should recognise the owning strategy in the Bybit UI."""
+        """An operator should recognise the owning strategy in the OKX UI."""
         first = client_order_id("exp1", "vwap_reversion_5m", "1.0", "setupA", 1_000_000)
         second = client_order_id("exp1", "vwap_reversion_5m", "1.0", "setupB", 1_000_000)
         # exp + strategy slug shared, setup slug differs.
@@ -130,7 +131,7 @@ class TestDuplicateOrderProtection:
 
     def _order(self, setup: str, intent: str = "entry", client_id: str | None = None) -> dict:
         return {
-            "client_order_id": client_id or f"b{setup}{intent}"[:36],
+            "client_order_id": client_id or f"b{setup}{intent}"[:32],
             "experiment_id": "exp_test",
             "signal_id": "sig_test",
             "setup_id": setup,

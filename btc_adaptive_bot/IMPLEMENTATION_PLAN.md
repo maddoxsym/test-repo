@@ -1,6 +1,92 @@
-# Implementation Plan — BTC Adaptive Bot (Bybit Demo Research System)
+# Implementation Plan — BTC Adaptive Bot
 
 Status legend: `[x]` done · `[~]` partial · `[ ]` not started
+
+The plan has two parts: the original **Bybit Demo build** (Phases 1–17, complete — kept
+below as the historical record) and the **OKX Europe Demo migration** (Phases M1–M12),
+which replaces the active exchange integration with OKX EEA Demo / BTC X-Perp while
+preserving every exchange-independent system.
+
+---
+
+# Part II — OKX Europe Demo migration (BTCUSD UM X-Perp)
+
+## Phase M1 — Research current OKX API  `[x]`
+
+- [x] Primary docs site unreachable from this environment (403) — corroborated every fact
+      from `okxapi/python-okx` (official) + `tiagosiebler/okx-api` + web search instead
+- [x] EEA REST host `https://eea.okx.com`; demo enforced by `x-simulated-trading: 1` header
+- [x] EEA demo WS hosts (`wseeapap.okx.com`), EEA **live** WS hosts to reject (`wseea.okx.com`)
+- [x] Signing: base64 HMAC-SHA256 over `ts + METHOD + path + body`, ISO-ms timestamp, passphrase header
+- [x] Endpoint paths for time/instruments/config/balance/positions/leverage/order/fills/funding
+- [x] Candle `confirm` flag (look-ahead guard carries over directly)
+- [x] Write `docs/okx_demo_capabilities.md` (incl. what could **not** be verified and how
+      runtime discovery covers it)
+
+**Key finding driving the design:** OKX demo is *the same host* as live, switched by a
+header — so demo safety moves from "pin a separate host" to "centrally enforce the header
++ pin the EEA host + negative-control probe without the header must fail with 50101".
+The WS side *is* host-separated (`wseeapap` vs `wseea`), one infix apart — exact-host
+allow-list, never substring matching.
+
+## Phase M2 — Exchange layer replacement  `[ ]`
+
+- [ ] `endpoints.py` → OKX EEA hosts; forbidden-host list incl. EEA live WS, global/US hosts
+- [ ] `signing.py` → OKX scheme (base64, ISO ts, passphrase; WS login variant with epoch-seconds ts)
+- [ ] `rest.py` → `OkxDemoClient`: central `x-simulated-trading: 1` injection, envelope
+      (`code`/`sCode` both levels), retry/backoff, clock-drift measurement → trading pause
+- [ ] `demo_guard.py` → 4 signals: host pin, header enforcement, authed demo reachability,
+      live-environment negative control (must fail 50101)
+- [ ] `instruments.py` → SWAP discovery, X-Perp selection (linear/BTC/live), `ctVal`/`ctMult`/
+      `lotSz`/`minSz`/`tickSz`/`lever` spec, contract↔base conversion
+- [ ] `ws.py` → public/private/**business** (candles live on business, `brokerId=9999`)
+- [ ] `models.py` → perp fields: posSide, tdMode, leverage, liqPx, mgnRatio, funding
+- [ ] Remove the Bybit integration (no selectable Bybit path remains)
+- [ ] `clOrdId` ≤ 32 chars → re-pack the client-order-ID layout
+
+## Phase M3 — Derivatives execution  `[ ]`
+
+- [ ] Long AND short routing (net vs long/short mode adaptation; `reduceOnly` correctness)
+- [ ] `DYNAMIC_LEVERAGE_ENGINE` (1x–10x from confidence/vol/regime/drawdown; journaled)
+- [ ] Set-and-confirm leverage before every entry (`set-leverage` → `leverage-info`)
+- [ ] Isolated margin only; no silent cross fallback
+- [ ] Liquidation protection: stop-vs-liqPx clearance check, margin-ratio circuit breaker
+- [ ] Funding/settlement/fee tracking wired into PnL, scores, champion selection
+
+## Phase M4 — Decision engine  `[ ]`
+
+- [ ] Ten-layer decision pipeline with per-layer accept/reject logging
+- [ ] `rejected_signals` + `leverage_decisions` DB entities (new migration)
+- [ ] Risk states NORMAL / REDUCED / DEFENSIVE / PAUSED
+
+## Phase M5 — Research engines updated for perps  `[ ]`
+
+- [ ] Shadow accounts: leverage, margin, funding, liquidation modelling
+- [ ] Backtester/walk-forward: same; deterministic fixture retained and extended
+- [ ] Strategy library expanded toward the enumerated set (38 → 45+)
+
+## Phase M6 — Surfaces  `[ ]`
+
+- [ ] Config/env: `OKX_DEMO_API_KEY/SECRET/PASSPHRASE`, `OKX_DEMO_RESEARCH` mode naming
+- [ ] Dashboard: instrument, position (leverage/liqPx/funding), decision + management panels
+- [ ] Scripts: `verify_okx_demo_connection.sh` (17 checks, no orders),
+      `smoke_test_okx_demo.sh --confirm-demo`; retire Bybit-named scripts
+- [ ] Reports/README/docs wording swept for Bybit references
+
+## Phase M7 — Verification  `[ ]`
+
+- [ ] Full test suite green (all existing + new OKX tests, mocked-client integration)
+- [ ] `ruff` clean; `audit_safety.sh` updated for OKX (header enforcement, host confinement)
+- [ ] Dry run offline; audit for live endpoints / missing demo headers / contract maths
+
+---
+
+# Part I — Bybit Demo build (historical record, complete)
+
+> **Status note (2026-07-28):** the Bybit integration described below has been replaced by
+> the OKX Europe Demo integration (Part II). The exchange-independent systems it built —
+> strategies, backtesting, shadow engine, regime, news, learning, scoring, database,
+> dashboard, reports — carry forward unchanged in architecture.
 
 ---
 
