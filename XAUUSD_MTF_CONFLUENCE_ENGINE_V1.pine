@@ -1,0 +1,1550 @@
+//@version=6
+// =============================================================================
+//  XAUUSD MULTI-TIMEFRAME CONFLUENCE ENGINE V1
+// =============================================================================
+//  Research / decision-support indicator for XAUUSD on a 5-minute execution
+//  chart. It is NOT a trading bot and NOT a one-condition signal generator.
+//  A signal is only produced when a full setup sequence completes AND a
+//  weighted multi-timeframe confluence score clears a configurable threshold.
+//
+//  ARCHITECTURE (top to bottom in this file)
+//    01  Inputs (12 groups)
+//    02  Types (zone objects) + generic helpers
+//    03  Core chart-timeframe calculations (ATR, volatility, momentum)
+//    04  Market-structure engine (shared by every timeframe)
+//    05  Higher-timeframe requests (one request.security per timeframe)
+//    06  Sessions, previous-day levels, session liquidity
+//    07  Liquidity pools + sweep detection
+//    08  Displacement
+//    09  Fair value gaps (creation, mitigation, lifecycle)
+//    10  Order blocks / supply-demand (creation, invalidation, lifecycle)
+//    11  Premium / equilibrium / discount
+//    12  Room to target + opposing-structure scan
+//    13  Market regime classification
+//    14  Setup families 1-4
+//    15  Confluence score
+//    16  Trade plan (entry, structural stop, structural targets, R:R)
+//    17  Verdict engine (BUY / SELL / WAIT / NO TRADE + reason)
+//    18  Trade management state machine
+//    19  Visuals
+//    20  Dashboard
+//    21  Alerts
+//
+//  NON-REPAINTING MODEL
+//    * Every request.security() call uses barmerge.lookahead_off.
+//    * Higher-timeframe values are taken from the PREVIOUS closed HTF bar,
+//      so an HTF value can never change once the chart bar has closed.
+//      ("Use live (unconfirmed) HTF candles" can override this - it is OFF by
+//      default and is clearly a repainting mode.)
+//    * Swing points are pivot-confirmed: a swing high needs `swingLen` bars to
+//      its right before it exists, so it can never be re-drawn later.
+//    * With "Confirmed-candle signals only" ON (default) every state change,
+//      signal, zone and management update happens on barstate.isconfirmed,
+//      i.e. at M5 candle close.
+//    * Historical signals are never moved, re-coloured or deleted based on
+//      outcome. The only deletion is a FIFO display cap (configurable) that
+//      exists purely to respect TradingView's 500-object limits.
+//
+//  UNAVOIDABLE TRADINGVIEW LIMITATIONS (see README section in the answer)
+//    * There is no bid/ask or real spread in Pine - spread and slippage are
+//      user-supplied estimates.
+//    * Using the previous closed HTF bar costs up to one HTF bar of latency.
+//      That is the price of never repainting; it is deliberate.
+//    * While the current M5 candle is still open the dashboard, WAIT/NO TRADE
+//      text, zone edges and the trailing-stop suggestion update live. They
+//      settle at candle close. Confirmed BUY/SELL labels do not.
+//    * Intrabar order of stop vs target cannot be known from M5 candles, so
+//      management flags use candle closes / candle extremes only.
+//
+//  NO PROFITABILITY IS CLAIMED OR IMPLIED. Test it yourself before relying on
+//  it for anything.
+// =============================================================================
+
+indicator("XAUUSD MULTI-TIMEFRAME CONFLUENCE ENGINE V1", "XAU MTF CONFLUENCE V1", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
+
+// =============================================================================
+// 01 - INPUTS
+// =============================================================================
+
+// --- 1 - TIMEFRAMES ----------------------------------------------------------
+string G_TF = "1 - Timeframes"
+string tfH1   = input.timeframe("60", "HTF direction 1 (major)",   group = G_TF, tooltip = "Overall directional context. Default H1.")
+string tfM30  = input.timeframe("30", "HTF direction 2 (major)",   group = G_TF, tooltip = "Secondary directional context. Default M30.")
+string tfM15  = input.timeframe("15", "Setup structure timeframe", group = G_TF, tooltip = "Setup structure and directional agreement. Default M15.")
+string tfM1   = input.timeframe("1",  "Refinement timeframe",      group = G_TF, tooltip = "Optional entry refinement only. It can never create a signal on its own.")
+bool   useM1  = input.bool(false, "Require refinement-timeframe agreement", group = G_TF, tooltip = "OFF by default. When ON, M1 structure must agree with the trade direction. M1 is never a standalone signal source.")
+bool   confirmedOnly = input.bool(true,  "Confirmed-candle signals only", group = G_TF, tooltip = "Default ON. All state changes, signals and management updates happen only at M5 candle close.")
+bool   htfLiveMode   = input.bool(false, "Use live (unconfirmed) HTF candles", group = G_TF, tooltip = "OFF = non-repainting (previous closed HTF bar). ON = faster but the HTF read can change while the HTF candle is open. Leave OFF unless you know why you want it.")
+bool   warnTF        = input.bool(true,  "Warn when chart is not M5", group = G_TF)
+
+// --- 2 - MARKET STRUCTURE ----------------------------------------------------
+string G_MS = "2 - Market structure"
+int    atrLenIn     = input.int(14, "ATR length (all timeframes)", minval = 2, maxval = 100, group = G_MS)
+int    swingLen     = input.int(3, "M5 swing sensitivity (pivot bars each side)", minval = 1, maxval = 25, group = G_MS, tooltip = "Higher = fewer, more meaningful swings. 3-5 suits XAUUSD M5.")
+int    swingLenHTF  = input.int(3, "HTF swing sensitivity (pivot bars each side)", minval = 1, maxval = 25, group = G_MS)
+float  structBufAtr = input.float(0.06, "Structure-break buffer (x ATR)", minval = 0.0, maxval = 2.0, step = 0.01, group = G_MS, tooltip = "A close must clear a swing by this much before it counts as a break. Stops tiny candle noise being labelled BOS.")
+int    emaFastLen   = input.int(21, "Fast EMA (pullback location only)", minval = 2, group = G_MS, tooltip = "EMAs are NOT scored as an independent confluence factor. They only help locate a continuation pullback.")
+int    emaSlowLen   = input.int(50, "Slow EMA (pullback location only)", minval = 2, group = G_MS)
+bool   showStructLbl= input.bool(true, "Show BOS / CHoCH / MSS labels", group = G_MS)
+bool   showSwingLbl = input.bool(false, "Show HH / HL / LH / LL labels", group = G_MS)
+int    maxStructLbl = input.int(18, "Max structure labels kept", minval = 2, maxval = 120, group = G_MS)
+
+// --- 3 - LIQUIDITY -----------------------------------------------------------
+string G_LQ = "3 - Liquidity"
+bool   useLiqPD    = input.bool(true, "Track previous-day high / low", group = G_LQ)
+bool   useLiqSess  = input.bool(true, "Track session highs / lows",    group = G_LQ)
+bool   useLiqEq    = input.bool(true, "Track equal highs / lows",      group = G_LQ)
+bool   useLiqSwing = input.bool(true, "Track confirmed swing high / low", group = G_LQ)
+float  eqTolAtr    = input.float(0.10, "Equal high/low tolerance (x ATR)", minval = 0.01, maxval = 1.0, step = 0.01, group = G_LQ)
+int    sweepValid  = input.int(15, "Sweep stays valid for (bars)", minval = 2, maxval = 200, group = G_LQ, tooltip = "How long after a sweep the reversal sequence may still complete.")
+float  sweepPenAtr = input.float(0.04, "Minimum sweep penetration (x ATR)", minval = 0.0, maxval = 2.0, step = 0.01, group = G_LQ)
+bool   sweepReject = input.bool(true, "Sweep must close back inside the level", group = G_LQ, tooltip = "Rejects levels that were simply broken and held.")
+
+// --- 4 - SESSIONS ------------------------------------------------------------
+string G_SE = "4 - Sessions"
+string tzIn      = input.string("UTC", "Session timezone", options = ["UTC", "Exchange", "Europe/London", "Europe/Berlin", "America/New_York", "America/Chicago", "Asia/Tokyo", "Asia/Shanghai", "Asia/Dubai", "Australia/Sydney"], group = G_SE, tooltip = "All session calculations use this timezone. 'Exchange' uses the chart symbol's own timezone.")
+string sessAsia  = input.session("0000-0700", "Asia session",     group = G_SE)
+string sessLon   = input.session("0700-1200", "London session",   group = G_SE)
+string sessNY    = input.session("1200-2100", "New York session", group = G_SE)
+bool   useSessFilter = input.bool(true, "Only signal inside permitted sessions", group = G_SE)
+bool   allowAsia = input.bool(false, "Permit Asia",     group = G_SE, inline = "perm")
+bool   allowLon  = input.bool(true,  "Permit London",   group = G_SE, inline = "perm")
+bool   allowNY   = input.bool(true,  "Permit New York", group = G_SE, inline = "perm")
+bool   allowOff  = input.bool(false, "Permit outside all sessions", group = G_SE)
+
+// --- 5 - FAIR VALUE GAPS -----------------------------------------------------
+string G_FV = "5 - Fair value gaps"
+bool   fvgOn        = input.bool(true, "Enable FVG engine", group = G_FV)
+float  fvgMinPts    = input.float(0.30, "Minimum FVG size (price units)", minval = 0.0, step = 0.05, group = G_FV, tooltip = "XAUUSD price units. 0.30 = 30 cents.")
+float  fvgMinAtr    = input.float(0.15, "Minimum FVG size (x ATR)", minval = 0.0, maxval = 3.0, step = 0.01, group = G_FV)
+bool   fvgNeedDisp  = input.bool(true, "Only keep FVGs created by displacement", group = G_FV)
+bool   fvgKeepPart  = input.bool(true, "Partially mitigated FVGs stay valid", group = G_FV, tooltip = "ON = the gap shrinks as it fills and stays usable until fully filled.")
+int    fvgMaxAge    = input.int(240, "Maximum FVG age (bars)", minval = 10, maxval = 3000, group = G_FV)
+bool   fvgHideInv   = input.bool(true, "Hide invalidated FVGs", group = G_FV)
+int    fvgMaxShown  = input.int(10, "Max FVGs kept", minval = 1, maxval = 60, group = G_FV)
+
+// --- 6 - ORDER BLOCKS --------------------------------------------------------
+string G_OB = "6 - Order blocks"
+bool   obOn        = input.bool(true, "Enable order block / supply-demand engine", group = G_OB)
+bool   obUseWick   = input.bool(true, "Zone uses full candle range (else body only)", group = G_OB)
+bool   obNeedBreak = input.bool(true, "Order block must be tied to a BOS / CHoCH", group = G_OB)
+int    obLookback  = input.int(12, "Search depth for the origin candle (bars)", minval = 1, maxval = 60, group = G_OB)
+int    obMaxAge    = input.int(300, "Maximum order block age (bars)", minval = 10, maxval = 3000, group = G_OB)
+bool   obCloseKill = input.bool(true, "Invalidate on a meaningful close through the zone", group = G_OB)
+float  obKillBuf   = input.float(0.10, "Invalidation buffer (x ATR)", minval = 0.0, maxval = 2.0, step = 0.01, group = G_OB)
+int    obMaxShown  = input.int(8, "Max order blocks kept", minval = 1, maxval = 40, group = G_OB)
+float  zoneNearAtr = input.float(1.00, "Zone counts as 'at price' within (x ATR)", minval = 0.1, maxval = 5.0, step = 0.1, group = G_OB, tooltip = "Applies to both order blocks and FVGs when deciding whether price is at a valid entry area.")
+
+// --- 7 - DISPLACEMENT --------------------------------------------------------
+string G_DP = "7 - Displacement"
+float  dispAtrMult  = input.float(0.90, "Minimum body size (x ATR)", minval = 0.1, maxval = 5.0, step = 0.05, group = G_DP)
+float  dispBodyRat  = input.float(0.55, "Minimum body-to-range ratio", minval = 0.1, maxval = 1.0, step = 0.01, group = G_DP, tooltip = "Stops big-wick candles being treated as displacement.")
+float  dispClosePos = input.float(0.62, "Close must be in this part of the range", minval = 0.5, maxval = 1.0, step = 0.01, group = G_DP, tooltip = "0.62 = bullish displacement must close in the top 38% of its range.")
+bool   dispUseVol   = input.bool(true, "Require relative volume / momentum", group = G_DP)
+float  dispVolMult  = input.float(1.25, "Relative volume multiple", minval = 0.5, maxval = 5.0, step = 0.05, group = G_DP)
+bool   dispNeedStr  = input.bool(false, "Displacement must also break structure", group = G_DP)
+int    dispWindow   = input.int(4, "Displacement stays relevant for (bars)", minval = 1, maxval = 30, group = G_DP)
+
+// --- 8 - CONFLUENCE SCORE ----------------------------------------------------
+string G_CS = "8 - Confluence score"
+float  wH1    = input.float(12, "Weight: HTF1 (H1) direction",      minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wM30   = input.float(10, "Weight: HTF2 (M30) direction",     minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wM15   = input.float(12, "Weight: M15 structure agreement",  minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wSweep = input.float(14, "Weight: important liquidity sweep",minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wShift = input.float(14, "Weight: CHoCH / MSS",              minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wDisp  = input.float(10, "Weight: displacement",             minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wFvg   = input.float(6,  "Weight: valid FVG",                minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wOb    = input.float(6,  "Weight: valid order block / zone", minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wPD    = input.float(5,  "Weight: premium / discount location", minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wSess  = input.float(3,  "Weight: active London / New York", minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wMom   = input.float(3,  "Weight: momentum / volume",        minval = 0, maxval = 40, step = 1, group = G_CS)
+float  wRoom  = input.float(5,  "Weight: sufficient room to target",minval = 0, maxval = 40, step = 1, group = G_CS)
+float  corrDisc = input.float(0.5, "Correlated-factor discount (FVG + OB together)", minval = 0.0, maxval = 1.0, step = 0.05, group = G_CS, tooltip = "When an FVG and an order block both pass (they are usually the same event) the second one is only counted at this fraction.")
+float  minScore = input.float(70, "Minimum score for BUY / SELL", minval = 0, maxval = 100, step = 1, group = G_CS)
+float  aPlusMin = input.float(80, "A+ setup from", minval = 0, maxval = 100, step = 1, group = G_CS)
+float  aMin     = input.float(70, "A setup from",  minval = 0, maxval = 100, step = 1, group = G_CS)
+float  bMin     = input.float(60, "B setup from",  minval = 0, maxval = 100, step = 1, group = G_CS)
+float  waitBand = input.float(12, "Show WAIT when score is within this of the minimum", minval = 0, maxval = 50, step = 1, group = G_CS)
+
+// --- 9 - RISK AND TARGETS ----------------------------------------------------
+string G_RK = "9 - Risk and targets"
+float  slBufAtr   = input.float(0.35, "Stop buffer beyond invalidation (x ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = G_RK)
+float  slMinAtr   = input.float(0.80, "Minimum stop distance (x ATR)", minval = 0.1, maxval = 5.0, step = 0.05, group = G_RK, tooltip = "Stops unrealistically tight XAUUSD M5 stops.")
+float  slMaxAtr   = input.float(4.00, "Maximum stop distance (x ATR)", minval = 0.5, maxval = 15.0, step = 0.25, group = G_RK, tooltip = "Setups needing a wider stop than this are rejected rather than traded small.")
+float  minRR      = input.float(1.80, "Minimum reward-to-risk (to TP2)", minval = 0.2, maxval = 10.0, step = 0.1, group = G_RK)
+float  minRR1     = input.float(1.00, "Minimum reward-to-risk (to TP1)", minval = 0.2, maxval = 10.0, step = 0.1, group = G_RK)
+float  spreadEst  = input.float(0.25, "Estimated spread (price units)", minval = 0.0, maxval = 10.0, step = 0.01, group = G_RK, tooltip = "Pine has no access to live spread on most feeds. Set this from your broker.")
+float  slipEst    = input.float(0.10, "Estimated slippage (price units)", minval = 0.0, maxval = 10.0, step = 0.01, group = G_RK)
+float  maxCostPct = input.float(12.0, "Reject if spread+slippage exceeds this % of risk", minval = 0.5, maxval = 100.0, step = 0.5, group = G_RK)
+string tp1Mode    = input.string("Structure first", "TP1 method", options = ["Structure first", "Fixed R"], group = G_RK)
+float  tp1R       = input.float(1.20, "TP1 fixed R (fallback / Fixed R mode)", minval = 0.2, maxval = 10.0, step = 0.1, group = G_RK)
+float  tp2MinR    = input.float(2.00, "TP2 fallback R when no structure target", minval = 0.5, maxval = 20.0, step = 0.1, group = G_RK)
+bool   runnerOn   = input.bool(true, "Show runner target in strong trends only", group = G_RK)
+float  roomMinAtr = input.float(1.50, "Minimum room to opposing structure (x ATR)", minval = 0.1, maxval = 10.0, step = 0.1, group = G_RK)
+int    maxPlans   = input.int(4, "Max trade plans drawn", minval = 1, maxval = 20, group = G_RK)
+int    planExtend = input.int(30, "Trade plan line length (bars)", minval = 5, maxval = 200, group = G_RK)
+
+// --- 10 - SIGNAL FILTERS -----------------------------------------------------
+string G_SF = "10 - Signal filters"
+bool   famLiqOn  = input.bool(true, "Family 1: liquidity reversal",  group = G_SF)
+bool   famContOn = input.bool(true, "Family 2: trend continuation",  group = G_SF)
+bool   famSessOn = input.bool(true, "Family 3: session liquidity",   group = G_SF)
+bool   famBrkOn  = input.bool(true, "Family 4: breakout and retest", group = G_SF)
+int    cooldown  = input.int(12, "Cooldown between signals (bars)", minval = 0, maxval = 500, group = G_SF)
+bool   requireRetest = input.bool(true, "Require a retest of the entry area", group = G_SF)
+float  maxExtAtr = input.float(2.00, "Reject late entries extended more than (x ATR)", minval = 0.2, maxval = 10.0, step = 0.1, group = G_SF)
+float  volLoMult = input.float(0.55, "Low-volatility cut-off (x average ATR%)", minval = 0.1, maxval = 1.0, step = 0.05, group = G_SF)
+float  volHiMult = input.float(2.20, "High-volatility cut-off (x average ATR%)", minval = 1.0, maxval = 6.0, step = 0.05, group = G_SF)
+int    compLen   = input.int(20, "Compression / range lookback (bars)", minval = 5, maxval = 120, group = G_SF)
+float  compAtrMult = input.float(2.50, "Compression: range must be under (x ATR)", minval = 0.5, maxval = 10.0, step = 0.1, group = G_SF)
+int    brkValid  = input.int(20, "Breakout stays valid for (bars)", minval = 2, maxval = 200, group = G_SF)
+float  brkRetTol = input.float(0.35, "Breakout retest tolerance (x ATR)", minval = 0.05, maxval = 3.0, step = 0.05, group = G_SF)
+int    staleBars = input.int(40, "Setup goes stale after (bars)", minval = 5, maxval = 400, group = G_SF)
+
+// --- 11 - VISUAL SETTINGS ----------------------------------------------------
+string G_VI = "11 - Visual settings"
+bool   showSignals   = input.bool(true,  "Show BUY / SELL labels",      group = G_VI)
+bool   showWaitLbl   = input.bool(false, "Show WAIT labels on chart",   group = G_VI, tooltip = "WAIT is always shown in the dashboard. Chart labels are off by default to keep the chart clean.")
+bool   showNoTrdLbl  = input.bool(false, "Show NO TRADE labels on chart", group = G_VI)
+bool   showFvgBox    = input.bool(true,  "Draw FVG zones",              group = G_VI)
+bool   showObBox     = input.bool(true,  "Draw order block zones",      group = G_VI)
+bool   showSessLines = input.bool(true,  "Draw session high / low lines", group = G_VI)
+bool   showPDLines   = input.bool(true,  "Draw previous-day high / low", group = G_VI)
+bool   showPlan      = input.bool(true,  "Draw entry / stop / TP lines", group = G_VI)
+bool   showTrailPlot = input.bool(true,  "Draw suggested trailing stop", group = G_VI)
+bool   showScoreLbl  = input.bool(true,  "Show score label at entries",  group = G_VI)
+bool   showMgmtLbl   = input.bool(true,  "Show management notes (PARTIAL / BE / EXIT)", group = G_VI)
+bool   showDash      = input.bool(true,  "Show dashboard",              group = G_VI)
+string dashSize      = input.string("Small", "Dashboard text size", options = ["Tiny", "Small", "Normal"], group = G_VI)
+int    maxSigLbl     = input.int(30, "Max signal labels kept", minval = 2, maxval = 200, group = G_VI)
+float  lblOffAtr     = input.float(0.8, "Label offset (x ATR)", minval = 0.0, maxval = 5.0, step = 0.1, group = G_VI)
+color  cBull   = input.color(#00c853, "Buy",       group = G_VI, inline = "c1")
+color  cBear   = input.color(#ff1744, "Sell",      group = G_VI, inline = "c1")
+color  cWait   = input.color(#ffd600, "Wait",      group = G_VI, inline = "c1")
+color  cNone   = input.color(#9e9e9e, "No trade",  group = G_VI, inline = "c1")
+color  cFvgB   = input.color(#26a69a, "FVG bull",  group = G_VI, inline = "c2")
+color  cFvgS   = input.color(#ef5350, "FVG bear",  group = G_VI, inline = "c2")
+color  cObB    = input.color(#1e88e5, "OB bull",   group = G_VI, inline = "c3")
+color  cObS    = input.color(#ab47bc, "OB bear",   group = G_VI, inline = "c3")
+color  cLevel  = input.color(#787b86, "Levels",    group = G_VI, inline = "c3")
+
+// --- 12 - ALERTS -------------------------------------------------------------
+string G_AL = "12 - Alerts"
+bool   alertsOn    = input.bool(true, "Enable dynamic alert() messages", group = G_AL, tooltip = "Create the alert with condition = 'Any alert() function call'.")
+bool   alertEntry  = input.bool(true, "Alert on confirmed BUY / SELL", group = G_AL)
+bool   alertAplus  = input.bool(true, "Alert on A+ setups",            group = G_AL)
+bool   alertTP     = input.bool(true, "Alert on TP1 / TP2 reached",    group = G_AL)
+bool   alertBE     = input.bool(true, "Alert on breakeven justified",  group = G_AL)
+bool   alertTrail  = input.bool(true, "Alert on trailing-stop update", group = G_AL)
+bool   alertExit   = input.bool(true, "Alert on early-exit warning",   group = G_AL)
+bool   alertInval  = input.bool(true, "Alert on setup invalidated",    group = G_AL)
+string alertTag    = input.string("XAU MTF V1", "Alert prefix", group = G_AL)
+
+// =============================================================================
+// 02 - TYPES AND GENERIC HELPERS
+// =============================================================================
+
+// A price zone: fair value gap OR order block / supply-demand.
+type Zone
+    float top      = na
+    float bot      = na
+    int   startBar = na
+    bool  bull     = true
+    bool  isOB     = false
+    bool  touched  = false
+    box   bx       = na
+
+var array<Zone> fvgZones  = array.new<Zone>()
+var array<Zone> obZones   = array.new<Zone>()
+var array<box>  deadBoxes = array.new<box>()
+var array<label> structLbls = array.new<label>()
+var array<label> sigLbls    = array.new<label>()
+var array<line>  planLines   = array.new<line>()
+
+// na-safe min / max: ignores na operands instead of poisoning the result.
+f_min2(float a, float b) =>
+    na(a) ? b : na(b) ? a : math.min(a, b)
+
+f_max2(float a, float b) =>
+    na(a) ? b : na(b) ? a : math.max(a, b)
+
+// Keep `lvl` only if it sits above `px`, then take the closest one so far.
+f_minAbove(float cur, float lvl, float px) =>
+    not na(lvl) and lvl > px ? (na(cur) ? lvl : math.min(cur, lvl)) : cur
+
+// Keep `lvl` only if it sits below `px`, then take the closest one so far.
+f_maxBelow(float cur, float lvl, float px) =>
+    not na(lvl) and lvl < px ? (na(cur) ? lvl : math.max(cur, lvl)) : cur
+
+f_px(float v) =>
+    na(v) ? "n/a" : str.tostring(v, format.mintick)
+
+f_r1(float v) =>
+    na(v) ? "n/a" : str.tostring(v, "#.##")
+
+f_dirTxt(int d) =>
+    d > 0 ? "BULLISH" : d < 0 ? "BEARISH" : "NEUTRAL"
+
+// Retire a drawing box: either delete it or park it in a capped graveyard.
+f_retire(box b, bool hide) =>
+    if not na(b)
+        if hide
+            box.delete(b)
+        else
+            box.set_bgcolor(b, color.new(color.gray, 90))
+            box.set_border_color(b, color.new(color.gray, 60))
+            array.push(deadBoxes, b)
+            if array.size(deadBoxes) > 30
+                box.delete(array.shift(deadBoxes))
+
+// =============================================================================
+// 03 - CORE CHART-TIMEFRAME CALCULATIONS
+// =============================================================================
+
+string tz       = tzIn == "Exchange" ? syminfo.timezone : tzIn
+float  atr      = ta.atr(atrLenIn)
+float  atrPct   = close != 0 ? atr / close * 100.0 : na
+float  atrPctAv = ta.sma(atrPct, 100)
+float  bodyAbs  = math.abs(close - open)
+float  barRange = math.max(high - low, syminfo.mintick)
+float  volAvg   = ta.sma(nz(volume), 20)
+float  rvol     = na(volAvg) or volAvg <= 0 ? 1.0 : nz(volume) / volAvg
+float  rsiV     = ta.rsi(close, 14)
+float  emaFast  = ta.ema(close, emaFastLen)
+float  emaSlow  = ta.ema(close, emaSlowLen)
+int    tfSec    = timeframe.in_seconds(timeframe.period)
+
+// Every piece of state below only advances on a closed candle when
+// "Confirmed-candle signals only" is enabled (the default).
+bool   commit   = confirmedOnly ? barstate.isconfirmed : true
+
+// Kaufman-style directional efficiency: |net move| / total path travelled.
+float  pathSum  = math.sum(math.abs(close - close[1]), compLen)
+float  effRatio = pathSum > 0 ? math.abs(close - close[compLen]) / pathSum : 0.0
+
+// =============================================================================
+// 04 - MARKET-STRUCTURE ENGINE
+// =============================================================================
+// One engine, used four times: once on the chart series and once inside each
+// request.security() context. Every call site keeps its own independent state,
+// so H1 structure is genuine H1 structure - not resampled M5 structure.
+//
+// Returns, in order:
+//   dir      +1 bullish / -1 bearish / 0 undecided
+//   sh, sl   last pivot-confirmed swing high / swing low
+//   bosUp    a break of structure in the direction of dir (continuation)
+//   bosDn
+//   chUp     a change of character against dir (first break the other way)
+//   chDn
+//   protHi   protected high  (the high that must hold for bearish structure)
+//   protLo   protected low   (the low that must hold for bullish structure)
+//   shPrev   previous swing high (for HH / LH classification)
+//   slPrev   previous swing low  (for HL / LL classification)
+//   atrLoc   ATR in that timeframe's own context
+f_struct(int len) =>
+    float atrLoc = ta.atr(atrLenIn)
+    float buf    = structBufAtr * atrLoc
+    var float sh     = na
+    var float sl     = na
+    var float shPrev = na
+    var float slPrev = na
+    var bool  shOpen = false          // swing high not yet taken
+    var bool  slOpen = false          // swing low not yet taken
+    var int   dir    = 0
+    var float protHi = na
+    var float protLo = na
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+    if not na(ph)
+        shPrev := sh
+        sh     := ph
+        shOpen := true
+    if not na(pl)
+        slPrev := sl
+        sl     := pl
+        slOpen := true
+    bool bosUp = false
+    bool bosDn = false
+    bool chUp  = false
+    bool chDn  = false
+    if shOpen and not na(sh) and close > sh + buf
+        shOpen := false
+        if dir < 0
+            chUp := true
+        else
+            bosUp := true
+        protLo := na(sl) ? protLo : sl
+        dir    := 1
+    if slOpen and not na(sl) and close < sl - buf
+        slOpen := false
+        if dir > 0
+            chDn := true
+        else
+            bosDn := true
+        protHi := na(sh) ? protHi : sh
+        dir    := -1
+    [dir, sh, sl, bosUp, bosDn, chUp, chDn, protHi, protLo, shPrev, slPrev, atrLoc]
+
+// Wrapper used inside request.security(). It shifts every value back by one
+// HTF bar so the result can never change once that HTF candle has closed.
+f_htfPack(int len) =>
+    [d, sh, sl, bu, bd, cu, cd, phi, plo, shp, slp, a] = f_struct(len)
+    int   dO   = htfLiveMode ? d   : d[1]
+    float shO  = htfLiveMode ? sh  : sh[1]
+    float slO  = htfLiveMode ? sl  : sl[1]
+    bool  cuO  = htfLiveMode ? cu  : cu[1]
+    bool  cdO  = htfLiveMode ? cd  : cd[1]
+    float phiO = htfLiveMode ? phi : phi[1]
+    float ploO = htfLiveMode ? plo : plo[1]
+    [dO, shO, slO, cuO, cdO, phiO, ploO]
+
+// Slim pack for the optional refinement timeframe - direction and change of
+// character only. Nothing here can ever create a signal on its own.
+f_ltfPack(int len) =>
+    [d, sh, sl, bu, bd, cu, cd, phi, plo, shp, slp, a] = f_struct(len)
+    int  dO  = htfLiveMode ? d  : d[1]
+    bool cuO = htfLiveMode ? cu : cu[1]
+    bool cdO = htfLiveMode ? cd : cd[1]
+    [dO, cuO, cdO]
+
+// --- chart timeframe structure ----------------------------------------------
+[msDir, msSH, msSL, msBosUp, msBosDn, msChUp, msChDn, msProtHi, msProtLo, msSHp, msSLp, msAtr] = f_struct(swingLen)
+
+// Fresh pivot events on the chart series, used for HH / HL / LH / LL labels.
+float chartPH = ta.pivothigh(high, swingLen, swingLen)
+float chartPL = ta.pivotlow(low, swingLen, swingLen)
+bool  newPH   = not na(chartPH)
+bool  newPL   = not na(chartPL)
+bool  isHH    = newPH and not na(msSHp) and chartPH > msSHp
+bool  isLH    = newPH and not na(msSHp) and chartPH <= msSHp
+bool  isHL    = newPL and not na(msSLp) and chartPL > msSLp
+bool  isLL    = newPL and not na(msSLp) and chartPL <= msSLp
+
+// =============================================================================
+// 05 - HIGHER-TIMEFRAME REQUESTS
+// =============================================================================
+// Exactly one request.security() per timeframe. Each returns a full structure
+// pack as a tuple, so no duplicate requests are made anywhere in the script.
+[h1Dir,  h1SH,  h1SL,  h1ChUp,  h1ChDn,  h1ProtHi,  h1ProtLo]  = request.security(syminfo.tickerid, tfH1,  f_htfPack(swingLenHTF), lookahead = barmerge.lookahead_off)
+[m30Dir, m30SH, m30SL, m30ChUp, m30ChDn, m30ProtHi, m30ProtLo] = request.security(syminfo.tickerid, tfM30, f_htfPack(swingLenHTF), lookahead = barmerge.lookahead_off)
+[m15Dir, m15SH, m15SL, m15ChUp, m15ChDn, m15ProtHi, m15ProtLo] = request.security(syminfo.tickerid, tfM15, f_htfPack(swingLenHTF), lookahead = barmerge.lookahead_off)
+[m1Dir,  m1ChUp, m1ChDn] = request.security(syminfo.tickerid, tfM1, f_ltfPack(swingLenHTF), lookahead = barmerge.lookahead_off)
+
+// Previous-day high / low, taken from the completed daily candle.
+[pdhRaw, pdlRaw] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_off)
+float pdh = useLiqPD ? pdhRaw : na
+float pdl = useLiqPD ? pdlRaw : na
+
+// Optional refinement only. M1 can never create a signal on its own - it is
+// used purely as an extra agreement filter when the user switches it on.
+bool m1AgreeLong  = not useM1 or (m1Dir >= 0 and not m1ChDn)
+bool m1AgreeShort = not useM1 or (m1Dir <= 0 and not m1ChUp)
+
+// An H1 / M30 change of character is a genuine reversal warning for the regime
+// classifier further down.
+bool htfRev = h1ChUp or h1ChDn or m30ChUp or m30ChDn
+
+// =============================================================================
+// 06 - SESSIONS, SESSION LIQUIDITY, PREVIOUS-DAY LEVELS
+// =============================================================================
+// Session high / low tracker. Works in the user-selected timezone, so it is
+// correct for XAUUSD regardless of the broker's chart timezone.
+f_sessHL(string sess) =>
+    bool inS = not na(time(timeframe.period, sess, tz))
+    var float hi     = na
+    var float lo     = na
+    var float prevHi = na
+    var float prevLo = na
+    bool started = inS and not inS[1]
+    if started
+        prevHi := hi
+        prevLo := lo
+        hi     := high
+        lo     := low
+    else if inS
+        hi := na(hi) ? high : math.max(hi, high)
+        lo := na(lo) ? low  : math.min(lo, low)
+    [hi, lo, prevHi, prevLo, inS]
+
+[asiaHiR, asiaLoR, asiaPHi, asiaPLo, inAsia] = f_sessHL(sessAsia)
+[lonHiR,  lonLoR,  lonPHi,  lonPLo,  inLon]  = f_sessHL(sessLon)
+[nyHiR,   nyLoR,   nyPHi,   nyPLo,   inNY]   = f_sessHL(sessNY)
+
+float asiaHi = useLiqSess ? asiaHiR : na
+float asiaLo = useLiqSess ? asiaLoR : na
+float lonHi  = useLiqSess ? lonHiR  : na
+float lonLo  = useLiqSess ? lonLoR  : na
+float nyHi   = useLiqSess ? nyHiR   : na
+float nyLo   = useLiqSess ? nyLoR   : na
+
+bool   inAnySess = inAsia or inLon or inNY
+string sessName  = inNY and inLon ? "London / New York overlap" : inNY ? "New York" : inLon ? "London" : inAsia ? "Asia" : "Outside sessions"
+bool   sessOk    = not useSessFilter or (inAsia and allowAsia) or (inLon and allowLon) or (inNY and allowNY) or (not inAnySess and allowOff)
+bool   killzone  = inLon or inNY
+
+// =============================================================================
+// 07 - LIQUIDITY POOLS AND SWEEP DETECTION
+// =============================================================================
+// Equal highs / lows: two consecutive confirmed swings within tolerance.
+float eqTol = eqTolAtr * atr
+float eqHi  = useLiqEq and not na(msSH) and not na(msSHp) and math.abs(msSH - msSHp) <= eqTol ? math.max(msSH, msSHp) : na
+float eqLo  = useLiqEq and not na(msSL) and not na(msSLp) and math.abs(msSL - msSLp) <= eqTol ? math.min(msSL, msSLp) : na
+
+float swHi = useLiqSwing ? msSH : na
+float swLo = useLiqSwing ? msSL : na
+
+// A sweep = price trades meaningfully through the level and (optionally) closes
+// back on the original side of it. A sweep on its own NEVER produces a signal.
+float sweepPen = sweepPenAtr * atr
+
+f_sweptHigh(float lvl) =>
+    not na(lvl) and high > lvl + sweepPen and (not sweepReject or close < lvl)
+
+f_sweptLow(float lvl) =>
+    not na(lvl) and low < lvl - sweepPen and (not sweepReject or close > lvl)
+
+// Priority order: the most significant pool wins when several are taken at once.
+int    swSide  = 0                 // +1 = buy-side (highs) taken, -1 = sell-side
+float  swLvl   = na
+string swName  = ""
+bool   swIsSes = false
+
+if f_sweptHigh(pdh)
+    swSide := 1
+    swLvl  := pdh
+    swName := "Previous-day high"
+    swIsSes := true
+else if f_sweptLow(pdl)
+    swSide := -1
+    swLvl  := pdl
+    swName := "Previous-day low"
+    swIsSes := true
+else if f_sweptHigh(asiaHi) and not inAsia
+    swSide := 1
+    swLvl  := asiaHi
+    swName := "Asia high"
+    swIsSes := true
+else if f_sweptLow(asiaLo) and not inAsia
+    swSide := -1
+    swLvl  := asiaLo
+    swName := "Asia low"
+    swIsSes := true
+else if f_sweptHigh(lonHi) and not inLon
+    swSide := 1
+    swLvl  := lonHi
+    swName := "London high"
+    swIsSes := true
+else if f_sweptLow(lonLo) and not inLon
+    swSide := -1
+    swLvl  := lonLo
+    swName := "London low"
+    swIsSes := true
+else if f_sweptHigh(nyHi) and not inNY
+    swSide := 1
+    swLvl  := nyHi
+    swName := "New York high"
+    swIsSes := true
+else if f_sweptLow(nyLo) and not inNY
+    swSide := -1
+    swLvl  := nyLo
+    swName := "New York low"
+    swIsSes := true
+else if f_sweptHigh(eqHi)
+    swSide := 1
+    swLvl  := eqHi
+    swName := "Equal highs"
+else if f_sweptLow(eqLo)
+    swSide := -1
+    swLvl  := eqLo
+    swName := "Equal lows"
+else if f_sweptHigh(swHi)
+    swSide := 1
+    swLvl  := swHi
+    swName := "Swing high"
+else if f_sweptLow(swLo)
+    swSide := -1
+    swLvl  := swLo
+    swName := "Swing low"
+
+var int    sweepSide  = 0
+var float  sweepLevel = na
+var float  sweepExtr  = na          // the wick extreme - real invalidation point
+var int    sweepBar   = na
+var string sweepName  = ""
+var bool   sweepSess  = false
+
+if commit and swSide != 0
+    if swSide == sweepSide and not na(sweepBar) and bar_index - sweepBar <= sweepValid
+        // same-direction re-sweep: keep the original event, extend the extreme
+        sweepExtr  := swSide > 0 ? math.max(sweepExtr, high) : math.min(sweepExtr, low)
+        sweepLevel := swLvl
+        sweepName  := swName
+        sweepSess  := sweepSess or swIsSes
+    else
+        sweepSide  := swSide
+        sweepLevel := swLvl
+        sweepName  := swName
+        sweepSess  := swIsSes
+        sweepBar   := bar_index
+        sweepExtr  := swSide > 0 ? high : low
+
+bool sweepFresh = sweepSide != 0 and not na(sweepBar) and bar_index - sweepBar <= sweepValid
+bool sweepLong  = sweepFresh and sweepSide < 0      // sell-side taken -> long bias
+bool sweepShort = sweepFresh and sweepSide > 0      // buy-side taken  -> short bias
+bool sweepStale = sweepSide != 0 and not na(sweepBar) and bar_index - sweepBar > staleBars
+
+// =============================================================================
+// 08 - DISPLACEMENT
+// =============================================================================
+// A displacement candle needs size, body dominance, a decisive close and
+// (optionally) participation. A big wick alone is explicitly not displacement.
+bool volOK    = not dispUseVol or rvol >= dispVolMult
+bool bigBody  = bodyAbs >= dispAtrMult * atr and (bodyAbs / barRange) >= dispBodyRat
+bool closeTop = (close - low) / barRange >= dispClosePos
+bool closeBot = (high - close) / barRange >= dispClosePos
+bool dispBullRaw = bigBody and close > open and closeTop and volOK
+bool dispBearRaw = bigBody and close < open and closeBot and volOK
+bool dispBull = dispBullRaw and (not dispNeedStr or msBosUp or msChUp)
+bool dispBear = dispBearRaw and (not dispNeedStr or msBosDn or msChDn)
+
+// "Displacement is still relevant" - within the configured window.
+var int lastDispUpBar = na
+var int lastDispDnBar = na
+if commit and dispBull
+    lastDispUpBar := bar_index
+if commit and dispBear
+    lastDispDnBar := bar_index
+bool dispUpRecent = not na(lastDispUpBar) and bar_index - lastDispUpBar <= dispWindow
+bool dispDnRecent = not na(lastDispDnBar) and bar_index - lastDispDnBar <= dispWindow
+
+// =============================================================================
+// 08b - STRUCTURE SHIFT TRACKING (CHoCH / MSS on M5 and M15)
+// =============================================================================
+// MSS = a change of character that also carries displacement. CHoCH without
+// displacement is a weaker event and is scored/labelled as such.
+bool chochUp = msChUp or m15ChUp
+bool chochDn = msChDn or m15ChDn
+bool mssUp   = chochUp and (dispBull or dispUpRecent)
+bool mssDn   = chochDn and (dispBear or dispDnRecent)
+
+var int    shiftBar  = na
+var int    shiftDir  = 0
+var bool   shiftDisp = false
+var bool   shiftM15  = false
+
+if commit and (chochUp or chochDn)
+    shiftDir  := chochUp and not chochDn ? 1 : chochDn and not chochUp ? -1 : (close > open ? 1 : -1)
+    shiftBar  := bar_index
+    shiftDisp := shiftDir > 0 ? (dispBull or dispUpRecent) : (dispBear or dispDnRecent)
+    shiftM15  := shiftDir > 0 ? m15ChUp : m15ChDn
+
+bool shiftFresh   = shiftDir != 0 and not na(shiftBar) and bar_index - shiftBar <= sweepValid
+bool shiftLong    = shiftFresh and shiftDir > 0
+bool shiftShort   = shiftFresh and shiftDir < 0
+bool shiftAfterSwL = shiftLong  and not na(sweepBar) and shiftBar >= sweepBar and sweepLong
+bool shiftAfterSwS = shiftShort and not na(sweepBar) and shiftBar >= sweepBar and sweepShort
+
+// =============================================================================
+// 08c - COMPRESSION, BREAKOUT AND RETEST STATE
+// =============================================================================
+float rangeHi = ta.highest(high, compLen)
+float rangeLo = ta.lowest(low, compLen)
+bool  compressed = (rangeHi - rangeLo) <= compAtrMult * atr
+
+var float  boxHi     = na
+var float  boxLo     = na
+var bool   compArmed = false
+var int    brkDir    = 0
+var float  brkLevel  = na
+var int    brkBar    = na
+var bool   brkDisp   = false
+var bool   brkRetest = false
+var bool   brkFailed = false
+var int    brkFailBar = na
+
+if commit
+    // Arm a range while price is genuinely compressing. The range is measured
+    // on CLOSED prior bars only - if it included the current bar the breakout
+    // candle would keep re-arming the box and could never break out of it.
+    if compressed and brkDir == 0
+        boxHi     := rangeHi[1]
+        boxLo     := rangeLo[1]
+        compArmed := true
+    // breakout must CLOSE beyond the range, not just wick through it
+    if compArmed and not na(boxHi) and close > boxHi + structBufAtr * atr
+        brkDir    := 1
+        brkLevel  := boxHi
+        brkBar    := bar_index
+        brkDisp   := dispBull or dispUpRecent
+        brkRetest := false
+        brkFailed := false
+        compArmed := false
+    else if compArmed and not na(boxLo) and close < boxLo - structBufAtr * atr
+        brkDir    := -1
+        brkLevel  := boxLo
+        brkBar    := bar_index
+        brkDisp   := dispBear or dispDnRecent
+        brkRetest := false
+        brkFailed := false
+        compArmed := false
+    // retest: price comes back to the broken edge and holds it on a close
+    if brkDir > 0 and not na(brkLevel) and bar_index > brkBar
+        if low <= brkLevel + brkRetTol * atr and close > brkLevel
+            brkRetest := true
+        if close < brkLevel - structBufAtr * atr
+            brkFailed  := true
+            brkFailBar := bar_index
+    if brkDir < 0 and not na(brkLevel) and bar_index > brkBar
+        if high >= brkLevel - brkRetTol * atr and close < brkLevel
+            brkRetest := true
+        if close > brkLevel + structBufAtr * atr
+            brkFailed  := true
+            brkFailBar := bar_index
+    // expire the breakout
+    if brkDir != 0 and not na(brkBar) and bar_index - brkBar > brkValid
+        brkDir    := 0
+        brkLevel  := na
+        brkRetest := false
+        brkFailed := false
+
+bool brkFresh     = brkDir != 0 and not na(brkBar) and bar_index - brkBar <= brkValid
+bool brkFailedNow = brkFailed and not na(brkFailBar) and bar_index - brkFailBar <= brkValid
+
+// =============================================================================
+// 09 - FAIR VALUE GAPS
+// =============================================================================
+// Classic three-candle imbalance. Detected only once the third candle has
+// closed, so an FVG never appears and then vanishes on the same bar.
+float fvgMinSize = math.max(fvgMinPts, fvgMinAtr * atr)
+bool  fvgBullNew = fvgOn and low > high[2] and (low - high[2]) >= fvgMinSize and (not fvgNeedDisp or dispBull[1])
+bool  fvgBearNew = fvgOn and high < low[2] and (low[2] - high) >= fvgMinSize and (not fvgNeedDisp or dispBear[1])
+
+// Lifecycle: mitigation, partial fills, ageing, invalidation.
+f_updFvg() =>
+    if array.size(fvgZones) > 0
+        for i = array.size(fvgZones) - 1 to 0
+            Zone z = array.get(fvgZones, i)
+            bool dead = false
+            if low <= z.top and high >= z.bot
+                z.touched := true
+            if z.bull
+                if low < z.top
+                    if fvgKeepPart
+                        z.top := math.max(low, z.bot)
+                    else
+                        dead := true
+                if close < z.bot
+                    dead := true
+            else
+                if high > z.bot
+                    if fvgKeepPart
+                        z.bot := math.min(high, z.top)
+                    else
+                        dead := true
+                if close > z.top
+                    dead := true
+            if z.top - z.bot <= syminfo.mintick
+                dead := true
+            if bar_index - z.startBar > fvgMaxAge
+                dead := true
+            if dead
+                f_retire(z.bx, fvgHideInv)
+                array.remove(fvgZones, i)
+            else if not na(z.bx)
+                box.set_top(z.bx, z.top)
+                box.set_bottom(z.bx, z.bot)
+                box.set_right(z.bx, bar_index + 2)
+
+f_addFvg(bool bull) =>
+    float t = bull ? low : low[2]
+    float b = bull ? high[2] : high
+    box bx = na
+    if showFvgBox
+        bx := box.new(bar_index - 2, t, bar_index + 2, b, border_color = color.new(bull ? cFvgB : cFvgS, 40), border_width = 1, bgcolor = color.new(bull ? cFvgB : cFvgS, 85))
+    array.push(fvgZones, Zone.new(top = t, bot = b, startBar = bar_index - 1, bull = bull, isOB = false, touched = false, bx = bx))
+    if array.size(fvgZones) > fvgMaxShown
+        Zone old = array.shift(fvgZones)
+        f_retire(old.bx, true)
+
+if commit
+    f_updFvg()
+    if fvgBullNew
+        f_addFvg(true)
+    if fvgBearNew
+        f_addFvg(false)
+
+// =============================================================================
+// 10 - ORDER BLOCKS / SUPPLY AND DEMAND
+// =============================================================================
+// Bullish OB  = last meaningful bearish candle before bullish displacement that
+//               also broke structure.
+// Bearish OB  = last meaningful bullish candle before bearish displacement that
+//               also broke structure.
+bool obBullTrigger = obOn and dispBull and (not obNeedBreak or msBosUp or msChUp)
+bool obBearTrigger = obOn and dispBear and (not obNeedBreak or msBosDn or msChDn)
+
+f_updOb() =>
+    if array.size(obZones) > 0
+        for i = array.size(obZones) - 1 to 0
+            Zone z = array.get(obZones, i)
+            bool dead = false
+            if low <= z.top and high >= z.bot
+                z.touched := true
+            if obCloseKill
+                if z.bull and close < z.bot - obKillBuf * atr
+                    dead := true
+                if not z.bull and close > z.top + obKillBuf * atr
+                    dead := true
+            if bar_index - z.startBar > obMaxAge
+                dead := true
+            if dead
+                f_retire(z.bx, true)
+                array.remove(obZones, i)
+            else if not na(z.bx)
+                box.set_right(z.bx, bar_index + 2)
+
+f_addOb(bool bull) =>
+    int k = -1
+    for i = 1 to obLookback
+        bool isOrigin = bull ? close[i] < open[i] : close[i] > open[i]
+        if isOrigin
+            k := i
+            break
+    if k > 0
+        float t = obUseWick ? high[k] : math.max(open[k], close[k])
+        float b = obUseWick ? low[k]  : math.min(open[k], close[k])
+        if t - b >= syminfo.mintick
+            box bx = na
+            if showObBox
+                bx := box.new(bar_index - k, t, bar_index + 2, b, border_color = color.new(bull ? cObB : cObS, 20), border_width = 2, bgcolor = color.new(bull ? cObB : cObS, 82), border_style = line.style_dashed)
+            array.push(obZones, Zone.new(top = t, bot = b, startBar = bar_index - k, bull = bull, isOB = true, touched = false, bx = bx))
+            if array.size(obZones) > obMaxShown
+                Zone old = array.shift(obZones)
+                f_retire(old.bx, true)
+
+if commit
+    f_updOb()
+    if obBullTrigger
+        f_addOb(true)
+    if obBearTrigger
+        f_addOb(false)
+
+// --- nearest usable zone in a given direction --------------------------------
+// Returns [found, top, bot, touched]
+f_zoneNear(array<Zone> arr, bool bull, float px, float maxDist) =>
+    float bTop  = na
+    float bBot  = na
+    bool  bTou  = false
+    float bestD = na
+    if array.size(arr) > 0
+        for z in arr
+            if z.bull == bull
+                float d    = bull ? math.abs(px - z.top) : math.abs(z.bot - px)
+                bool  near = px <= z.top + maxDist and px >= z.bot - maxDist
+                if near and (na(bestD) or d < bestD)
+                    bestD := d
+                    bTop  := z.top
+                    bBot  := z.bot
+                    bTou  := z.touched
+    [not na(bTop), bTop, bBot, bTou]
+
+float zoneNear = zoneNearAtr * atr
+[obLFound, obLTop, obLBot, obLTou] = f_zoneNear(obZones,  true,  close, zoneNear)
+[obSFound, obSTop, obSBot, obSTou] = f_zoneNear(obZones,  false, close, zoneNear)
+[fvLFound, fvLTop, fvLBot, fvLTou] = f_zoneNear(fvgZones, true,  close, zoneNear)
+[fvSFound, fvSTop, fvSBot, fvSTou] = f_zoneNear(fvgZones, false, close, zoneNear)
+
+// Preferred entry area: order block first (usually the tighter invalidation),
+// fair value gap second.
+float entZoneTopL = obLFound ? obLTop : fvLFound ? fvLTop : na
+float entZoneBotL = obLFound ? obLBot : fvLFound ? fvLBot : na
+bool  entZoneTouL = obLFound ? obLTou : fvLFound ? fvLTou : false
+float entZoneTopS = obSFound ? obSTop : fvSFound ? fvSTop : na
+float entZoneBotS = obSFound ? obSBot : fvSFound ? fvSBot : na
+bool  entZoneTouS = obSFound ? obSTou : fvSFound ? fvSTou : false
+bool  zoneFoundL  = obLFound or fvLFound
+bool  zoneFoundS  = obSFound or fvSFound
+
+// A retest means price has actually traded back into the area and is holding.
+// When no zone exists the fallback reference is the broken level (breakout
+// setups) or the fast EMA (continuation pullbacks) - never "any candle".
+float refRetL = nz(brkDir > 0 ? brkLevel : na, emaFast)
+float refRetS = nz(brkDir < 0 ? brkLevel : na, emaFast)
+bool  retFallL = low <= refRetL + brkRetTol * atr and close > refRetL
+bool  retFallS = high >= refRetS - brkRetTol * atr and close < refRetS
+float lo3      = ta.lowest(low, 3)
+float hi3      = ta.highest(high, 3)
+bool  retestL  = not requireRetest ? true : zoneFoundL ? (entZoneTouL and lo3 <= entZoneTopL + 0.10 * atr and close >= entZoneBotL) : retFallL
+bool  retestS  = not requireRetest ? true : zoneFoundS ? (entZoneTouS and hi3 >= entZoneBotS - 0.10 * atr and close <= entZoneTopS) : retFallS
+
+// =============================================================================
+// 11 - PREMIUM / EQUILIBRIUM / DISCOUNT
+// =============================================================================
+// Dealing range = the latest confirmed, meaningful swing high / swing low pair.
+bool  drValid = not na(msSH) and not na(msSL) and (msSH - msSL) >= atr
+float drHi    = drValid ? msSH : na
+float drLo    = drValid ? msSL : na
+float drEq    = drValid ? (drHi + drLo) / 2.0 : na
+float drPos   = drValid and drHi > drLo ? (close - drLo) / (drHi - drLo) : na
+bool  inDisc  = drValid and drPos < 0.45
+bool  inPrem  = drValid and drPos > 0.55
+string pdTxt  = not drValid ? "No clean range" : inDisc ? "DISCOUNT (" + f_r1(drPos * 100) + "%)" : inPrem ? "PREMIUM (" + f_r1(drPos * 100) + "%)" : "EQUILIBRIUM " + f_px(drEq)
+
+// =============================================================================
+// 12 - ROOM TO TARGET AND OPPOSING STRUCTURE
+// =============================================================================
+// Nearest opposing liquidity / structure above and below the given price.
+f_nearAbove(float px) =>
+    float r = na
+    r := f_minAbove(r, pdh, px)
+    r := f_minAbove(r, asiaHi, px)
+    r := f_minAbove(r, lonHi, px)
+    r := f_minAbove(r, nyHi, px)
+    r := f_minAbove(r, eqHi, px)
+    r := f_minAbove(r, msSH, px)
+    r := f_minAbove(r, m15SH, px)
+    r := f_minAbove(r, m30SH, px)
+    r := f_minAbove(r, h1SH, px)
+    r := f_minAbove(r, m15ProtHi, px)
+    r := f_minAbove(r, m30ProtHi, px)
+    r := f_minAbove(r, h1ProtHi, px)
+    r := f_minAbove(r, asiaPHi, px)
+    r := f_minAbove(r, lonPHi, px)
+    r := f_minAbove(r, nyPHi, px)
+    if array.size(obZones) > 0
+        for zo in obZones
+            if not zo.bull
+                r := f_minAbove(r, zo.bot, px)
+    if array.size(fvgZones) > 0
+        for zf in fvgZones
+            if not zf.bull
+                r := f_minAbove(r, zf.bot, px)
+    r
+
+f_nearBelow(float px) =>
+    float r = na
+    r := f_maxBelow(r, pdl, px)
+    r := f_maxBelow(r, asiaLo, px)
+    r := f_maxBelow(r, lonLo, px)
+    r := f_maxBelow(r, nyLo, px)
+    r := f_maxBelow(r, eqLo, px)
+    r := f_maxBelow(r, msSL, px)
+    r := f_maxBelow(r, m15SL, px)
+    r := f_maxBelow(r, m30SL, px)
+    r := f_maxBelow(r, h1SL, px)
+    r := f_maxBelow(r, m15ProtLo, px)
+    r := f_maxBelow(r, m30ProtLo, px)
+    r := f_maxBelow(r, h1ProtLo, px)
+    r := f_maxBelow(r, asiaPLo, px)
+    r := f_maxBelow(r, lonPLo, px)
+    r := f_maxBelow(r, nyPLo, px)
+    if array.size(obZones) > 0
+        for zo in obZones
+            if zo.bull
+                r := f_maxBelow(r, zo.top, px)
+    if array.size(fvgZones) > 0
+        for zf in fvgZones
+            if zf.bull
+                r := f_maxBelow(r, zf.top, px)
+    r
+
+float nextAbove1 = f_nearAbove(close)
+float nextBelow1 = f_nearBelow(close)
+float nextAbove2 = f_nearAbove(nz(nextAbove1, close) + syminfo.mintick)
+float nextBelow2 = f_nearBelow(nz(nextBelow1, close) - syminfo.mintick)
+
+float roomUp   = na(nextAbove1) ? atr * 10.0 : nextAbove1 - close
+float roomDn   = na(nextBelow1) ? atr * 10.0 : close - nextBelow1
+bool  roomOkL  = roomUp >= roomMinAtr * atr
+bool  roomOkS  = roomDn >= roomMinAtr * atr
+
+// Late-entry guard: how far price has already travelled away from the swing
+// that produced the move.
+float extUp    = close - ta.lowest(low, 10)
+float extDn    = ta.highest(high, 10) - close
+bool  notLateL = extUp <= maxExtAtr * atr
+bool  notLateS = extDn <= maxExtAtr * atr
+
+// =============================================================================
+// 13 - MARKET REGIME
+// =============================================================================
+// Structure + efficiency + volatility, deliberately not a moving-average cross.
+bool   volHigh   = not na(atrPctAv) and atrPct > volHiMult * atrPctAv
+bool   volLow    = not na(atrPctAv) and atrPct < volLoMult * atrPctAv
+bool   trendUp   = msDir > 0 and m15Dir > 0 and (h1Dir > 0 or m30Dir > 0) and effRatio > 0.35
+bool   trendDn   = msDir < 0 and m15Dir < 0 and (h1Dir < 0 or m30Dir < 0) and effRatio > 0.35
+bool   revWarn   = (sweepFresh and shiftFresh and shiftDisp) or htfRev
+string regime    = volHigh ? "HIGH VOLATILITY" : volLow ? "LOW VOLATILITY" : compressed ? "COMPRESSION" : trendUp ? "BULLISH TREND" : trendDn ? "BEARISH TREND" : revWarn ? "POSSIBLE REVERSAL" : "RANGE"
+
+// A strong trend is required before any trailing-stop guidance is shown.
+bool strongTrendUp = h1Dir > 0 and m30Dir > 0 and m15Dir > 0 and msDir > 0 and effRatio > 0.45 and not volLow and dispUpRecent
+bool strongTrendDn = h1Dir < 0 and m30Dir < 0 and m15Dir < 0 and msDir < 0 and effRatio > 0.45 and not volLow and dispDnRecent
+
+// =============================================================================
+// 14 - SETUP FAMILIES
+// =============================================================================
+// Every family is a SEQUENCE, not a single condition. A liquidity sweep on its
+// own can never produce a BUY or a SELL - it can only ever produce WAIT.
+float lo8 = ta.lowest(low, 8)
+float hi8 = ta.highest(high, 8)
+
+// Recent continuation breaks of structure (used by the continuation family and
+// by the CHoCH/MSS score component).
+var int lastBosUpBar = na
+var int lastBosDnBar = na
+if commit and msBosUp
+    lastBosUpBar := bar_index
+if commit and msBosDn
+    lastBosDnBar := bar_index
+bool bosUpRecent = not na(lastBosUpBar) and bar_index - lastBosUpBar <= sweepValid
+bool bosDnRecent = not na(lastBosDnBar) and bar_index - lastBosDnBar <= sweepValid
+
+// --- FAMILY 1: LIQUIDITY REVERSAL -------------------------------------------
+//  1 H1/M30 context is not against the trade
+//  2 price is in a logical premium / discount location (scored, not a hard gate)
+//  3 an important pool of liquidity is swept
+//  4 M15 or M5 produces a genuine CHoCH / MSS AFTER the sweep
+//  5 the shift carries displacement
+//  6 an FVG / order block created by that displacement is preferred
+//  7 price retests the entry area
+//  8 there is room to the next opposing liquidity
+bool htfCtxL = not (h1Dir < 0 and m30Dir < 0)
+bool htfCtxS = not (h1Dir > 0 and m30Dir > 0)
+bool revCoreL = sweepLong and shiftAfterSwL and (shiftDisp or dispUpRecent) and retestL and htfCtxL and roomOkL and notLateL
+bool revCoreS = sweepShort and shiftAfterSwS and (shiftDisp or dispDnRecent) and retestS and htfCtxS and roomOkS and notLateS
+
+bool fam1L = famLiqOn and revCoreL
+bool fam1S = famLiqOn and revCoreS
+
+// --- FAMILY 3: SESSION LIQUIDITY --------------------------------------------
+// Same confirmation stack, but the pool taken must be a session / previous-day
+// pool and the sweep must happen inside London or New York.
+bool fam3L = famSessOn and revCoreL and sweepSess and killzone
+bool fam3S = famSessOn and revCoreS and sweepSess and killzone
+
+// --- FAMILY 2: TREND CONTINUATION -------------------------------------------
+//  1 H1 and/or M30 trend is clear and not conflicted
+//  2 M15 structure agrees
+//  3 price pulls back into a logical area (zone / discount / protected swing /
+//    EMA area supported by structure)
+//  4 M5 BOS or continuation displacement
+//  5 controlled retest
+//  6 room before opposing liquidity, and the entry is not late
+bool htfTrendL = h1Dir >= 0 and m30Dir >= 0 and (h1Dir > 0 or m30Dir > 0)
+bool htfTrendS = h1Dir <= 0 and m30Dir <= 0 and (h1Dir < 0 or m30Dir < 0)
+bool emaAreaL  = m15Dir > 0 and close <= emaFast + 0.6 * atr and close >= emaSlow - 1.2 * atr
+bool emaAreaS  = m15Dir < 0 and close >= emaFast - 0.6 * atr and close <= emaSlow + 1.2 * atr
+bool protPullL = not na(msProtLo) and low <= msProtLo + 1.0 * atr and close > msProtLo
+bool protPullS = not na(msProtHi) and high >= msProtHi - 1.0 * atr and close < msProtHi
+bool pullbackL = zoneFoundL or inDisc or emaAreaL or protPullL
+bool pullbackS = zoneFoundS or inPrem or emaAreaS or protPullS
+bool fam2L = famContOn and htfTrendL and m15Dir > 0 and pullbackL and (bosUpRecent or dispUpRecent) and retestL and notLateL and roomOkL
+bool fam2S = famContOn and htfTrendS and m15Dir < 0 and pullbackS and (bosDnRecent or dispDnRecent) and retestS and notLateS and roomOkS
+
+// --- FAMILY 4: BREAKOUT AND RETEST ------------------------------------------
+//  1 genuine compression / accumulation
+//  2 a CLOSE beyond the range (wick-only breakouts are rejected in section 08c)
+//  3 displacement or momentum on the break
+//  4 a retest that holds
+//  5 HTF not strongly against
+//  6 room to the next major opposing level, entry not late
+//  Breakouts that close back inside the range set brkFailed and are rejected.
+bool fam4L = famBrkOn and brkDir > 0 and brkFresh and brkDisp and brkRetest and not brkFailed and htfCtxL and roomOkL and notLateL
+bool fam4S = famBrkOn and brkDir < 0 and brkFresh and brkDisp and brkRetest and not brkFailed and htfCtxS and roomOkS and notLateS
+
+bool setupL = fam1L or fam2L or fam3L or fam4L
+bool setupS = fam1S or fam2S or fam3S or fam4S
+string famL = fam3L ? "Session liquidity" : fam1L ? "Liquidity reversal" : fam2L ? "Trend continuation" : fam4L ? "Breakout & retest" : "None"
+string famS = fam3S ? "Session liquidity" : fam1S ? "Liquidity reversal" : fam2S ? "Trend continuation" : fam4S ? "Breakout & retest" : "None"
+
+// =============================================================================
+// 15 - CONFLUENCE SCORE
+// =============================================================================
+// Transparent 0-100 score. Correlated factors are deliberately not counted as
+// two independent confirmations (see corrDisc), and EMAs are never scored - they
+// only help locate a pullback inside family 2.
+f_score(bool cH1, bool cM30, bool cM15, bool cSw, bool cSh, bool cDp, bool cFv, bool cOb, bool cPd, bool cSs, bool cMo, bool cRm) =>
+    float tot = wH1 + wM30 + wM15 + wSweep + wShift + wDisp + wFvg + wOb + wPD + wSess + wMom + wRoom
+    float raw = 0.0
+    raw += cH1  ? wH1   : 0.0
+    raw += cM30 ? wM30  : 0.0
+    raw += cM15 ? wM15  : 0.0
+    raw += cSw  ? wSweep : 0.0
+    raw += cSh  ? wShift : 0.0
+    raw += cDp  ? wDisp : 0.0
+    raw += cFv  ? wFvg  : 0.0
+    raw += cOb  ? (cFv ? wOb * corrDisc : wOb) : 0.0
+    raw += cPd  ? wPD   : 0.0
+    raw += cSs  ? wSess : 0.0
+    raw += cMo  ? wMom  : 0.0
+    raw += cRm  ? wRoom : 0.0
+    tot > 0 ? math.min(100.0, raw / tot * 100.0) : 0.0
+
+// Long components
+bool cH1L  = h1Dir > 0
+bool cM30L = m30Dir > 0
+bool cM15L = m15Dir > 0
+bool cSwL  = sweepLong
+bool cShL  = shiftLong or bosUpRecent
+bool cDpL  = dispUpRecent
+bool cFvL  = fvLFound
+bool cZoneL = obLFound
+bool cPdL  = inDisc
+bool cMoL  = rsiV > 50 and (rvol >= dispVolMult or rsiV > rsiV[3])
+bool cRmL  = roomOkL
+// Short components
+bool cH1S  = h1Dir < 0
+bool cM30S = m30Dir < 0
+bool cM15S = m15Dir < 0
+bool cSwS  = sweepShort
+bool cShS  = shiftShort or bosDnRecent
+bool cDpS  = dispDnRecent
+bool cFvS  = fvSFound
+bool cZoneS = obSFound
+bool cPdS  = inPrem
+bool cMoS  = rsiV < 50 and (rvol >= dispVolMult or rsiV < rsiV[3])
+bool cRmS  = roomOkS
+bool cSess = killzone
+
+float scoreL = f_score(cH1L, cM30L, cM15L, cSwL, cShL, cDpL, cFvL, cZoneL, cPdL, cSess, cMoL, cRmL)
+float scoreS = f_score(cH1S, cM30S, cM15S, cSwS, cShS, cDpS, cFvS, cZoneS, cPdS, cSess, cMoS, cRmS)
+
+f_grade(float s) =>
+    s >= aPlusMin ? "A+" : s >= aMin ? "A" : s >= bMin ? "B" : "-"
+
+// =============================================================================
+// 16 - TRADE PLAN (entry, structural stop, structural targets, R:R)
+// =============================================================================
+bool okL = setupL and scoreL >= minScore and m1AgreeLong
+bool okS = setupS and scoreS >= minScore and m1AgreeShort
+int  candDir = okL and (not okS or scoreL >= scoreS) ? 1 : okS ? -1 : 0
+int  planDir = candDir != 0 ? candDir : (scoreL >= scoreS ? 1 : -1)
+bool isL     = planDir > 0
+float planScore = isL ? scoreL : scoreS
+string planFam  = isL ? famL : famS
+
+// Real invalidation: beyond the swept extreme, beyond the entry zone, beyond the
+// protected swing, beyond the recent structural low/high - whichever is furthest.
+float invLong  = f_min2(f_min2(sweepLong ? sweepExtr : na, entZoneBotL), f_min2(msProtLo, lo8))
+float invShort = f_max2(f_max2(sweepShort ? sweepExtr : na, entZoneTopS), f_max2(msProtHi, hi8))
+float invUsed  = isL ? nz(invLong, lo8) : nz(invShort, hi8)
+
+float pEntry  = close
+float rawStop = isL ? invUsed - slBufAtr * atr : invUsed + slBufAtr * atr
+float minStop = isL ? pEntry - slMinAtr * atr : pEntry + slMinAtr * atr
+float pStop   = isL ? math.min(rawStop, minStop) : math.max(rawStop, minStop)
+float risk    = math.max(isL ? pEntry - pStop : pStop - pEntry, syminfo.mintick)
+bool  stopTooWide = risk > slMaxAtr * atr
+
+// Targets come from real structure first, with an R-based fallback so that no
+// signal is forced into a fixed 2.5R box.
+float cost      = spreadEst + slipEst
+float t1Struct  = isL ? nextAbove1 : nextBelow1
+float t2Struct  = isL ? nextAbove2 : nextBelow2
+float t1Fixed   = isL ? pEntry + tp1R * risk : pEntry - tp1R * risk
+bool  t1StructOk = not na(t1Struct) and (isL ? t1Struct - pEntry : pEntry - t1Struct) >= risk
+float pTp1      = tp1Mode == "Fixed R" ? t1Fixed : (t1StructOk ? t1Struct : t1Fixed)
+float t2Fall    = isL ? pEntry + tp2MinR * risk : pEntry - tp2MinR * risk
+bool  t2StructOk = not na(t2Struct) and (isL ? t2Struct > pTp1 + 0.10 * atr : t2Struct < pTp1 - 0.10 * atr)
+float pTp2      = t2StructOk ? t2Struct : t2Fall
+bool  runnerOkL = runnerOn and strongTrendUp
+bool  runnerOkS = runnerOn and strongTrendDn
+float runRef    = isL ? h1SH : h1SL
+float pTp3      = (isL ? runnerOkL : runnerOkS) ? (isL ? f_max2(runRef, pTp2 + risk) : f_min2(runRef, pTp2 - risk)) : na
+
+float rr1 = ((isL ? pTp1 - pEntry : pEntry - pTp1) - cost) / (risk + cost)
+float rr2 = ((isL ? pTp2 - pEntry : pEntry - pTp2) - cost) / (risk + cost)
+
+// =============================================================================
+// 17 - VERDICT ENGINE
+// =============================================================================
+bool volNormal   = na(atrPctAv) or (atrPct >= volLoMult * atrPctAv and atrPct <= volHiMult * atrPctAv)
+bool costOk      = cost <= maxCostPct / 100.0 * risk
+bool rrOk        = rr2 >= minRR and rr1 >= minRR1
+bool stopOk      = not stopTooWide and risk > 0
+bool roomOkDir   = isL ? roomOkL : roomOkS
+bool htfAgainst  = isL ? (h1Dir < 0 and m30Dir < 0) : (h1Dir > 0 and m30Dir > 0)
+bool htfConflict = (h1Dir > 0 and m30Dir < 0) or (h1Dir < 0 and m30Dir > 0)
+bool setupStale  = (sweepStale and not shiftFresh) or (brkDir != 0 and not brkFresh)
+bool tfOk        = tfSec == 300
+
+// Anchor bar of the current setup - used to make sure we never fire twice for
+// the same setup.
+int anchorBar = planFam == "Breakout & retest" ? nz(brkBar, -1) : planFam == "None" ? -1 : nz(sweepBar, nz(shiftBar, -1))
+string setupKey = str.tostring(planDir) + "|" + planFam + "|" + str.tostring(anchorBar)
+
+var string lastKey    = ""
+var int    lastSigBar = na
+bool coolOk   = na(lastSigBar) or (bar_index - lastSigBar) >= cooldown
+bool newSetup = setupKey != lastKey
+bool gatesOk  = candDir != 0 and rrOk and costOk and stopOk and volNormal and sessOk and roomOkDir and not htfAgainst and not setupStale
+bool fire     = gatesOk and coolOk and newSetup and commit
+bool fireBuy  = fire and candDir > 0
+bool fireSell = fire and candDir < 0
+
+// Verdict + the exact reason it was accepted or rejected.
+string verdict = "NO TRADE"
+string reason  = "No qualifying setup sequence"
+float  bestScore = math.max(scoreL, scoreS)
+
+if fire
+    verdict := candDir > 0 ? "BUY" : "SELL"
+    reason  := planFam + " confirmed, score " + f_r1(planScore) + ", R:R " + f_r1(rr2)
+else if not sessOk
+    verdict := "NO TRADE"
+    reason  := "Outside permitted trading sessions (" + sessName + ")"
+else if not volNormal
+    verdict := "NO TRADE"
+    reason  := (atrPct > volHiMult * atrPctAv ? "Volatility abnormally high " : "Volatility abnormally low ") + "(ATR " + f_r1(atrPct) + "% vs avg " + f_r1(atrPctAv) + "%)"
+else if brkFailedNow
+    verdict := "NO TRADE"
+    reason  := "Breakout failed and closed back inside its range"
+else if setupStale
+    verdict := "NO TRADE"
+    reason  := "Setup is stale - liquidity event too old with no follow-through"
+else if htfConflict and candDir == 0 and bestScore < minScore
+    verdict := "NO TRADE"
+    reason  := "H1 and M30 strongly conflict"
+else if candDir != 0 and not stopOk
+    verdict := "NO TRADE"
+    reason  := "Structural stop is wider than the maximum allowed (" + f_r1(risk / atr) + " x ATR)"
+else if candDir != 0 and not rrOk
+    verdict := "NO TRADE"
+    reason  := "Reward-to-risk too low after spread/slippage (TP1 " + f_r1(rr1) + "R, TP2 " + f_r1(rr2) + "R)"
+else if candDir != 0 and not costOk
+    verdict := "NO TRADE"
+    reason  := "Estimated spread + slippage is " + f_r1(cost / risk * 100) + "% of risk"
+else if candDir != 0 and not roomOkDir
+    verdict := "NO TRADE"
+    reason  := "Price is entering directly into opposing structure"
+else if candDir != 0 and not coolOk
+    verdict := "WAIT"
+    reason  := "Cooldown active (" + str.tostring(cooldown - (bar_index - lastSigBar)) + " bars left)"
+else if candDir != 0 and not newSetup
+    verdict := "WAIT"
+    reason  := "Same setup already signalled - waiting for a genuinely new one"
+else if candDir != 0 and not commit
+    verdict := "WAIT"
+    reason  := "Setup complete - waiting for the M5 candle to close"
+else if (sweepLong or sweepShort) and not shiftFresh
+    verdict := "WAIT"
+    reason  := sweepName + " swept - waiting for CHoCH / MSS"
+else if shiftFresh and not (shiftDisp or dispUpRecent or dispDnRecent)
+    verdict := "WAIT"
+    reason  := "Structure shifted without displacement"
+else if (isL ? zoneFoundL and not entZoneTouL : zoneFoundS and not entZoneTouS)
+    verdict := "WAIT"
+    reason  := "Waiting for a retest of the " + (isL ? "demand" : "supply") + " area"
+else if bestScore >= minScore - waitBand and bestScore < minScore
+    verdict := "WAIT"
+    reason  := "Score " + f_r1(bestScore) + " is below the " + f_r1(minScore) + " threshold"
+else if (isL ? setupL : setupS) and bestScore < minScore
+    verdict := "WAIT"
+    reason  := "Sequence present but confluence is too thin (" + f_r1(bestScore) + ")"
+
+// =============================================================================
+// 18 - TRADE MANAGEMENT STATE MACHINE
+// =============================================================================
+var int    tDir     = 0     // 0 once the plan is closed out
+var int    tDirLast = 0     // direction of the most recent plan, kept for alerts
+var float  tEntry  = na
+var float  tStop   = na
+var float  tTp1    = na
+var float  tTp2    = na
+var float  tTp3    = na
+var float  tRisk   = na
+var float  tScore  = na
+var string tFam    = ""
+var int    tBar    = na
+var bool   tTp1Hit = false
+var bool   tTp2Hit = false
+var bool   tBeOk   = false
+var bool   tExit   = false
+var float  tTrail  = na
+var string mgmtStage = "FLAT"
+
+bool evTp1   = false
+bool evTp2   = false
+bool evBe    = false
+bool evTrail = false
+bool evExit  = false
+bool evInval = false
+
+if fire
+    tDir     := candDir
+    tDirLast := candDir
+    tEntry  := pEntry
+    tStop   := pStop
+    tTp1    := pTp1
+    tTp2    := pTp2
+    tTp3    := pTp3
+    tRisk   := risk
+    tScore  := planScore
+    tFam    := planFam
+    tBar    := bar_index
+    tTp1Hit := false
+    tTp2Hit := false
+    tBeOk   := false
+    tExit   := false
+    tTrail  := na
+    mgmtStage := "IN TRADE - initial stop"
+    lastKey    := setupKey
+    lastSigBar := bar_index
+
+// Management only ever advances on a closed candle, and the suggested trailing
+// stop can only ever tighten.
+if commit and tDir != 0 and not fire
+    bool longT = tDir > 0
+    if (longT ? low <= tStop : high >= tStop)
+        mgmtStage := tTp1Hit ? "CLOSED - stop after TP1" : "CLOSED - stopped out"
+        evInval := true
+        tDir := 0
+    else
+        if (longT ? high >= tTp1 : low <= tTp1) and not tTp1Hit
+            tTp1Hit := true
+            evTp1   := true
+            mgmtStage := "PARTIAL - consider 40-50% at TP1, run the rest to structure"
+        if (longT ? high >= tTp2 : low <= tTp2) and not tTp2Hit
+            tTp2Hit := true
+            evTp2   := true
+            mgmtStage := na(tTp3) ? "CLOSED - TP2 reached" : "TP2 reached - runner only"
+            if na(tTp3)
+                tDir := 0
+        // Breakeven is never suggested just because price tagged 1R.
+        if tDir != 0 and tTp1Hit and not tBeOk
+            bool beStruct = longT ? (msBosUp or (not na(msProtLo) and msProtLo > tEntry)) : (msBosDn or (not na(msProtHi) and msProtHi < tEntry))
+            bool beDisp   = longT ? (dispBull and close > tEntry) : (dispBear and close < tEntry)
+            if beStruct or beDisp
+                tBeOk := true
+                evBe  := true
+                mgmtStage := "BREAKEVEN JUSTIFIED - structure has moved in your favour"
+        // Trailing guidance only in a genuinely strong, still-healthy trend.
+        if tDir != 0 and tBeOk and (longT ? strongTrendUp : strongTrendDn)
+            float trailCand = longT ? nz(msProtLo, lo8) - slBufAtr * atr : nz(msProtHi, hi8) + slBufAtr * atr
+            bool  candOk    = longT ? trailCand < close and trailCand > nz(tTrail, tStop) : trailCand > close and trailCand < nz(tTrail, tStop)
+            if candOk
+                tTrail := longT ? f_max2(tTrail, trailCand) : f_min2(tTrail, trailCand)
+                evTrail := true
+                mgmtStage := "TRAILING - stop suggestion " + f_px(tTrail)
+        // Early exit only on genuine invalidation, never on one opposite candle.
+        if tDir != 0 and not tExit
+            bool oppShift = longT ? (msChDn and (dispBear or dispDnRecent)) : (msChUp and (dispBull or dispUpRecent))
+            bool protLost = longT ? (not na(msProtLo) and close < msProtLo) : (not na(msProtHi) and close > msProtHi)
+            bool m15Flip  = longT ? (m15Dir < 0 and dispDnRecent) : (m15Dir > 0 and dispUpRecent)
+            bool zoneRej  = longT ? (obSFound and close < obSBot and dispDnRecent) : (obLFound and close > obLTop and dispUpRecent)
+            bool brkBack  = longT ? (brkDir > 0 and brkFailed) : (brkDir < 0 and brkFailed)
+            if oppShift or protLost or m15Flip or zoneRej or brkBack
+                tExit := true
+                evExit := true
+                evInval := true
+                mgmtStage := "EXIT WARNING - " + (oppShift ? "opposite CHoCH with displacement" : protLost ? "protected swing lost" : m15Flip ? "M15 structure flipped" : zoneRej ? "rejected from opposing HTF zone" : "breakout fell back inside its range")
+
+// =============================================================================
+// 19 - CONFIRMATION SUMMARY (used by the dashboard and by alert messages)
+// =============================================================================
+bool pH1  = isL ? cH1L  : cH1S
+bool pM30 = isL ? cM30L : cM30S
+bool pM15 = isL ? cM15L : cM15S
+bool pSw  = isL ? cSwL  : cSwS
+bool pSh  = isL ? cShL  : cShS
+bool pDp  = isL ? cDpL  : cDpS
+bool pFv  = isL ? cFvL  : cFvS
+bool pOb  = isL ? cZoneL : cZoneS
+bool pPd  = isL ? cPdL  : cPdS
+bool pMo  = isL ? cMoL  : cMoS
+bool pRm  = isL ? cRmL  : cRmS
+
+f_cf(string n, bool ok) =>
+    ok ? n + " " : ""
+
+string confPass = f_cf("H1", pH1) + f_cf("M30", pM30) + f_cf("M15", pM15) + f_cf("SWEEP", pSw) + f_cf("CHoCH/MSS", pSh) + f_cf("DISP", pDp) + f_cf("FVG", pFv) + f_cf("OB", pOb) + f_cf("P/D", pPd) + f_cf("SESSION", cSess) + f_cf("MOM", pMo) + f_cf("ROOM", pRm)
+string confFail = f_cf("H1", not pH1) + f_cf("M30", not pM30) + f_cf("M15", not pM15) + f_cf("SWEEP", not pSw) + f_cf("CHoCH/MSS", not pSh) + f_cf("DISP", not pDp) + f_cf("FVG", not pFv) + f_cf("OB", not pOb) + f_cf("P/D", not pPd) + f_cf("SESSION", not cSess) + f_cf("MOM", not pMo) + f_cf("ROOM", not pRm)
+
+// =============================================================================
+// 20 - VISUALS
+// =============================================================================
+// --- session and previous-day liquidity lines -------------------------------
+plot(showPDLines   and useLiqPD   ? pdh    : na, "Previous-day high", color = color.new(cLevel, 0),  style = plot.style_linebr, linewidth = 1)
+plot(showPDLines   and useLiqPD   ? pdl    : na, "Previous-day low",  color = color.new(cLevel, 0),  style = plot.style_linebr, linewidth = 1)
+plot(showSessLines and useLiqSess ? asiaHi : na, "Asia high",         color = color.new(cLevel, 35), style = plot.style_linebr, linewidth = 1)
+plot(showSessLines and useLiqSess ? asiaLo : na, "Asia low",          color = color.new(cLevel, 35), style = plot.style_linebr, linewidth = 1)
+plot(showSessLines and useLiqSess ? lonHi  : na, "London high",       color = color.new(cLevel, 20), style = plot.style_linebr, linewidth = 1)
+plot(showSessLines and useLiqSess ? lonLo  : na, "London low",        color = color.new(cLevel, 20), style = plot.style_linebr, linewidth = 1)
+plot(showSessLines and useLiqSess ? nyHi   : na, "New York high",     color = color.new(cLevel, 20), style = plot.style_linebr, linewidth = 1)
+plot(showSessLines and useLiqSess ? nyLo   : na, "New York low",      color = color.new(cLevel, 20), style = plot.style_linebr, linewidth = 1)
+plot(showTrailPlot and tDir != 0 ? tTrail : na, "Suggested trailing stop", color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 2)
+
+// --- structure labels --------------------------------------------------------
+if showStructLbl and commit and (msBosUp or msChUp or msBosDn or msChDn)
+    bool   upEv = msBosUp or msChUp
+    string sTxt = msChUp ? (mssUp ? "MSS" : "CHoCH") : msChDn ? (mssDn ? "MSS" : "CHoCH") : "BOS"
+    label sl = label.new(bar_index, upEv ? high + 0.4 * lblOffAtr * atr : low - 0.4 * lblOffAtr * atr, sTxt, style = upEv ? label.style_label_down : label.style_label_up, color = color.new(upEv ? cBull : cBear, 25), textcolor = color.white, size = size.tiny)
+    array.push(structLbls, sl)
+    if array.size(structLbls) > maxStructLbl
+        label.delete(array.shift(structLbls))
+
+if showSwingLbl and commit and (newPH or newPL)
+    // "H" / "L" alone means there is no earlier swing to compare against yet.
+    string wTxt = newPH ? (isHH ? "HH" : isLH ? "LH" : "H") : (isHL ? "HL" : isLL ? "LL" : "L")
+    label wl = label.new(bar_index - swingLen, newPH ? chartPH : chartPL, wTxt, style = newPH ? label.style_label_down : label.style_label_up, color = color.new(color.gray, 55), textcolor = color.white, size = size.tiny)
+    array.push(structLbls, wl)
+    if array.size(structLbls) > maxStructLbl
+        label.delete(array.shift(structLbls))
+
+// --- confirmed BUY / SELL labels and the frozen trade plan --------------------
+// These are drawn once, on a closed candle, and are never moved or removed
+// afterwards (apart from the FIFO display cap set in the visual settings).
+if fire and showSignals
+    bool   up  = candDir > 0
+    string txt = (up ? "BUY" : "SELL") + (showScoreLbl ? "  " + f_grade(planScore) + " " + f_r1(planScore) : "") + "\n" + planFam
+    label sg = label.new(bar_index, up ? low - lblOffAtr * atr : high + lblOffAtr * atr, txt, style = up ? label.style_label_up : label.style_label_down, color = color.new(up ? cBull : cBear, 10), textcolor = color.white, size = size.small)
+    array.push(sigLbls, sg)
+    if array.size(sigLbls) > maxSigLbl
+        label.delete(array.shift(sigLbls))
+
+if fire and showPlan
+    int   x1 = bar_index
+    int   x2 = bar_index + planExtend
+    line le = line.new(x1, pEntry, x2, pEntry, color = color.new(color.blue, 0),  width = 2)
+    line ls = line.new(x1, pStop,  x2, pStop,  color = color.new(cBear, 0), width = 2, style = line.style_dashed)
+    line l1 = line.new(x1, pTp1,   x2, pTp1,   color = color.new(cBull, 20), width = 1)
+    line l2 = line.new(x1, pTp2,   x2, pTp2,   color = color.new(cBull, 0),  width = 2)
+    array.push(planLines, le)
+    array.push(planLines, ls)
+    array.push(planLines, l1)
+    array.push(planLines, l2)
+    if not na(pTp3)
+        line l3 = line.new(x1, pTp3, x2, pTp3, color = color.new(cBull, 45), width = 1, style = line.style_dotted)
+        array.push(planLines, l3)
+    label pl = label.new(x2, pEntry, "E " + f_px(pEntry) + "  SL " + f_px(pStop) + "\nTP1 " + f_px(pTp1) + "  TP2 " + f_px(pTp2) + "\nR:R " + f_r1(rr2), style = label.style_label_left, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+    array.push(sigLbls, pl)
+    if array.size(sigLbls) > maxSigLbl
+        label.delete(array.shift(sigLbls))
+    while array.size(planLines) > maxPlans * 5
+        line.delete(array.shift(planLines))
+
+// --- WAIT / NO TRADE labels (state changes only, never one per candle) -------
+var string prevVerdict = ""
+if commit and verdict != prevVerdict
+    if verdict == "WAIT" and showWaitLbl
+        label wv = label.new(bar_index, high + lblOffAtr * atr, "WAIT", style = label.style_label_down, color = color.new(cWait, 20), textcolor = color.black, size = size.tiny)
+        array.push(sigLbls, wv)
+        if array.size(sigLbls) > maxSigLbl
+            label.delete(array.shift(sigLbls))
+    if verdict == "NO TRADE" and showNoTrdLbl
+        label nv = label.new(bar_index, high + lblOffAtr * atr, "NO TRADE", style = label.style_label_down, color = color.new(cNone, 20), textcolor = color.white, size = size.tiny)
+        array.push(sigLbls, nv)
+        if array.size(sigLbls) > maxSigLbl
+            label.delete(array.shift(sigLbls))
+    prevVerdict := verdict
+
+// --- management notes --------------------------------------------------------
+if showMgmtLbl and (evTp1 or evTp2 or evBe or evExit)
+    string mTxt = evExit ? "EXIT WARNING" : evBe ? "BREAKEVEN JUSTIFIED" : evTp2 ? "TP2" : "PARTIAL - TP1"
+    color  mCol = evExit ? cBear : evBe ? color.new(color.orange, 10) : cBull
+    label ml = label.new(bar_index, tDir > 0 or evExit ? high + 0.6 * lblOffAtr * atr : low - 0.6 * lblOffAtr * atr, mTxt, style = label.style_label_down, color = color.new(mCol, 15), textcolor = color.white, size = size.tiny)
+    array.push(sigLbls, ml)
+    if array.size(sigLbls) > maxSigLbl
+        label.delete(array.shift(sigLbls))
+
+// =============================================================================
+// 21 - DASHBOARD
+// =============================================================================
+string tsz = dashSize == "Tiny" ? size.tiny : dashSize == "Normal" ? size.normal : size.small
+var table dash = table.new(position.top_right, 2, 26, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 40))
+
+f_row(int r, string k, string v, color vc) =>
+    table.cell(dash, 0, r, k, text_color = color.new(color.silver, 0), text_size = tsz, text_halign = text.align_left,  bgcolor = color.new(color.black, 25))
+    table.cell(dash, 1, r, v, text_color = vc,                          text_size = tsz, text_halign = text.align_right, bgcolor = color.new(color.black, 25))
+
+if showDash and barstate.islast
+    color vCol = verdict == "BUY" ? cBull : verdict == "SELL" ? cBear : verdict == "WAIT" ? cWait : cNone
+    table.cell(dash, 0, 0, "XAUUSD MTF CONFLUENCE V1", text_color = color.white, text_size = tsz, bgcolor = color.new(color.blue, 40))
+    table.cell(dash, 1, 0, tfOk ? "M5" : timeframe.period + " (!)", text_color = tfOk ? color.white : cWait, text_size = tsz, bgcolor = color.new(color.blue, 40))
+    f_row(1,  "VERDICT",        verdict, vCol)
+    f_row(2,  "Score / grade",  f_r1(planScore) + "  " + f_grade(planScore), planScore >= minScore ? cBull : cWait)
+    f_row(3,  "Setup family",   planFam, color.white)
+    f_row(4,  "H1 bias",        f_dirTxt(h1Dir),  h1Dir > 0 ? cBull : h1Dir < 0 ? cBear : cNone)
+    f_row(5,  "M30 bias",       f_dirTxt(m30Dir), m30Dir > 0 ? cBull : m30Dir < 0 ? cBear : cNone)
+    f_row(6,  "M15 structure",  f_dirTxt(m15Dir), m15Dir > 0 ? cBull : m15Dir < 0 ? cBear : cNone)
+    f_row(7,  "M5 confirmation", f_dirTxt(msDir) + (msBosUp or msBosDn ? " BOS" : "") + (msChUp or msChDn ? " CHoCH" : ""), msDir > 0 ? cBull : msDir < 0 ? cBear : cNone)
+    f_row(8,  "Market regime",  regime + "  (ATR " + f_r1(msAtr) + ")", regime == "BULLISH TREND" ? cBull : regime == "BEARISH TREND" ? cBear : cWait)
+    f_row(9,  "Session",        sessName + (sessOk ? "" : " (blocked)"), killzone ? cBull : cNone)
+    f_row(10, "Liquidity",      sweepFresh ? sweepName + " swept" : "No fresh sweep", sweepFresh ? cBull : cNone)
+    f_row(11, "CHoCH / MSS",    shiftFresh ? (shiftDisp ? "MSS " : "CHoCH ") + f_dirTxt(shiftDir) + (shiftM15 ? " (M15)" : " (M5)") : "None", shiftFresh ? cBull : cNone)
+    f_row(12, "Displacement",   dispUpRecent ? "BULLISH" : dispDnRecent ? "BEARISH" : "None", dispUpRecent ? cBull : dispDnRecent ? cBear : cNone)
+    f_row(13, "FVG at price",   pFv ? (isL ? "Bullish " : "Bearish ") + f_px(isL ? fvLBot : fvSBot) + "-" + f_px(isL ? fvLTop : fvSTop) : "None", pFv ? cBull : cNone)
+    f_row(14, "Order block",    pOb ? (isL ? "Demand " : "Supply ") + f_px(isL ? obLBot : obSBot) + "-" + f_px(isL ? obLTop : obSTop) : "None", pOb ? cBull : cNone)
+    f_row(15, "Premium/discount", pdTxt, pPd ? cBull : cNone)
+    f_row(16, "Room to target", f_r1((isL ? roomUp : roomDn) / atr) + " x ATR", pRm ? cBull : cNone)
+    f_row(17, "Est. R:R",       "TP1 " + f_r1(rr1) + "R  TP2 " + f_r1(rr2) + "R", rrOk ? cBull : cNone)
+    f_row(18, "Entry",          f_px(pEntry), color.white)
+    f_row(19, "Stop",           f_px(pStop) + "  (" + f_r1(risk / atr) + " ATR)", cBear)
+    f_row(20, "TP1",            f_px(pTp1), cBull)
+    f_row(21, "TP2 / runner",   f_px(pTp2) + (na(pTp3) ? "" : "  |  " + f_px(pTp3)), cBull)
+    f_row(22, "Management",     mgmtStage + (tDir != 0 and not na(tBar) ? "  [" + str.tostring(bar_index - tBar) + " bars]" : ""), tDir == 0 ? cNone : cWait)
+    f_row(23, "Passed",         confPass == "" ? "-" : confPass, cBull)
+    f_row(24, "Failed",         confFail == "" ? "-" : confFail, cNone)
+    f_row(25, "Reason",         reason, vCol)
+
+// One-off warning if the script is not on its intended execution timeframe.
+var label tfWarn = na
+if warnTF and barstate.islast and not tfOk
+    label.delete(tfWarn)
+    tfWarn := label.new(bar_index, high, "This engine is designed for the M5 execution chart.\nCurrent chart: " + timeframe.period, style = label.style_label_down, color = color.new(cWait, 15), textcolor = color.black, size = size.small)
+
+// =============================================================================
+// 22 - ALERTS
+// =============================================================================
+// Alert body. While a trade plan exists the message describes THAT plan (so a
+// TP1 or exit alert quotes the levels the signal was actually issued with);
+// otherwise it describes the setup currently on the chart.
+f_msg(string kind, string why) =>
+    bool   live  = tDirLast != 0
+    string dTxt  = live ? (tDirLast > 0 ? "LONG" : "SHORT") : (isL ? "LONG" : "SHORT")
+    string fTxt  = live ? tFam : planFam
+    float  sc    = live ? tScore : planScore
+    float  e     = live ? tEntry : pEntry
+    float  s     = live ? tStop  : pStop
+    float  q1    = live ? tTp1   : pTp1
+    float  q2    = live ? tTp2   : pTp2
+    float  rk    = live ? tRisk  : risk
+    alertTag + " | " + kind + "\n" + "Symbol: " + syminfo.ticker + " | Chart TF: " + timeframe.period + "\n" + "Direction: " + dTxt + " | Setup: " + fTxt + "\n" + "Score: " + f_r1(sc) + " (" + f_grade(sc) + ")\n" + "Entry: " + f_px(e) + " | Stop: " + f_px(s) + " | Risk: " + f_px(rk) + "\n" + "TP1: " + f_px(q1) + " | TP2: " + f_px(q2) + "\n" + "HTF bias - H1 " + f_dirTxt(h1Dir) + " / M30 " + f_dirTxt(m30Dir) + " / M15 " + f_dirTxt(m15Dir) + "\n" + "Confirmations: " + confPass + "\n" + "Reason: " + why
+
+bool aPlusBuy  = fireBuy  and planScore >= aPlusMin
+bool aPlusSell = fireSell and planScore >= aPlusMin
+
+// Static alertcondition() hooks - pick these from the TradingView alert dialog.
+alertcondition(fireBuy,   "Confirmed BUY",  "XAU MTF V1: confirmed BUY on {{ticker}} {{interval}} - check the dashboard for score, entry, stop and targets.")
+alertcondition(fireSell,  "Confirmed SELL", "XAU MTF V1: confirmed SELL on {{ticker}} {{interval}} - check the dashboard for score, entry, stop and targets.")
+alertcondition(aPlusBuy,  "A+ BUY",         "XAU MTF V1: A+ BUY on {{ticker}} {{interval}}.")
+alertcondition(aPlusSell, "A+ SELL",        "XAU MTF V1: A+ SELL on {{ticker}} {{interval}}.")
+alertcondition(evTp1,     "TP1 reached",    "XAU MTF V1: TP1 reached on {{ticker}} {{interval}} - consider taking 40-50% off.")
+alertcondition(evTp2,     "TP2 reached",    "XAU MTF V1: TP2 reached on {{ticker}} {{interval}}.")
+alertcondition(evBe,      "Breakeven justified", "XAU MTF V1: breakeven is now justified on {{ticker}} {{interval}}.")
+alertcondition(evTrail,   "Trailing stop update", "XAU MTF V1: trailing stop suggestion updated on {{ticker}} {{interval}}.")
+alertcondition(evExit,    "Early exit warning", "XAU MTF V1: early exit warning on {{ticker}} {{interval}}.")
+alertcondition(evInval,   "Setup invalidated", "XAU MTF V1: setup invalidated on {{ticker}} {{interval}}.")
+
+// Dynamic alert() messages - create ONE alert with "Any alert() function call".
+if alertsOn and alertEntry and fire
+    alert(f_msg(candDir > 0 ? "CONFIRMED BUY" : "CONFIRMED SELL", reason), alert.freq_once_per_bar_close)
+if alertsOn and alertAplus and (aPlusBuy or aPlusSell)
+    alert(f_msg(aPlusBuy ? "A+ BUY" : "A+ SELL", "A+ grade setup: " + confPass), alert.freq_once_per_bar_close)
+if alertsOn and alertTP and evTp1
+    alert(f_msg("TP1 REACHED", "Consider taking 40-50% at TP1 and running the rest to the structural target"), alert.freq_once_per_bar_close)
+if alertsOn and alertTP and evTp2
+    alert(f_msg("TP2 REACHED", "Main structural target reached"), alert.freq_once_per_bar_close)
+if alertsOn and alertBE and evBe
+    alert(f_msg("BREAKEVEN JUSTIFIED", mgmtStage), alert.freq_once_per_bar_close)
+if alertsOn and alertTrail and evTrail
+    alert(f_msg("TRAILING STOP UPDATE", "Suggested trailing stop " + f_px(tTrail) + " (tightening only)"), alert.freq_once_per_bar_close)
+if alertsOn and alertExit and evExit
+    alert(f_msg("EARLY EXIT WARNING", mgmtStage), alert.freq_once_per_bar_close)
+if alertsOn and alertInval and evInval and not evExit
+    alert(f_msg("SETUP INVALIDATED", mgmtStage), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// End of XAUUSD MULTI-TIMEFRAME CONFLUENCE ENGINE V1
+// Research and decision-support only. No profitability is claimed or implied.
+// =============================================================================
