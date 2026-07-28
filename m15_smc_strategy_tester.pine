@@ -1,0 +1,819 @@
+//@version=6
+// =============================================================================
+// M15 SMC STRATEGY TESTER
+// -----------------------------------------------------------------------------
+// PURPOSE: test the sweep -> displacement -> structure-shift strategy and
+// produce a real backtest report. Built as a strategy, not an indicator, so
+// TradingView draws its native entry/exit arrows with per-trade P&L and fills
+// the Strategy Tester tab.
+//
+// VISUAL POLICY: the chart stays clean. The ONLY things drawn by default are
+//   1. the dashboard in the top right, and
+//   2. TradingView's own trade arrows and exit labels.
+// Every other drawing is optional and defaults to OFF. No zone boxes, no level
+// lines streaking across history, no per-bar plot() segments.
+//
+// The trade logic is unchanged in substance from the structure engine: a
+// meaningful level is swept, price closes back inside, a displacement candle
+// proves intent, market structure confirms, and only then is a position taken
+// with a structural stop and a liquidity-based target.
+//
+// NO PROFITABILITY IS CLAIMED. Set realistic commission and slippage in the
+// Properties tab and enable bar magnifier before believing any result.
+// =============================================================================
+
+strategy("M15 SMC Strategy Tester",
+     shorttitle              = "M15 SMC",
+     overlay                 = true,
+     initial_capital         = 10000,
+     currency                = currency.USD,
+     default_qty_type        = strategy.fixed,
+     pyramiding              = 0,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.05,
+     slippage                = 5,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     max_labels_count        = 50,
+     max_lines_count         = 20)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+g1 = "① Direction & risk"
+allowLong  = input.bool(true, "Longs",  group = g1, inline = "d")
+allowShort = input.bool(true, "Shorts", group = g1, inline = "d")
+riskC      = input.float(0.5, "Risk % — grade C", minval = 0.0, maxval = 5.0, step = 0.05, group = g1,
+     tooltip = "Set to 0 to skip grade C setups entirely.")
+riskB      = input.float(1.0, "Risk % — grade B", minval = 0.05, maxval = 5.0, step = 0.05, group = g1)
+riskA      = input.float(1.5, "Risk % — grade A", minval = 0.05, maxval = 5.0, step = 0.05, group = g1)
+maxLev     = input.float(5.0, "Max notional leverage", minval = 0.1, maxval = 50.0, step = 0.1, group = g1)
+
+g2 = "② Setup types"
+useSweepRev = input.bool(true, "Sweep and reversal", group = g2)
+usePullback = input.bool(true, "Trend pullback", group = g2)
+useBreakRet = input.bool(true, "Breakout and retest", group = g2)
+
+g3 = "③ Context"
+useH1     = input.bool(true, "Require H1 alignment", group = g3,
+     tooltip = "Off = H1 is context only and never blocks a trade.")
+h1Tf      = input.timeframe("60", "H1 timeframe", group = g3)
+h1EmaLen  = input.int(50, "H1 EMA length", minval = 5, group = g3)
+useM5     = input.bool(false, "Require M5 confirmation candle", group = g3)
+m5Tf      = input.timeframe("5", "M5 timeframe", group = g3)
+
+g4 = "④ Structure"
+pivL      = input.int(3, "Swing pivot left",  minval = 1, maxval = 20, group = g4, inline = "p")
+pivR      = input.int(3, "Swing pivot right", minval = 1, maxval = 20, group = g4, inline = "p")
+atrLen    = input.int(14, "ATR length", minval = 2, group = g4)
+breakBuf  = input.float(0.05, "Structural break buffer (ATR x)", minval = 0.0, step = 0.01, group = g4)
+rangeLb   = input.int(96, "Active range lookback (bars)", minval = 20, group = g4)
+edgeFrac  = input.float(0.30, "Range edge fraction", minval = 0.05, maxval = 0.45, step = 0.05, group = g4)
+erLen     = input.int(20, "Efficiency-ratio lookback", minval = 5, group = g4)
+erChop    = input.float(0.12, "Block trades below efficiency ratio", minval = 0.0, maxval = 1.0, step = 0.01, group = g4)
+
+g5 = "⑤ Sweeps & displacement"
+swMinPen   = input.float(0.10, "Min wick penetration (ATR x)", minval = 0.0, step = 0.01, group = g5)
+swMaxPen   = input.float(1.50, "Max wick penetration (ATR x)", minval = 0.2, step = 0.1, group = g5)
+swNeedBack = input.bool(true, "Require close back inside level", group = g5)
+sweepWin   = input.int(8, "Sweep valid for N bars", minval = 1, group = g5)
+dispWin    = input.int(5, "Displacement must follow within N bars", minval = 1, group = g5)
+bosWin     = input.int(6, "Structure must confirm within N bars", minval = 1, group = g5)
+dispSens   = input.float(1.0, "Displacement sensitivity", minval = 0.3, maxval = 2.0, step = 0.05, group = g5)
+dispNeed   = input.int(3, "Displacement criteria required (of 5)", minval = 2, maxval = 5, group = g5)
+
+g6 = "⑥ Sessions & levels"
+sessTz   = input.string("UTC", "Session timezone", group = g6)
+asiaSess = input.session("0000-0700", "Asia",     group = g6)
+lonSess  = input.session("0700-1600", "London",   group = g6)
+nySess   = input.session("1200-2100", "New York", group = g6)
+killZone = input.bool(false, "Only trade London + New York hours", group = g6)
+
+g7 = "⑦ Stops & targets"
+stopMode   = input.string("Structure + ATR buffer", "Stop method",
+     options = ["Structure", "ATR", "Structure + ATR buffer"], group = g7)
+stopAtrM   = input.float(0.30, "ATR buffer / ATR stop multiple", minval = 0.05, step = 0.05, group = g7)
+minStopA   = input.float(0.35, "Minimum stop (ATR x)", minval = 0.05, step = 0.05, group = g7)
+maxStopA   = input.float(3.00, "Maximum stop (ATR x)", minval = 0.5, step = 0.1, group = g7)
+roomMode   = input.string("ATR", "Minimum target room measured in", options = ["ATR", "Pips"], group = g7)
+roomAtr    = input.float(1.50, "Minimum room (ATR x)", minval = 0.2, step = 0.1, group = g7)
+roomPips   = input.int(800, "Minimum room (pips)", minval = 1, group = g7)
+pipMode    = input.string("Auto", "Pip size", options = ["Auto", "XAUUSD 0.01", "BTCUSD 1.0", "Custom"], group = g7)
+pipCustom  = input.float(0.01, "Custom pip size", minval = 0.00001, step = 0.001, group = g7)
+minRr      = input.float(1.6, "Minimum reward:risk", minval = 0.3, step = 0.1, group = g7)
+rrCap      = input.float(5.0, "Reward:risk cap", minval = 1.0, step = 0.5, group = g7)
+tp1R       = input.float(1.0, "TP1 at R", minval = 0.2, step = 0.1, group = g7)
+tp1Pct     = input.float(50.0, "TP1 size %", minval = 0.0, maxval = 95.0, step = 5.0, group = g7,
+     tooltip = "Set to 0 to disable partial exits and run one target only.")
+useBE      = input.bool(true, "Breakeven after TP1", group = g7)
+useTrail   = input.bool(true, "ATR trail after TP1", group = g7, inline = "t")
+trailAtrM  = input.float(1.5, "", minval = 0.3, step = 0.1, group = g7, inline = "t")
+timeStop   = input.int(48, "Time stop — bars under +0.2R (0 = off)", minval = 0, group = g7)
+
+g8 = "⑧ Volatility & events"
+volPctLen  = input.int(100, "Volatility percentile lookback", minval = 20, group = g8)
+volExtreme = input.float(97.0, "Extreme above percentile", minval = 60.0, maxval = 100.0, step = 1.0, group = g8)
+blockVol   = input.bool(true, "Block trades in extreme volatility", group = g8)
+evOn       = input.bool(false, "Enable manual event blackout", group = g8)
+evBefore   = input.int(30, "Minutes before", minval = 0, group = g8, inline = "ev")
+evAfter    = input.int(30, "Minutes after",  minval = 0, group = g8, inline = "ev")
+ev1        = input.time(timestamp("01 Jan 2020 00:00 +0000"), "Event 1", group = g8)
+ev2        = input.time(timestamp("01 Jan 2020 00:00 +0000"), "Event 2", group = g8)
+
+g9 = "⑨ Capital protection"
+maxDailyLoss  = input.float(4.0, "Daily loss lock %", minval = 0.5, step = 0.5, group = g9)
+maxConsecLoss = input.int(3, "Consecutive-loss lock", minval = 1, group = g9)
+maxTradesDay  = input.int(4, "Max trades per day", minval = 1, group = g9)
+
+g10 = "⑩ Backtest window"
+startDate = input.time(timestamp("01 Jan 2023 00:00 +0000"), "Start", group = g10)
+endDate   = input.time(timestamp("01 Jan 2099 00:00 +0000"), "End",   group = g10)
+oosDate   = input.time(timestamp("01 Jan 2025 00:00 +0000"), "Out-of-sample starts", group = g10)
+
+g11 = "⑪ Display"
+showDash   = input.bool(true, "Show dashboard", group = g11)
+dashPos    = input.string("Top right", "Dashboard position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = g11)
+dashSize   = input.string("Tiny", "Text size", options = ["Tiny", "Small", "Normal"], group = g11)
+showPlan   = input.bool(false, "Draw stop / target lines for the open trade", group = g11)
+showOos    = input.bool(false, "Shade out-of-sample period", group = g11)
+
+// =============================================================================
+// CORE SERIES
+// =============================================================================
+
+atr      = ta.atr(atrLen)
+bodyAbs  = math.abs(close - open)
+rng      = high - low
+avgBody  = ta.sma(bodyAbs, 20)
+avgRange = ta.sma(rng, 20)
+
+inWindow = time >= startDate and time <= endDate
+isOos    = time >= oosDate
+newDay   = ta.change(time("D")) != 0
+
+erNum = math.abs(close - close[erLen])
+erDen = math.sum(math.abs(close - close[1]), erLen)
+er    = erDen > 0 ? erNum / erDen : 0.0
+
+atrPct       = ta.percentrank(atr, volPctLen)
+volIsExtreme = atrPct >= volExtreme
+
+// pip size resolution
+autoPip = str.contains(syminfo.ticker, "XAU") ? 0.01 :
+     str.contains(syminfo.ticker, "BTC") ? 1.0 : syminfo.mintick * 10
+pipSize = pipMode == "Auto" ? autoPip :
+     pipMode == "XAUUSD 0.01" ? 0.01 :
+     pipMode == "BTCUSD 1.0" ? 1.0 : pipCustom
+minRoom = roomMode == "ATR" ? roomAtr * atr : roomPips * pipSize
+
+// =============================================================================
+// HIGHER-TIMEFRAME CONTEXT (non-repainting: previous completed HTF bar)
+// =============================================================================
+
+h1Ema = request.security(syminfo.tickerid, h1Tf, ta.ema(close, h1EmaLen)[1],
+     lookahead = barmerge.lookahead_off)
+h1Cl = request.security(syminfo.tickerid, h1Tf, close[1],
+     lookahead = barmerge.lookahead_off)
+h1Up = request.security(syminfo.tickerid, h1Tf,
+     (ta.ema(close, h1EmaLen) > ta.ema(close, h1EmaLen)[3])[1],
+     lookahead = barmerge.lookahead_off)
+
+h1Ctx = na(h1Ema) or na(h1Cl) ? 0 : h1Cl > h1Ema and h1Up ? 1 :
+     h1Cl < h1Ema and not h1Up ? -1 : 0
+
+m5Up = request.security(syminfo.tickerid, m5Tf,
+     close > open and (high - low) > 0 and (close - low) / (high - low) >= 0.6,
+     lookahead = barmerge.lookahead_off)
+m5Dn = request.security(syminfo.tickerid, m5Tf,
+     close < open and (high - low) > 0 and (high - close) / (high - low) >= 0.6,
+     lookahead = barmerge.lookahead_off)
+
+// =============================================================================
+// LEVELS
+// =============================================================================
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off)
+dOp = request.security(syminfo.tickerid, "D", open,    lookahead = barmerge.lookahead_off)
+
+f_sessTrack(_in) =>
+    var float hi = na
+    var float lo = na
+    if _in and not _in[1]
+        hi := high
+        lo := low
+    else if _in
+        hi := math.max(nz(hi, high), high)
+        lo := math.min(nz(lo, low), low)
+    [hi, lo]
+
+inAsia = not na(time(timeframe.period, asiaSess, sessTz))
+inLon  = not na(time(timeframe.period, lonSess,  sessTz))
+inNy   = not na(time(timeframe.period, nySess,   sessTz))
+
+[asiaH, asiaL] = f_sessTrack(inAsia)
+[lonH,  lonL ] = f_sessTrack(inLon)
+[nyH,   nyL  ] = f_sessTrack(inNy)
+
+rangeHi  = ta.highest(high, rangeLb)
+rangeLo  = ta.lowest(low,  rangeLb)
+rangeW   = rangeHi - rangeLo
+rangePos = rangeW > 0 ? (close - rangeLo) / rangeW : 0.5
+
+locOutside = rangePos > 1.0 or rangePos < 0.0
+locUpper   = not locOutside and rangePos >= 1.0 - edgeFrac
+locLower   = not locOutside and rangePos <= edgeFrac
+locMiddle  = not locOutside and not locUpper and not locLower
+locTxt     = locOutside ? "Outside range" : locUpper ? "Upper edge" :
+     locLower ? "Lower edge" : "Middle of range"
+
+// =============================================================================
+// SWING STRUCTURE AND BIAS
+// =============================================================================
+
+ph = ta.pivothigh(high, pivL, pivR)
+pl = ta.pivotlow(low,  pivL, pivR)
+
+var float sh1 = na
+var float sl1 = na
+if not na(ph)
+    sh1 := ph
+if not na(pl)
+    sl1 := pl
+
+var float lastBrokenHi = na
+var float lastBrokenLo = na
+
+bosUp = not na(sh1) and close > sh1 + breakBuf * atr and (na(lastBrokenHi) or sh1 != lastBrokenHi)
+bosDn = not na(sl1) and close < sl1 - breakBuf * atr and (na(lastBrokenLo) or sl1 != lastBrokenLo)
+
+var int   bias        = 0
+var int   bosKind     = 0     // 1 = continuation BOS, 2 = change of character
+var int   bosDir      = 0
+var int   bosBar      = na
+var float bosLevel    = na
+var float preserveLvl = na
+var float flipLvl     = na
+
+if bosUp
+    bosKind      := bias >= 0 ? 1 : 2
+    bosDir       := 1
+    bosBar       := bar_index
+    bosLevel     := sh1
+    lastBrokenHi := sh1
+    preserveLvl  := sl1
+    flipLvl      := sl1
+    bias         := 1
+
+if bosDn
+    bosKind      := bias <= 0 ? 1 : 2
+    bosDir       := -1
+    bosBar       := bar_index
+    bosLevel     := sl1
+    lastBrokenLo := sl1
+    preserveLvl  := sh1
+    flipLvl      := sh1
+    bias         := -1
+
+if bias == 1 and not na(preserveLvl) and close < preserveLvl
+    bias := 0
+if bias == -1 and not na(preserveLvl) and close > preserveLvl
+    bias := 0
+
+bosFresh = not na(bosBar) and (bar_index - bosBar) <= bosWin
+
+// =============================================================================
+// DISPLACEMENT — five visible criteria
+// =============================================================================
+
+clUp = rng > 0 ? (close - low) / rng : 0.0
+clDn = rng > 0 ? (high - close) / rng : 0.0
+
+d1 = atr > 0 and bodyAbs >= 1.20 * dispSens * atr
+d2 = avgBody > 0 and bodyAbs >= 1.60 * dispSens * avgBody
+d3u = clUp >= 0.65
+d3d = clDn >= 0.65
+d4u = not na(sh1) and close > sh1
+d4d = not na(sl1) and close < sl1
+d5 = avgRange > 0 and rng >= 1.30 * dispSens * avgRange
+
+scoreU = (d1 ? 1 : 0) + (d2 ? 1 : 0) + (d3u ? 1 : 0) + (d4u ? 1 : 0) + (d5 ? 1 : 0)
+scoreD = (d1 ? 1 : 0) + (d2 ? 1 : 0) + (d3d ? 1 : 0) + (d4d ? 1 : 0) + (d5 ? 1 : 0)
+
+dispUp = close > open and scoreU >= dispNeed
+dispDn = close < open and scoreD >= dispNeed
+
+var int dispUpBar = na
+var int dispDnBar = na
+if dispUp
+    dispUpBar := bar_index
+if dispDn
+    dispDnBar := bar_index
+
+dispUpFresh = not na(dispUpBar) and (bar_index - dispUpBar) <= dispWin
+dispDnFresh = not na(dispDnBar) and (bar_index - dispDnBar) <= dispWin
+
+dispTxt = dispUp ? "Bullish displacement" : dispDn ? "Bearish displacement" :
+     dispUpFresh ? "Bullish (recent)" : dispDnFresh ? "Bearish (recent)" : "None"
+
+// =============================================================================
+// SWEEPS — levels read as of the PREVIOUS bar so the current candle cannot
+// redefine the level it is sweeping.
+// =============================================================================
+
+f_swDn(_l) =>
+    not na(_l) and low < _l - swMinPen * atr and low >= _l - swMaxPen * atr and
+     (not swNeedBack or close > _l) and low[1] >= _l
+f_swUp(_l) =>
+    not na(_l) and high > _l + swMinPen * atr and high <= _l + swMaxPen * atr and
+     (not swNeedBack or close < _l) and high[1] <= _l
+
+sD1 = f_swDn(sl1[1])
+sD2 = f_swDn(pdl[1])
+sD3 = f_swDn(asiaL[1])
+sD4 = f_swDn(lonL[1])
+sD5 = f_swDn(nyL[1])
+sD6 = f_swDn(rangeLo[1])
+
+sU1 = f_swUp(sh1[1])
+sU2 = f_swUp(pdh[1])
+sU3 = f_swUp(asiaH[1])
+sU4 = f_swUp(lonH[1])
+sU5 = f_swUp(nyH[1])
+sU6 = f_swUp(rangeHi[1])
+
+sweepBull = sD1 or sD2 or sD3 or sD4 or sD5 or sD6
+sweepBear = sU1 or sU2 or sU3 or sU4 or sU5 or sU6
+
+bullName = sD2 ? "PDL" : sD6 ? "range low" : sD3 ? "Asia low" : sD4 ? "London low" :
+     sD5 ? "NY low" : sD1 ? "swing low" : ""
+bearName = sU2 ? "PDH" : sU6 ? "range high" : sU3 ? "Asia high" : sU4 ? "London high" :
+     sU5 ? "NY high" : sU1 ? "swing high" : ""
+
+// HTF pools are stronger than a local pivot
+bullHtf = sD2 or sD3 or sD4 or sD5 or sD6
+bearHtf = sU2 or sU3 or sU4 or sU5 or sU6
+
+var int    sweepDir  = 0
+var int    sweepBar  = na
+var float  sweepWick = na
+var bool   sweepIsHtf= false
+var string sweepName = ""
+
+if sweepBull
+    sweepDir   := 1
+    sweepBar   := bar_index
+    sweepWick  := low
+    sweepIsHtf := bullHtf
+    sweepName  := bullName
+if sweepBear
+    sweepDir   := -1
+    sweepBar   := bar_index
+    sweepWick  := high
+    sweepIsHtf := bearHtf
+    sweepName  := bearName
+
+sweepFresh = not na(sweepBar) and (bar_index - sweepBar) <= sweepWin
+
+// =============================================================================
+// NEAREST SUPPORT / RESISTANCE
+// =============================================================================
+
+f_below(_c, _l, _p) => not na(_l) and _l < _p and (na(_c) or _l > _c) ? _l : _c
+f_above(_c, _l, _p) => not na(_l) and _l > _p and (na(_c) or _l < _c) ? _l : _c
+
+float sup = na
+sup := f_below(sup, pdh, close)
+sup := f_below(sup, pdl, close)
+sup := f_below(sup, dOp, close)
+sup := f_below(sup, asiaH, close)
+sup := f_below(sup, asiaL, close)
+sup := f_below(sup, lonH, close)
+sup := f_below(sup, lonL, close)
+sup := f_below(sup, nyH, close)
+sup := f_below(sup, nyL, close)
+sup := f_below(sup, sh1, close)
+sup := f_below(sup, sl1, close)
+sup := f_below(sup, rangeLo, close)
+
+float res = na
+res := f_above(res, pdh, close)
+res := f_above(res, pdl, close)
+res := f_above(res, dOp, close)
+res := f_above(res, asiaH, close)
+res := f_above(res, asiaL, close)
+res := f_above(res, lonH, close)
+res := f_above(res, lonL, close)
+res := f_above(res, nyH, close)
+res := f_above(res, nyL, close)
+res := f_above(res, sh1, close)
+res := f_above(res, sl1, close)
+res := f_above(res, rangeHi, close)
+
+// =============================================================================
+// REGIME, VOLATILITY, EVENT BLACKOUT
+// =============================================================================
+
+failedBreak = bosFresh and not na(bosLevel) and
+     ((bosDir == 1 and close < bosLevel) or (bosDir == -1 and close > bosLevel))
+
+regime = failedBreak ? "Failed breakout" :
+     volIsExtreme ? "Volatility expansion" :
+     er < erChop ? "Unstructured chop" :
+     bias == 1 ? "Bullish trend" : bias == -1 ? "Bearish trend" : "Balanced range"
+
+f_black(_t) => evOn and not na(_t) and
+     time >= _t - evBefore * 60000 and time <= _t + evAfter * 60000
+eventBlock = f_black(ev1) or f_black(ev2)
+
+hUtc      = hour(time, "UTC")
+sessionOk = not killZone or (hUtc >= 7 and hUtc < 21)
+volBlock  = blockVol and volIsExtreme
+
+// =============================================================================
+// SETUP DETECTION
+// =============================================================================
+// Ordered sequence, enforced by bar indices rather than a rigid state machine:
+//     sweep  ->  displacement (after the sweep)  ->  structure break (after it)
+
+seqLong = sweepFresh and sweepDir == 1 and dispUpFresh and
+     not na(dispUpBar) and not na(sweepBar) and dispUpBar >= sweepBar and
+     bosFresh and bosDir == 1 and not na(bosBar) and bosBar >= dispUpBar
+
+seqShort = sweepFresh and sweepDir == -1 and dispDnFresh and
+     not na(dispDnBar) and not na(sweepBar) and dispDnBar >= sweepBar and
+     bosFresh and bosDir == -1 and not na(bosBar) and bosBar >= dispDnBar
+
+// A. sweep and reversal
+revLong  = useSweepRev and seqLong
+revShort = useSweepRev and seqShort
+
+// B. trend pullback: with bias, at the correct edge of the range, sequence done
+pullLong  = usePullback and seqLong  and bias == 1 and (locLower or locOutside)
+pullShort = usePullback and seqShort and bias == -1 and (locUpper or locOutside)
+
+// C. breakout and retest: displaced close beyond a level, then a hold above it
+var float brkLevel = na
+var int   brkBar   = na
+var int   brkDir   = 0
+if dispUp and not na(res) and close > res
+    brkLevel := res
+    brkBar   := bar_index
+    brkDir   := 1
+if dispDn and not na(sup) and close < sup
+    brkLevel := sup
+    brkBar   := bar_index
+    brkDir   := -1
+
+brkFresh = not na(brkBar) and (bar_index - brkBar) <= 20 and (bar_index - brkBar) >= 1
+retLong  = useBreakRet and brkFresh and brkDir == 1 and not na(brkLevel) and
+     low <= brkLevel + 0.30 * atr and close > brkLevel and close > open
+retShort = useBreakRet and brkFresh and brkDir == -1 and not na(brkLevel) and
+     high >= brkLevel - 0.30 * atr and close < brkLevel and close < open
+
+rawLong  = revLong or pullLong or retLong
+rawShort = revShort or pullShort or retShort
+
+setupType = (revLong or revShort) ? 3 : (retLong or retShort) ? 2 :
+     (pullLong or pullShort) ? 1 : 0
+typeTxt = setupType == 1 ? "Trend pullback" : setupType == 2 ? "Breakout and retest" :
+     setupType == 3 ? "Sweep and reversal" : "-"
+
+// =============================================================================
+// STOPS, TARGETS, GRADE
+// =============================================================================
+
+anchorL = math.min(low, nz(sweepWick, low))
+anchorS = math.max(high, nz(sweepWick, high))
+
+rawStopL = stopMode == "ATR" ? close - stopAtrM * atr :
+     stopMode == "Structure" ? anchorL : anchorL - stopAtrM * atr
+rawStopS = stopMode == "ATR" ? close + stopAtrM * atr :
+     stopMode == "Structure" ? anchorS : anchorS + stopAtrM * atr
+
+distL = math.min(math.max(close - rawStopL, minStopA * atr), maxStopA * atr)
+distS = math.min(math.max(rawStopS - close, minStopA * atr), maxStopA * atr)
+
+stopL = close - distL
+stopS = close + distS
+
+// target: nearest opposing level, if it offers enough room and reward
+roomL  = not na(res) ? res - close : na
+roomS  = not na(sup) ? close - sup : na
+rrLiqL = not na(roomL) and distL > 0 ? roomL / distL : 0.0
+rrLiqS = not na(roomS) and distS > 0 ? roomS / distS : 0.0
+
+liqOkL = not na(roomL) and roomL >= minRoom and rrLiqL >= minRr
+liqOkS = not na(roomS) and roomS >= minRoom and rrLiqS >= minRr
+
+rrL = math.min(rrCap, liqOkL ? rrLiqL : minRr)
+rrS = math.min(rrCap, liqOkS ? rrLiqS : minRr)
+
+tp1L = close + tp1R * distL
+tp2L = close + rrL * distL
+tp1S = close - tp1R * distS
+tp2S = close - rrS * distS
+
+// grading: count the weaknesses, never convert to a probability
+f_grade(_dir) =>
+    isL = _dir == 1
+    w = 0
+    w := w + ((isL ? (locLower or locOutside) : (locUpper or locOutside)) ? 0 : 1)
+    w := w + ((isL ? bias == 1 : bias == -1) ? 0 : 1)
+    w := w + ((isL ? liqOkL : liqOkS) ? 0 : 1)
+    w := w + (sweepIsHtf and sweepFresh ? 0 : 1)
+    w := w + (h1Ctx == _dir ? 0 : 1)
+    w := w + (er >= erChop and not volIsExtreme ? 0 : 1)
+    w == 0 ? 3 : w == 1 ? 3 : w == 2 ? 2 : w <= 3 ? 1 : 0
+
+gradeL = f_grade(1)
+gradeS = f_grade(-1)
+
+f_risk(_g) => _g == 3 ? riskA : _g == 2 ? riskB : _g == 1 ? riskC : 0.0
+
+// =============================================================================
+// CAPITAL PROTECTION
+// =============================================================================
+
+var float dayStartEq  = na
+var int   tradesToday = 0
+var int   consecLoss  = 0
+
+if newDay or na(dayStartEq)
+    dayStartEq  := strategy.equity
+    tradesToday := 0
+    consecLoss  := 0
+
+dayPnlPct = not na(dayStartEq) and dayStartEq > 0
+     ? (strategy.equity - dayStartEq) / dayStartEq * 100.0 : 0.0
+
+if strategy.closedtrades > nz(strategy.closedtrades[1])
+    lastP = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    consecLoss := lastP < 0 ? consecLoss + 1 : 0
+
+lockedDaily  = dayPnlPct <= -maxDailyLoss
+lockedStreak = consecLoss >= maxConsecLoss
+lockedCount  = tradesToday >= maxTradesDay
+locked       = lockedDaily or lockedStreak or lockedCount
+lockTxt = lockedDaily ? "DAILY LOSS" : lockedStreak ? "LOSS STREAK" :
+     lockedCount ? "TRADE CAP" : "clear"
+
+// =============================================================================
+// ENTRY GATES
+// =============================================================================
+
+flat     = strategy.position_size == 0
+baseOk   = inWindow and flat and not locked and sessionOk and not eventBlock and
+     not volBlock and er >= erChop
+
+longOk = allowLong and baseOk and rawLong and liqOkL and gradeL > 0 and
+     f_risk(gradeL) > 0 and (not useH1 or h1Ctx >= 0) and (not useM5 or m5Up) and
+     not (locMiddle and setupType != 2)
+
+shortOk = allowShort and baseOk and rawShort and liqOkS and gradeS > 0 and
+     f_risk(gradeS) > 0 and (not useH1 or h1Ctx <= 0) and (not useM5 or m5Dn) and
+     not (locMiddle and setupType != 2)
+
+// If both sides qualify on the same bar, the stronger grade wins rather than
+// both being cancelled.
+takeLong  = longOk  and (not shortOk or gradeL >= gradeS)
+takeShort = shortOk and (not longOk  or gradeS >  gradeL)
+
+f_qty(_riskPct, _dist) =>
+    q = _dist > 0 and _riskPct > 0 ? strategy.equity * _riskPct / 100.0 / _dist : 0.0
+    math.max(0.0, math.min(q, strategy.equity * maxLev / close))
+
+qtyL = f_qty(f_risk(gradeL), distL)
+qtyS = f_qty(f_risk(gradeS), distS)
+
+gradeTxtL = gradeL == 3 ? "A" : gradeL == 2 ? "B" : gradeL == 1 ? "C" : "REJECT"
+gradeTxtS = gradeS == 3 ? "A" : gradeS == 2 ? "B" : gradeS == 1 ? "C" : "REJECT"
+
+// =============================================================================
+// EXECUTION — TradingView draws the arrows and exit labels natively
+// =============================================================================
+
+var float posEntry = na
+var float posStop  = na
+var float posRisk  = na
+var float posTp2   = na
+var bool  tp1Done  = false
+var int   barsIn   = 0
+var float bestR    = 0.0
+
+// The stop distance and target must be captured on the SIGNAL bar. The
+// position only becomes visible to the script on the following bar, by which
+// time ATR and the sweep anchor have already moved.
+var float pendRisk = na
+var float pendRr   = na
+
+if takeLong and qtyL > 0
+    strategy.entry("L", strategy.long, qty = qtyL, comment = gradeTxtL)
+    pendRisk := distL
+    pendRr   := rrL
+if takeShort and qtyS > 0
+    strategy.entry("S", strategy.short, qty = qtyS, comment = gradeTxtS)
+    pendRisk := distS
+    pendRr   := rrS
+
+justOpened = strategy.position_size != 0 and nz(strategy.position_size[1]) == 0
+
+if justOpened and not na(pendRisk)
+    isL      = strategy.position_size > 0
+    posEntry := strategy.position_avg_price
+    posRisk  := pendRisk
+    posStop  := isL ? posEntry - posRisk : posEntry + posRisk
+    posTp2   := isL ? posEntry + pendRr * posRisk : posEntry - pendRr * posRisk
+    tp1Done  := false
+    barsIn   := 0
+    bestR    := 0.0
+    tradesToday := tradesToday + 1
+
+if strategy.position_size > 0 and not na(posRisk) and posRisk > 0
+    barsIn := barsIn + 1
+    r = (close - posEntry) / posRisk
+    bestR := math.max(bestR, r)
+
+    if tp1Pct > 0 and not tp1Done and r >= tp1R
+        strategy.close("L", qty_percent = tp1Pct, comment = "TP1")
+        tp1Done := true
+        if useBE
+            posStop := math.max(posStop, posEntry)
+    if useTrail and tp1Done
+        posStop := math.max(posStop, close - trailAtrM * atr)
+
+    strategy.exit("L-exit", from_entry = "L", stop = posStop, limit = posTp2)
+
+    if timeStop > 0 and barsIn >= timeStop and bestR < 0.2
+        strategy.close("L", comment = "Time")
+
+if strategy.position_size < 0 and not na(posRisk) and posRisk > 0
+    barsIn := barsIn + 1
+    r = (posEntry - close) / posRisk
+    bestR := math.max(bestR, r)
+
+    if tp1Pct > 0 and not tp1Done and r >= tp1R
+        strategy.close("S", qty_percent = tp1Pct, comment = "TP1")
+        tp1Done := true
+        if useBE
+            posStop := math.min(posStop, posEntry)
+    if useTrail and tp1Done
+        posStop := math.min(posStop, close + trailAtrM * atr)
+
+    strategy.exit("S-exit", from_entry = "S", stop = posStop, limit = posTp2)
+
+    if timeStop > 0 and barsIn >= timeStop and bestR < 0.2
+        strategy.close("S", comment = "Time")
+
+if strategy.position_size == 0
+    posStop := na
+    posTp2  := na
+    posEntry := na
+
+// =============================================================================
+// OPTIONAL: stop / target lines for the OPEN trade only (off by default)
+// =============================================================================
+// Two line objects, repositioned each bar. Nothing accumulates.
+
+INVIS = color.new(color.black, 100)
+inTrade = strategy.position_size != 0 and not na(posStop) and not na(posTp2)
+
+var line lnStop = line.new(bar_index, close, bar_index, close, color = INVIS, width = 2)
+var line lnTp   = line.new(bar_index, close, bar_index, close, color = INVIS, width = 2)
+
+line.set_xy1(lnStop, bar_index - 10, inTrade ? posStop : close)
+line.set_xy2(lnStop, bar_index + 3,  inTrade ? posStop : close)
+line.set_color(lnStop, showPlan and inTrade ? color.new(color.red, 0) : INVIS)
+
+line.set_xy1(lnTp, bar_index - 10, inTrade ? posTp2 : close)
+line.set_xy2(lnTp, bar_index + 3,  inTrade ? posTp2 : close)
+line.set_color(lnTp, showPlan and inTrade ? color.new(color.lime, 0) : INVIS)
+
+bgcolor(showOos and isOos ? color.new(color.blue, 95) : na, title = "Out-of-sample")
+
+// =============================================================================
+// PERFORMANCE — in-sample vs out-of-sample
+// =============================================================================
+
+var float eqPeak = na
+eqPeak := na(eqPeak) ? strategy.equity : math.max(eqPeak, strategy.equity)
+ddNow  = eqPeak > 0 ? (eqPeak - strategy.equity) / eqPeak * 100.0 : 0.0
+var float maxDD = 0.0
+maxDD := math.max(maxDD, ddNow)
+
+var int isT = 0
+var int isW = 0
+var int osT = 0
+var int osW = 0
+
+if strategy.closedtrades > nz(strategy.closedtrades[1])
+    p = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if isOos
+        osT := osT + 1
+        osW := p > 0 ? osW + 1 : osW
+    else
+        isT := isT + 1
+        isW := p > 0 ? isW + 1 : isW
+
+var float firstClose = na
+if na(firstClose) and inWindow
+    firstClose := close
+
+bhPct  = not na(firstClose) and firstClose > 0 ? (close / firstClose - 1.0) * 100.0 : 0.0
+netPct = strategy.initial_capital > 0 ? strategy.netprofit / strategy.initial_capital * 100.0 : 0.0
+pf     = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+winPct = strategy.closedtrades > 0 ? strategy.wintrades * 100.0 / strategy.closedtrades : 0.0
+isWin  = isT > 0 ? isW * 100.0 / isT : 0.0
+osWin  = osT > 0 ? osW * 100.0 / osT : 0.0
+
+// =============================================================================
+// DASHBOARD
+// =============================================================================
+
+dPos = dashPos == "Top left" ? position.top_left :
+     dashPos == "Bottom right" ? position.bottom_right :
+     dashPos == "Bottom left" ? position.bottom_left :
+     dashPos == "Middle right" ? position.middle_right : position.top_right
+dSz = dashSize == "Small" ? size.small : dashSize == "Normal" ? size.normal : size.tiny
+
+var table dash = table.new(dPos, 2, 22, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+
+f_cell(_r, _k, _v, _c) =>
+    table.cell(dash, 0, _r, _k, text_color = color.new(color.gray, 0),
+         text_size = dSz, text_halign = text.align_left)
+    table.cell(dash, 1, _r, _v, text_color = _c, text_size = dSz,
+         text_halign = text.align_right)
+
+f_num(_v) => na(_v) ? "-" : str.tostring(_v, format.mintick)
+
+if showDash and barstate.islast
+    sideLong = gradeL >= gradeS
+    decision = eventBlock ? "EVENT RISK — NO TRADE" :
+         volBlock ? "NO TRADE" :
+         locked ? "LOCKED" :
+         strategy.position_size > 0 ? "IN LONG" :
+         strategy.position_size < 0 ? "IN SHORT" :
+         takeLong ? "LONG" : takeShort ? "SHORT" :
+         (rawLong or rawShort) ? "WAIT" : "NO TRADE"
+    decCol = decision == "LONG" or decision == "IN LONG" ? color.teal :
+         decision == "SHORT" or decision == "IN SHORT" ? color.red :
+         decision == "WAIT" ? color.new(color.yellow, 0) : color.new(color.gray, 0)
+
+    gTxt = sideLong ? gradeTxtL : gradeTxtS
+    gCol = (sideLong ? gradeL : gradeS) == 3 ? color.teal :
+         (sideLong ? gradeL : gradeS) == 2 ? color.new(color.lime, 20) :
+         (sideLong ? gradeL : gradeS) == 1 ? color.new(color.orange, 0) : color.new(color.gray, 20)
+
+    table.cell(dash, 0, 0, "M15 SMC", text_color = color.white, text_size = dSz)
+    table.cell(dash, 1, 0, syminfo.ticker + " " + timeframe.period,
+         text_color = color.new(color.gray, 0), text_size = dSz, text_halign = text.align_right)
+
+    f_cell(1, "H1 context", h1Ctx == 1 ? "Bullish" : h1Ctx == -1 ? "Bearish" : "Neutral",
+         h1Ctx == 1 ? color.teal : h1Ctx == -1 ? color.red : color.gray)
+    f_cell(2, "M15 bias", bias == 1 ? "Bullish" : bias == -1 ? "Bearish" : "Balanced",
+         bias == 1 ? color.teal : bias == -1 ? color.red : color.gray)
+    f_cell(3, "Market regime", regime, color.new(color.gray, 0))
+    f_cell(4, "Setup type", typeTxt, color.new(color.gray, 0))
+    f_cell(5, "Setup grade", gTxt, gCol)
+    f_cell(6, "Price location", locTxt, locMiddle ? color.orange : color.teal)
+    f_cell(7, "Preserve level", f_num(preserveLvl), color.new(color.gray, 0))
+    f_cell(8, "Bias flip level", f_num(flipLvl), color.new(color.gray, 0))
+    f_cell(9, "Nearest support", f_num(sup), color.teal)
+    f_cell(10, "Nearest resistance", f_num(res), color.red)
+    f_cell(11, "Displacement", dispTxt, dispUp ? color.teal : dispDn ? color.red : color.gray)
+    f_cell(12, "Last sweep", sweepFresh ? (sweepDir == 1 ? "low: " : "high: ") + sweepName +
+         (sweepIsHtf ? " (HTF)" : "") : "-",
+         sweepFresh ? color.new(color.yellow, 0) : color.gray)
+    f_cell(13, "Entry / Stop",
+         inTrade ? f_num(posEntry) + " / " + f_num(posStop) :
+         f_num(sideLong ? close : close) + " / " + f_num(sideLong ? stopL : stopS),
+         inTrade ? color.white : color.new(color.gray, 0))
+    f_cell(14, "TP1 / TP2",
+         inTrade ? "-" + " / " + f_num(posTp2) :
+         f_num(sideLong ? tp1L : tp1S) + " / " + f_num(sideLong ? tp2L : tp2S), color.teal)
+    f_cell(15, "R:R to TP2", str.tostring(sideLong ? rrL : rrS, "#.##"),
+         (sideLong ? rrL : rrS) >= minRr ? color.teal : color.orange)
+    f_cell(16, "Volatility / locks", (volIsExtreme ? "Extreme" : "Normal") + " | " + lockTxt,
+         volIsExtreme or locked ? color.orange : color.teal)
+    f_cell(17, "DECISION", decision, decCol)
+    f_cell(18, "Net / Buy&hold", str.tostring(netPct, "#.#") + "% / " + str.tostring(bhPct, "#.#") + "%",
+         netPct >= 0 ? color.teal : color.red)
+    f_cell(19, "Profit factor", na(pf) ? "-" : str.tostring(pf, "#.##"),
+         na(pf) ? color.gray : pf >= 1.3 ? color.teal : color.red)
+    f_cell(20, "Trades / win% / DD",
+         str.tostring(strategy.closedtrades) + " / " + str.tostring(winPct, "#") + "% / " +
+         str.tostring(maxDD, "#.#") + "%", color.new(color.gray, 0))
+    f_cell(21, "IS vs OOS win%",
+         str.tostring(isWin, "#") + "% (" + str.tostring(isT) + ") vs " +
+         str.tostring(osWin, "#") + "% (" + str.tostring(osT) + ")",
+         osT < 20 ? color.gray : osWin >= isWin * 0.8 ? color.teal : color.red)
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+
+alertcondition(takeLong,  "Long entry",  "M15 SMC: long entry")
+alertcondition(takeShort, "Short entry", "M15 SMC: short entry")
