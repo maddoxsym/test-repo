@@ -479,6 +479,67 @@ class TestFillReconciliationInTheExecutor:
         assert any(r["layer_name"] == "order_canceled" for r in repos.rejected.recent(5))
 
 
+class TestResearchEquityDrivesSizing:
+    """Sizing must follow the capped research figure, not the account total."""
+
+    async def test_a_10k_research_equity_sizes_smaller_than_an_84k_account(
+        self, repos, capabilities
+    ):
+        client = MockOkxClient()
+        executor, _ = _executor(repos, client, _verified_guard())
+
+        research = await _submit(executor, _signal(), capabilities, equity=10_000.0)
+        assert research.success and research.sizing is not None
+
+        account = await _submit(
+            executor, _signal(setup_key="k2"), capabilities,
+            setup_id="set_2", signal_id="sig_2", equity=84_000.0,
+        )
+        assert account.sizing is not None
+        assert account.sizing.quantity > research.sizing.quantity, (
+            "sizing tracks the equity it is handed — which is why it must be "
+            "handed research equity, not totalEq"
+        )
+
+    async def test_insufficient_available_usdt_reduces_or_rejects_the_order(
+        self, repos, capabilities
+    ):
+        """Requirement: the real account, not research equity, gates margin."""
+        client = MockOkxClient()
+        executor, _ = _executor(repos, client, _verified_guard())
+
+        rich = await _submit(
+            executor, _signal(), capabilities, equity=10_000.0, available=10_000.0
+        )
+        thin = await _submit(
+            executor, _signal(setup_key="k2"), capabilities,
+            setup_id="set_2", signal_id="sig_2", equity=10_000.0, available=5.0,
+        )
+
+        assert rich.success and rich.sizing is not None
+        if thin.success:
+            assert thin.sizing is not None
+            assert thin.sizing.quantity < rich.sizing.quantity, "size was not reduced"
+        else:
+            # Reduced so far it no longer clears the exchange minimum — the
+            # other half of "reduce size or reject the trade".
+            assert "sizing rejected" in thin.reason
+            assert len(client.orders) == 1, "the unaffordable order was still sent"
+
+    async def test_no_order_is_sent_when_margin_cannot_cover_it(
+        self, repos, capabilities
+    ):
+        """Rejected before the request, not after."""
+        client = MockOkxClient()
+        executor, _ = _executor(repos, client, _verified_guard())
+
+        result = await _submit(
+            executor, _signal(), capabilities, equity=10_000.0, available=0.0
+        )
+        assert not result.success
+        assert client.orders == [], "an unaffordable order reached the exchange"
+
+
 class TestUnconfirmedFillEntersSafeMode:
     async def test_an_order_that_never_settles_enters_safe_mode(self, repos, capabilities):
         breakers = CircuitBreakers(SafetyConfig())

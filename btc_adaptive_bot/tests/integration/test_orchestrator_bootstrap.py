@@ -96,14 +96,30 @@ class MockRestClient:
             candles = [c for c in candles if c.open_ms <= end_ms]
         return candles[-limit:]
 
+    def set_balance(
+        self, *, usdt: float, btc_usd: float = 0.0, eth_usd: float = 0.0
+    ) -> None:
+        """Model a realistic demo account: mostly assets that are not USDT."""
+        self._usdt = usdt
+        self._btc_usd = btc_usd
+        self._eth_usd = eth_usd
+        self._equity = usdt + btc_usd + eth_usd
+
     async def get_wallet_balance(self) -> WalletBalance:
         self.calls.append("balance")
+        usdt = getattr(self, "_usdt", self._equity)
+        coins: dict[str, dict[str, float]] = {
+            "USDT": {"eq": usdt, "availEq": usdt, "cashBal": usdt, "eqUsd": usdt},
+        }
+        if getattr(self, "_btc_usd", 0.0):
+            coins["BTC"] = {"eq": 0.5, "availEq": 0.5, "eqUsd": self._btc_usd}
+        if getattr(self, "_eth_usd", 0.0):
+            coins["ETH"] = {"eq": 5.0, "availEq": 5.0, "eqUsd": self._eth_usd}
         return WalletBalance(
             total_equity=self._equity,
-            total_available=self._equity,
+            total_available=usdt,
             unrealized_pnl=0.0,
-            coins={"USDT": {"eq": self._equity, "availEq": self._equity,
-                            "eqUsd": self._equity}},
+            coins=coins,
             ts_ms=now_ms(),
         )
 
@@ -262,6 +278,28 @@ class TestBootstrap:
         finally:
             await orchestrator.shutdown()
 
+    async def test_research_equity_is_capped_and_usdt_only(
+        self, monkeypatch, loaded_config, perp_instrument
+    ):
+        """An $84,000 account with $10,000 USDT runs on $10,000."""
+        from btcbot.app.orchestrator import Orchestrator
+
+        mock = _patch_client(monkeypatch, perp_instrument)
+        mock.set_balance(usdt=10_000.0, btc_usd=59_000.0, eth_usd=15_000.0)
+        orchestrator = Orchestrator(loaded_config, _credentials())
+        try:
+            await orchestrator.bootstrap()
+            ledger = orchestrator.research_equity
+
+            assert ledger.actual_total_equity == pytest.approx(84_000.0)
+            assert ledger.actual_usdt_equity == pytest.approx(10_000.0)
+            assert ledger.cap_usdt == pytest.approx(10_000.0)
+            # Before the experiment starts nothing is fixed yet; the account has
+            # only been observed.
+            assert ledger.starting_equity == 0.0
+        finally:
+            await orchestrator.shutdown()
+
     async def test_bootstrap_without_credentials_leaves_demo_unverified(
         self, monkeypatch, loaded_config, perp_instrument
     ):
@@ -401,6 +439,19 @@ class TestDryRunDoesNotStartTheTimer:
             # The instrument panel reflects the discovered contract spec.
             assert state["instrument"]["inst_id"] == orchestrator._inst_id  # noqa: SLF001
             assert state["instrument"]["margin_mode"] == "isolated"
+            # Requirement: the five equity figures are shown separately and
+            # never conflated with each other.
+            equity = state["research_equity"]
+            for key in (
+                "actual_total_equity", "actual_available_usdt",
+                "starting_equity", "current_equity", "cap_usdt",
+            ):
+                assert key in equity, key
+            assert equity["cap_usdt"] == 10_000.0
+            # The account panel reports RESEARCH equity, with the real account
+            # alongside it under an unambiguous name.
+            assert state["demo_account"]["equity"] == equity["current_equity"]
+            assert state["demo_account"]["actual_total_equity"] == equity["actual_total_equity"]
             assert state["demo_account"]["risk_state"]["state"]
             json.dumps(state, default=str)
         finally:

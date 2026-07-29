@@ -273,6 +273,30 @@ else
   failure "the position-size clamp is missing"
 fi
 
+# The research ledger must never derive its capital from the account total.
+# `totalEq` values BTC, ETH, OKB and anything else the demo account holds.
+if grep -q 'total_equity' src/btcbot/execution/research_equity.py &&
+   ! grep -qE '(starting_equity|current_equity)[^=]*=[^=]*total_equity' \
+       src/btcbot/execution/research_equity.py; then
+  pass "research equity is never derived from OKX totalEq"
+else
+  failure "research equity appears to be derived from the account total"
+fi
+
+if grep -q 'RESEARCH_CURRENCY = "USDT"' src/btcbot/execution/research_equity.py &&
+   grep -q 'research_equity_cap_usdt' src/btcbot/config/schema.py; then
+  pass "research capital is USDT-only and capped by configuration"
+else
+  failure "the research-equity cap or its USDT restriction is missing"
+fi
+
+if grep -q 'equity=self.research_equity.current_equity' src/btcbot/app/orchestrator.py &&
+   grep -q 'equity=research.current_equity' src/btcbot/app/orchestrator.py; then
+  pass "risk state and order sizing both read research equity, not totalEq"
+else
+  failure "an order or risk path still sizes from the OKX account total"
+fi
+
 if grep -q '_set_and_confirm_leverage' src/btcbot/execution/demo_executor.py &&
    grep -q 'get_leverage_info' src/btcbot/execution/demo_executor.py; then
   pass "leverage is set AND confirmed before every entry"

@@ -189,6 +189,31 @@ reported "no fill matched the client order ID". Two causes, both real:
 - [x] Smoke test PASSES on order-details proof; a delayed per-fill record is `[WARN]`
 - [x] `tests/unit/test_fill_reconciliation.py` (36) + executor scenarios + audit checks
 
+## Phase R8 — Research-equity cap  `[x]`
+
+The demo account holds BTC, ETH and other assets, so OKX's `totalEq` (~$84,000) is not
+the experiment's capital. Sizing from it would let a BTC price move resize every
+position and a deposit raise the risk budget, and would make the 14-day "return" a
+measurement of the account rather than the strategies.
+
+**Design.** The research ledger reads the account **exactly once**, at experiment start:
+`starting = min(execution.research_equity_cap_usdt, usable USDT)`. After that it moves
+only by bot-attributable PnL, fees and funding. Because nothing re-reads the account,
+external changes are structurally incapable of touching it — there is no clamp to defeat.
+
+- [x] `execution.research_equity_cap_usdt` (default 10,000) + `risk.weekly_loss_limit_pct`
+- [x] `execution/research_equity.py`: USDT-only ledger, `start`/`restore`/`observe_balance`,
+      `components_from_records` (grosses closed PnL back up so fees count once)
+- [x] Migration 5: `research_equity_snapshots` table + the two `experiments` columns, so a
+      restart resumes the same ledger instead of re-baselining
+- [x] Orchestrator feeds research equity to risk state, sizing, leverage and the allocator;
+      `available` stays the REAL usable USDT so margin is still checked against the account
+- [x] Startup banner: "Research capital used by bot: $X" / "Other OKX Demo assets: EXCLUDED"
+- [x] Dashboard shows the five figures separately; reports and Day-14 metrics use research
+      capital; `weekly_loss_limit_pct` added alongside the daily limit
+- [x] `tests/unit/test_research_equity.py` (50) + orchestrator, restart and sizing tests;
+      3 new audit checks
+
 ---
 
 # Part I — Bybit Demo build (historical record, complete)

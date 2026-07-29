@@ -13,6 +13,12 @@ experiment:
 # concurrently, and a real demo order whenever a qualifying setup appears. Trade
 # frequency is governed by setup availability, cooldowns and risk — not by an
 # artificial per-day cap.
+# The 14-day experiment runs on exactly this much USDT, whatever else the demo
+# account happens to hold. See execution.research_equity_cap_usdt in
+# default.yaml for the full rationale.
+execution:
+  research_equity_cap_usdt: 10000
+
 allocator:
   forced_exploration_ratio: 0.3
   max_demo_orders_per_hour: 12

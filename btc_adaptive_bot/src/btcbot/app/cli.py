@@ -184,11 +184,23 @@ async def cmd_status(args: argparse.Namespace) -> int:
             f"Demo orders     {len(demo_orders)}",
             f"Outages         {len(outages)}",
         ]
+        research = repos.research_equity.latest(experiment["experiment_id"])
+        if research:
+            lines.append(
+                f"Research equity ${float(research['current_equity']):,.2f} "
+                f"(start ${float(research['starting_equity']):,.2f}, "
+                f"cap ${float(research['cap_usdt']):,.2f})"
+            )
+        else:
+            lines.append(
+                "Research equity "
+                f"${float(experiment['starting_research_equity_usdt'] or 0.0):,.2f} (start)"
+            )
         if balance:
-            lines.append(f"Demo equity     ${float(balance['total_equity']):,.2f}")
-        lines.append(
-            f"Start equity    ${float(experiment['starting_demo_equity']):,.2f}"
-        )
+            # The whole account, including assets the experiment never touches.
+            lines.append(
+                f"OKX total equity ${float(balance['total_equity']):,.2f} (all assets, unused)"
+            )
         if champion:
             lines.extend(
                 [

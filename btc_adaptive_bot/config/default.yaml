@@ -55,6 +55,27 @@ exchange:
   ws_ping_interval_seconds: 20
   ws_reconnect_max_backoff_seconds: 60
 
+execution:
+  # HARD CAP on the capital this research experiment may use, in USDT.
+  #
+  # The OKX Demo account may hold anything — BTC, ETH, OKB, AED, leftovers
+  # from manual trades. None of it belongs to this experiment. At the start of
+  # a new 14-day run the bot takes:
+  #
+  #     starting research equity = min(research_equity_cap_usdt, usable USDT)
+  #
+  # and thereafter tracks its own ledger: starting capital plus this bot's
+  # realised and unrealised PnL, minus its fees, plus its funding. The account
+  # is never re-read for sizing, so deposits, unrelated holdings and manual
+  # trades cannot raise the research budget.
+  #
+  # If the account holds slightly less than the cap (smoke-test fees, say),
+  # the actual usable USDT is used — that is not an error.
+  #
+  # Real balances are still read continuously, and available USDT is still
+  # checked before every order.
+  research_equity_cap_usdt: 10000
+
 data:
   candle_buffer: 1500
   history_days: 400
@@ -95,8 +116,11 @@ risk:
   min_stop_distance_pct: 0.0008
   min_stop_distance_atr_mult: 0.15
   max_stop_distance_pct: 0.15
-  # Equity protection for the demo account.
+  # Equity protection. Both limits are measured against RESEARCH equity
+  # (execution.research_equity_cap_usdt), never against the OKX account total —
+  # an unrelated BTC price move must not widen or narrow them.
   daily_loss_limit_pct: 0.10
+  weekly_loss_limit_pct: 0.20
   drawdown_derisk_threshold_pct: 0.08
   drawdown_derisk_factor: 0.5
   # Confidence scaling band applied to the normal risk figure.

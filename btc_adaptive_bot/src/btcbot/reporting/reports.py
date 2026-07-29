@@ -100,8 +100,14 @@ class ReportGenerator:
             "",
             "## OKX Demo (Layer 3)",
             "",
-            f"- **Current equity:** ${float(balance['total_equity']):,.2f}" if balance else "- Balance unavailable",
-            f"- **Starting equity:** ${state.starting_demo_equity:,.2f}",
+            # Research capital, not the account: every percentage in this
+            # report is a percentage of what the bot was actually given.
+            f"- **Research starting equity:** ${state.starting_research_equity_usdt:,.2f} "
+            f"(cap ${state.research_equity_cap_usdt:,.2f}, USDT only — other assets excluded)",
+            f"- **Actual OKX total equity:** ${float(balance['total_equity']):,.2f} "
+            "(all assets; not used for sizing)"
+            if balance
+            else "- Actual OKX balance unavailable",
             f"- **Realised demo PnL:** ${demo_pnl:+,.2f}",
             f"- **Demo trades closed:** {len(demo_positions)} ({demo_wins} winners)",
             "",
@@ -439,7 +445,9 @@ class ReportGenerator:
             f"| Scheduled end | {iso(state.scheduled_end)} |",
             f"| Duration | {state.duration_days} calendar days |",
             f"| Primary market | {state.primary_symbol} ({state.demo_category}) |",
-            f"| Starting demo equity | ${state.starting_demo_equity:,.2f} |",
+            f"| Research starting equity | ${state.starting_research_equity_usdt:,.2f} (USDT only) |",
+            f"| Research equity cap | ${state.research_equity_cap_usdt:,.2f} |",
+            f"| Actual OKX equity at start | ${state.starting_demo_equity:,.2f} (all assets, unused) |",
             f"| Shadow equity per strategy | ${state.shadow_equity_per_strategy:,.2f} |",
             f"| Strategies | {len(state.enabled_strategies)} |",
             f"| Config hash | `{state.config_hash}` |",

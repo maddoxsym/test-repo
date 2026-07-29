@@ -163,11 +163,32 @@ function render(d){
     ));
   }
 
-  const a=d.demo_account||{};
-  cards.push(card('OKX Demo',
-    row('Equity', money(a.equity))+
-    row('Available', money(a.available))+
-    row('Starting', money(a.starting_equity))+
+  const a=d.demo_account||{}, re=d.research_equity||{};
+  // The account the bot is allowed to use, and the account it happens to sit in.
+  // Shown as two separate blocks so they can never be read as one number.
+  cards.push(card('Research equity (what the bot uses)',
+    row('Research equity cap', money(re.cap_usdt))+
+    row('Research starting equity', money(re.starting_equity))+
+    row('Current research equity', money(re.current_equity), re.current_equity>=re.starting_equity?'ok':'bad')+
+    row('Research P&amp;L', money(re.net_pnl)+' ('+pct(re.return_pct)+')', re.net_pnl>=0?'ok':'bad')+
+    row('Peak', money(re.peak_equity))+
+    row('Drawdown', pct(re.drawdown_pct), re.drawdown_pct>5?'warn':'')+
+    row('Realised / unrealised', money(re.realized_pnl)+' / '+money(re.unrealized_pnl))+
+    row('Fees / funding', money(re.fees)+' / '+money(re.funding))
+  ));
+
+  cards.push(card('Actual OKX account (not used for sizing)',
+    row('Actual OKX total equity', money(re.actual_total_equity))+
+    row('Actual available USDT', money(re.actual_available_usdt))+
+    row('Actual USDT equity', money(re.actual_usdt_equity))+
+    row('Excluded from research', money(re.excluded_equity), 'warn')+
+    row('Other assets', '<span class="tag">EXCLUDED</span>')
+  ));
+
+  cards.push(card('OKX Demo positions',
+    row('Equity (research)', money(a.equity))+
+    row('Available USDT (actual)', money(a.available))+
+    row('Starting (research)', money(a.starting_equity))+
     row('Realised PnL', money(a.realized_pnl), a.realized_pnl>=0?'ok':'bad')+
     row('Drawdown', pct(a.drawdown_pct), a.drawdown_pct>5?'warn':'')+
     row('Open positions', (a.positions||[]).length)+

@@ -40,6 +40,10 @@ from ..execution.allocator import DemoAllocator
 from ..execution.demo_executor import DemoExecutor
 from ..execution.order_safety import OrderSafetyGuard
 from ..execution.position_ledger import PositionLedger
+from ..execution.research_equity import (
+    ResearchEquityLedger,
+    components_from_records,
+)
 from ..execution.trade_manager import TradeManager
 from ..features.engine import FeatureEngine, MultiTimeframeFeatures
 from ..learning.loss_analysis import ConfidenceCalibrator, LossAnalyzer
@@ -67,7 +71,6 @@ from ..utils.errors import (
 from ..utils.ids import setup_id as make_setup_id
 from ..utils.ids import signal_id as make_signal_id
 from ..utils.logging import get_logger
-from ..utils.numeric import safe_div
 from ..utils.timeutil import interval_seconds, iso, now_utc
 from .experiment import ExperimentManager, ExperimentMode, Preconditions
 
@@ -134,10 +137,17 @@ class Orchestrator:
         self._tasks: list[asyncio.Task[Any]] = []
         self._bar_queue: asyncio.Queue[tuple[str, Candle]] = asyncio.Queue(maxsize=500)
         self._current_regime: RegimeSnapshot | None = None
+        # The OKX account totals. Read continuously; used for margin checks,
+        # liquidation monitoring and display — NEVER for sizing or scoring.
         self._equity = 0.0
         self._available = 0.0
         self._starting_equity = 0.0
         self._peak_equity = 0.0
+        # The capped, USDT-only capital this experiment actually runs on.
+        # Everything that sizes, scores or limits reads from here.
+        self.research_equity = ResearchEquityLedger(
+            cap_usdt=self.config.execution.research_equity_cap_usdt
+        )
         self._last_report_day = 0
         self._outage_id: int | None = None
         self._shutdown_event = asyncio.Event()
@@ -220,19 +230,24 @@ class Orchestrator:
             balance = await self.client.get_wallet_balance()
             self._equity = balance.total_equity
             self._available = balance.total_available or balance.total_equity
-            log.info("BALANCE", f"${self._equity:,.2f}")
+            self.research_equity.observe_balance(balance)
             log.info(
                 "BALANCE",
-                f"Expected research capital: ${self.config.experiment.expected_demo_equity:,.2f} | "
-                f"Actual OKX Demo capital: ${self._equity:,.2f}",
+                f"OKX account total (all assets): ${self._equity:,.2f} | "
+                f"usable USDT: ${self.research_equity.actual_usdt_equity:,.2f}",
             )
-            if abs(self._equity - self.config.experiment.expected_demo_equity) > 1.0:
-                log.info(
+            log.info(
+                "BALANCE",
+                f"Research equity cap: ${self.research_equity.cap_usdt:,.2f} — only USDT "
+                "counts toward research capital; BTC/ETH/OKB and any other asset are "
+                "excluded from sizing, limits and performance.",
+            )
+            if self.research_equity.actual_usdt_equity <= 0:
+                log.warning(
                     "BALANCE",
-                    "Actual demo balance differs from the expected figure — the actual "
-                    "balance is what the demo execution engine will use.",
+                    "No usable USDT in the demo account — research capital would be $0. "
+                    "Top up USDT in the OKX Demo Trading UI.",
                 )
-            self.risk_state.start_of_day(self._equity)
         else:
             log.warning("BALANCE", "Demo balance unavailable (not verified) — demo layer disabled")
 
@@ -358,10 +373,16 @@ class Orchestrator:
             )
 
         capabilities = self.discovery.capabilities
+        # Fix the research capital BEFORE the experiment row is written, so the
+        # figure that gets persisted is the one the bot will actually use.
+        proposed_research_equity = min(
+            self.research_equity.cap_usdt, self.research_equity.actual_usdt_equity
+        )
         state = self.experiment.start_or_resume(
             mode=self.mode,
             preconditions=preconditions,
             starting_demo_equity=self._equity,
+            starting_research_equity_usdt=proposed_research_equity,
             enabled_strategies=self.registry.ids,
             strategy_versions=self.registry.version_map(),
             demo_category=capabilities.primary.inst_type.value,
@@ -370,15 +391,44 @@ class Orchestrator:
         self._starting_equity = state.starting_demo_equity or self._equity
         self._peak_equity = max(self._equity, self._starting_equity)
 
+        if state.resumed and state.starting_research_equity_usdt > 0:
+            # Resume the SAME ledger. Re-deriving it from today's balance would
+            # silently re-baseline the experiment and erase its losses.
+            self.research_equity.restore(state.starting_research_equity_usdt)
+            log.info(
+                "EQUITY",
+                f"Resumed research ledger — starting capital "
+                f"${state.starting_research_equity_usdt:,.2f} (unchanged by restart)",
+            )
+        else:
+            # A new experiment (or one predating the research ledger): read the
+            # account once and cap it. This is the only account read that ever
+            # sets research capital.
+            self.research_equity.start(await self.client.get_wallet_balance())
+        self.risk_state.start_of_day(self.research_equity.current_equity)
+        self.risk_state.start_of_week(self.research_equity.current_equity)
+
         if not state.resumed:
             log.banner(
                 self.experiment.start_banner(
-                    strategy_count=len(self.registry), actual_equity=self._equity
+                    strategy_count=len(self.registry),
+                    actual_equity=self._equity,
+                    research_equity=self.research_equity.snapshot(),
                 ),
                 tag="START",
             )
         await self._init_layers(state.experiment_id)
         await self._reconcile()
+        # Rebuild the ledger's bot-attributable components from persisted
+        # records. Deterministic, so a restart lands on the same number.
+        self._refresh_research_equity()
+        log.info(
+            "EQUITY",
+            f"Research equity ${self.research_equity.current_equity:,.2f} "
+            f"(start ${self.research_equity.starting_equity:,.2f}, cap "
+            f"${self.research_equity.cap_usdt:,.2f}) — OKX account total "
+            f"${self._equity:,.2f} is NOT used for sizing",
+        )
 
         self.reports = ReportGenerator(self.repos, self.config, registry=self.registry)
         await self.notifications.notify(
@@ -435,6 +485,54 @@ class Orchestrator:
         self.news.restore_influence()
 
     # =================================================================
+    #  RESEARCH EQUITY
+    # =================================================================
+
+    def _refresh_research_equity(self, *, mark_price: float | None = None) -> float:
+        """Recompute the bot-attributable components from persisted records.
+
+        Absolute totals, not deltas, so this is idempotent — calling it after
+        every fill, close and price update converges on the same number a
+        restart would rebuild.
+        """
+        if not (self.repos and self.experiment and self.experiment.state):
+            return self.research_equity.current_equity
+        experiment_id = self.experiment.state.experiment_id
+        price = mark_price if mark_price is not None else self.store.last_price if self.store else 0.0
+
+        unrealized = 0.0
+        if self.ledger is not None and price > 0:
+            unrealized = sum(
+                position.unrealized_pnl(price) for position in self.ledger.open_positions()
+            )
+
+        components = components_from_records(
+            closed_positions=self.repos.positions.closed_positions(experiment_id),
+            open_positions=self.repos.positions.open_positions(),
+            unrealized_pnl=unrealized,
+            funding=self.repos.funding.total_for_experiment(experiment_id),
+        )
+        return self.research_equity.apply(components)
+
+    def _persist_research_equity(self) -> None:
+        """Write one research-equity snapshot alongside the balance snapshot."""
+        if not (self.repos and self.experiment and self.experiment.state):
+            return
+        self.repos.research_equity.record(
+            self.experiment.state.experiment_id,
+            {
+                key: value
+                for key, value in self.research_equity.snapshot().as_dict().items()
+                if key
+                in (
+                    "cap_usdt", "starting_equity", "current_equity", "peak_equity",
+                    "realized_pnl", "unrealized_pnl", "fees", "funding",
+                    "actual_total_equity", "actual_available_usdt", "actual_usdt_equity",
+                )
+            },
+        )
+
+    # =================================================================
     #  RECONCILIATION
     # =================================================================
 
@@ -463,6 +561,8 @@ class Orchestrator:
         self._equity = balance.total_equity
         self._available = balance.total_available or balance.total_equity
         self._peak_equity = max(self._peak_equity, self._equity)
+        # Real account figures only — this never moves research equity.
+        self.research_equity.observe_balance(balance)
         self.repos.market.record_balance(
             {
                 "experiment_id": self.experiment.require_state().experiment_id,
@@ -476,6 +576,9 @@ class Orchestrator:
                 "source": "rest",
             }
         )
+        # The research figure is written alongside it, so the two can always be
+        # compared after the fact rather than inferred.
+        self._persist_research_equity()
 
         # Backfill any fills we missed while offline — idempotent by execId.
         for execution in executions:
@@ -653,6 +756,9 @@ class Orchestrator:
                 await self._manage_open_positions(price)
                 if self.shadow:
                     self.shadow.mark_to_market(price)
+                # Mark research equity to the same price. Only the bot's own
+                # open positions move it — the account's other assets do not.
+                self._refresh_research_equity(mark_price=price)
 
     async def _on_orderbook(self, data: dict[str, Any], msg_type: str) -> None:
         assert self.store
@@ -703,6 +809,9 @@ class Orchestrator:
                 self._peak_equity = max(self._peak_equity, self._equity)
             if balance.total_available > 0:
                 self._available = balance.total_available
+            # Deposits, transfers and unrelated asset moves land here and go no
+            # further: research equity is not derived from the account.
+            self.research_equity.observe_balance(balance)
 
     async def _on_position(self, data: list[dict[str, Any]]) -> None:
         """Private ``positions`` channel — liquidation-protection monitoring."""
@@ -906,8 +1015,11 @@ class Orchestrator:
         assert self.allocator and self.executor and self.ledger and self.store
 
         # --- decision engine layers 1–7 (per candidate, journaled) --------
+        # Research equity, never the OKX account total: an unrelated BTC move
+        # must not widen or narrow the loss limits.
         risk_state = self.risk_state.evaluate(
-            equity=self._equity, peak_equity=self._peak_equity
+            equity=self.research_equity.current_equity,
+            peak_equity=self.research_equity.peak_equity
         )
         health = self.store.health()
         context = self._build_context()
@@ -968,15 +1080,19 @@ class Orchestrator:
             signal.bar_open_ms, signal.direction.value,
         )
         news_state = self.news.state_at() if self.news else None
-        drawdown = safe_div(self._peak_equity - self._equity, self._peak_equity)
+        research = self.research_equity.snapshot()
+        drawdown = research.drawdown_pct
 
         result = await self.executor.submit_entry(
             signal,
             setup_id=setup_uid,
             signal_id=signal_uid,
             capabilities=self.discovery.capabilities,
-            equity=self._equity,
-            available=self._available,
+            # Sizing, risk-per-trade and leverage all derive from research
+            # equity. `available` stays the REAL usable USDT, because that is
+            # what actually has to cover the margin.
+            equity=research.current_equity,
+            available=self.research_equity.actual_available_usdt or self._available,
             atr=atr if atr == atr else 0.0,
             expectancy_r=arm.demo_expectancy if arm else 0.0,
             observations=arm.demo_observations if arm else 0,
@@ -1713,14 +1829,28 @@ class Orchestrator:
             },
             "experiment": state.as_dict() if state else None,
             "instrument": instrument_panel,
+            # The research ledger — what the bot actually runs on. Rendered
+            # side by side with the real account so the two are never confused.
+            "research_equity": self.research_equity.snapshot().as_dict(),
             "demo_account": {
-                "equity": round(self._equity, 2),
-                "available": round(self._available, 2),
-                "starting_equity": round(self._starting_equity, 2),
-                "realized_pnl": round(self._equity - self._starting_equity, 2),
-                "peak_equity": round(self._peak_equity, 2),
+                # These four are the RESEARCH figures: every percentage the
+                # dashboard shows is a percentage of research capital.
+                "equity": round(self.research_equity.current_equity, 2),
+                "available": round(self.research_equity.actual_available_usdt, 2),
+                "starting_equity": round(self.research_equity.starting_equity, 2),
+                "realized_pnl": round(
+                    self.research_equity.current_equity
+                    - self.research_equity.starting_equity,
+                    2,
+                ),
+                "peak_equity": round(self.research_equity.peak_equity, 2),
                 "drawdown_pct": round(
-                    safe_div(self._peak_equity - self._equity, self._peak_equity) * 100, 2
+                    self.research_equity.snapshot().drawdown_pct * 100, 2
+                ),
+                # The real account, kept adjacent and clearly labelled.
+                "actual_total_equity": round(self._equity, 2),
+                "actual_available_usdt": round(
+                    self.research_equity.actual_available_usdt, 2
                 ),
                 "positions": self.ledger.snapshot() if self.ledger else [],
                 "margin_ratio": self._latest_margin_ratio,

@@ -150,6 +150,19 @@ class LeverageConfig(StrictModel):
         return self
 
 
+class ExecutionConfig(StrictModel):
+    """How much of the OKX Demo account this research experiment may use.
+
+    The demo account may hold anything — BTC, ETH, OKB, AED, leftovers from
+    manual experiments. None of it belongs to this research run. The bot sizes
+    every trade from a **research equity ledger** denominated in USDT and
+    capped here, never from OKX's ``totalEq``. See
+    ``execution/research_equity.py``.
+    """
+
+    research_equity_cap_usdt: float = Field(10_000.0, gt=0, le=10_000_000)
+
+
 class RiskConfig(StrictModel):
     # Present for transparency; may not be changed — this system never falls
     # back to cross margin, silently or otherwise.
@@ -164,6 +177,9 @@ class RiskConfig(StrictModel):
     min_stop_distance_atr_mult: float = Field(0.15, gt=0, le=5)
     max_stop_distance_pct: float = Field(0.15, gt=0, le=0.9)
     daily_loss_limit_pct: float = Field(0.10, gt=0, le=1.0)
+    # Both loss limits are measured against **research** equity, never against
+    # the OKX account total — see ExecutionConfig.
+    weekly_loss_limit_pct: float = Field(0.20, gt=0, le=1.0)
     drawdown_derisk_threshold_pct: float = Field(0.08, gt=0, le=1.0)
     drawdown_derisk_factor: float = Field(0.5, gt=0, le=1.0)
     confidence_size_floor: float = Field(0.6, gt=0, le=1.0)
@@ -171,6 +187,11 @@ class RiskConfig(StrictModel):
 
     @model_validator(mode="after")
     def _ordering(self) -> RiskConfig:
+        if self.weekly_loss_limit_pct < self.daily_loss_limit_pct:
+            raise ValueError(
+                "weekly_loss_limit_pct must be at least daily_loss_limit_pct "
+                f"(got {self.weekly_loss_limit_pct} < {self.daily_loss_limit_pct})"
+            )
         if not (self.min_risk_pct <= self.normal_risk_pct <= self.max_risk_pct):
             raise ValueError(
                 "risk percentages must satisfy min_risk_pct <= normal_risk_pct <= max_risk_pct "
@@ -442,6 +463,7 @@ class AppConfig(StrictModel):
     exchange: ExchangeConfig = ExchangeConfig()
     data: DataConfig = DataConfig()
     risk: RiskConfig = RiskConfig()
+    execution: ExecutionConfig = ExecutionConfig()
     shadow: ShadowConfig = ShadowConfig()
     allocator: AllocatorConfig = AllocatorConfig()
     backtesting: BacktestingConfig = BacktestingConfig()

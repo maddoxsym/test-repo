@@ -599,7 +599,53 @@ MIGRATIONS: tuple[Migration, ...] = (
         """,
         python=lambda db: _okx_columns(db),
     ),
+    Migration(
+        version=5,
+        name="research_equity_ledger",
+        sql="""
+        -- ============ research equity snapshots ============
+        -- The experiment's own capital over time, in USDT, independent of the
+        -- OKX account total. Written alongside the balance snapshots so the
+        -- two can be compared after the fact: `actual_total_equity` is the
+        -- whole demo account (BTC, ETH, OKB, whatever), `current_equity` is
+        -- only what this bot did with its capped starting capital.
+        CREATE TABLE IF NOT EXISTS research_equity_snapshots (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id         TEXT NOT NULL,
+            ts_utc                TEXT NOT NULL,
+            cap_usdt              REAL NOT NULL,
+            starting_equity       REAL NOT NULL,
+            current_equity        REAL NOT NULL,
+            peak_equity           REAL NOT NULL,
+            realized_pnl          REAL NOT NULL DEFAULT 0,
+            unrealized_pnl        REAL NOT NULL DEFAULT 0,
+            fees                  REAL NOT NULL DEFAULT 0,
+            funding               REAL NOT NULL DEFAULT 0,
+            actual_total_equity   REAL NOT NULL DEFAULT 0,
+            actual_available_usdt REAL NOT NULL DEFAULT 0,
+            actual_usdt_equity    REAL NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_research_equity_ts
+            ON research_equity_snapshots(experiment_id, ts_utc);
+        """,
+        python=lambda db: _research_equity_columns(db),
+    ),
 )
+
+
+def _research_equity_columns(db: Database) -> None:
+    """The experiment's capped starting capital, persisted for restart.
+
+    Recomputing it from the live balance on every restart would silently
+    re-baseline the experiment: a losing day would vanish and the 14-day
+    return would be measured from the wrong number.
+    """
+    _add_column_if_missing(
+        db, "experiments", "research_equity_cap_usdt", "REAL NOT NULL DEFAULT 10000"
+    )
+    _add_column_if_missing(
+        db, "experiments", "starting_research_equity_usdt", "REAL NOT NULL DEFAULT 0"
+    )
 
 
 def _okx_columns(db: Database) -> None:

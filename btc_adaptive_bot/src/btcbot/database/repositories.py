@@ -51,12 +51,14 @@ class ExperimentRepository(BaseRepository):
             INSERT INTO experiments (
                 experiment_id, name, mode, status, start_ts_utc, scheduled_end_ts_utc,
                 actual_end_ts_utc, duration_days, starting_demo_equity, expected_demo_equity,
+                research_equity_cap_usdt, starting_research_equity_usdt,
                 shadow_equity_per_strategy, enabled_strategies, strategy_versions, config_hash,
                 software_version, git_commit, primary_symbol, demo_category, outage_policy,
                 metadata, created_at
             ) VALUES (
                 :experiment_id, :name, :mode, :status, :start_ts_utc, :scheduled_end_ts_utc,
                 :actual_end_ts_utc, :duration_days, :starting_demo_equity, :expected_demo_equity,
+                :research_equity_cap_usdt, :starting_research_equity_usdt,
                 :shadow_equity_per_strategy, :enabled_strategies, :strategy_versions, :config_hash,
                 :software_version, :git_commit, :primary_symbol, :demo_category, :outage_policy,
                 :metadata, :created_at
@@ -1353,6 +1355,43 @@ class FundingRepository(BaseRepository):
         return [dict(row) for row in rows]
 
 
+class ResearchEquityRepository(BaseRepository):
+    """The experiment's own capital over time, separate from the account total."""
+
+    def record(self, experiment_id: str, snapshot: dict[str, Any]) -> None:
+        self.db.execute(
+            """
+            INSERT INTO research_equity_snapshots (
+                experiment_id, ts_utc, cap_usdt, starting_equity, current_equity,
+                peak_equity, realized_pnl, unrealized_pnl, fees, funding,
+                actual_total_equity, actual_available_usdt, actual_usdt_equity
+            ) VALUES (
+                :experiment_id, :ts_utc, :cap_usdt, :starting_equity, :current_equity,
+                :peak_equity, :realized_pnl, :unrealized_pnl, :fees, :funding,
+                :actual_total_equity, :actual_available_usdt, :actual_usdt_equity
+            )
+            """,
+            {"experiment_id": experiment_id, "ts_utc": iso(now_utc()), **snapshot},
+        )
+
+    def latest(self, experiment_id: str) -> dict[str, Any] | None:
+        return row_to_dict(
+            self.db.query_one(
+                "SELECT * FROM research_equity_snapshots WHERE experiment_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (experiment_id,),
+            )
+        )
+
+    def series(self, experiment_id: str, limit: int = 500) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM research_equity_snapshots WHERE experiment_id = ? "
+            "ORDER BY ts_utc LIMIT ?",
+            (experiment_id, limit),
+        )
+        return [dict(row) for row in rows]
+
+
 class Repositories:
     """Convenience bundle passed around the engine."""
 
@@ -1374,3 +1413,4 @@ class Repositories:
         self.leverage = LeverageDecisionRepository(db)
         self.rejected = RejectedSignalRepository(db)
         self.funding = FundingRepository(db)
+        self.research_equity = ResearchEquityRepository(db)

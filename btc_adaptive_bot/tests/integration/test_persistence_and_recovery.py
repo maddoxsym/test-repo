@@ -242,6 +242,75 @@ class TestExperimentTimer:
         assert resumed.resumed is True
         # The originally recorded starting equity must not be overwritten.
         assert math.isclose(resumed.starting_demo_equity, 10_000.0)
+        # Nor may the research ledger be re-baselined: doing so on every restart
+        # would silently erase the experiment's losses.
+        assert math.isclose(
+            resumed.starting_research_equity_usdt,
+            original.starting_research_equity_usdt,
+        )
+        assert math.isclose(resumed.research_equity_cap_usdt, 10_000.0)
+
+    def test_the_research_ledger_survives_a_restart_with_its_pnl(self, repos, app_config):
+        """The whole point of persisting the starting figure."""
+        from btcbot.execution.research_equity import (
+            ResearchEquityLedger,
+            components_from_records,
+        )
+
+        manager = ExperimentManager(
+            repos.experiments, repos.system, app_config, config_hash="restart"
+        )
+        state = manager.start_or_resume(
+            mode=ExperimentMode.RESEARCH, preconditions=_met(),
+            starting_demo_equity=84_000.0, starting_research_equity_usdt=10_000.0,
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"},
+            demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
+        )
+        assert math.isclose(state.starting_research_equity_usdt, 10_000.0)
+
+        # The bot loses $1,500 (net of $40 of fees), then the process restarts.
+        repos.positions.open({
+            "position_id": "p1", "experiment_id": state.experiment_id,
+            "strategy_id": "s1", "strategy_version": "1.0", "setup_id": "set1",
+            "signal_id": "sig1", "symbol": "BTC-USDT-SWAP", "category": "SWAP",
+            "direction": "long", "reason": "test", "opened_ts_utc": "2026-07-29T00:00:00Z",
+            "entry_price": 100_000.0, "quantity": 0.1, "remaining_qty": 0.1,
+            "stop_price": 99_000.0, "target_price": 102_000.0, "planned_exit": "stop",
+            "entry_order_id": "o1", "entry_regime": "TREND_UP", "news_state": None,
+            "confidence": 0.7, "fees": 0.0,
+        })
+        repos.positions.close("p1", {
+            "closed_ts_utc": "2026-07-29T01:00:00Z", "exit_price": 98_500.0,
+            "realized_pnl": -1_500.0, "r_multiple": -1.5, "mfe": 0.0, "mae": -1_500.0,
+            "exit_reason": "stop", "exit_order_id": "o2", "fees": 40.0,
+        })
+
+        resumed_state = ExperimentManager(
+            repos.experiments, repos.system, app_config, config_hash="restart"
+        ).start_or_resume(
+            mode=ExperimentMode.RESEARCH, preconditions=_met(),
+            starting_demo_equity=999_999.0,          # the account has since moved
+            starting_research_equity_usdt=999_999.0,  # and would re-cap wrongly
+            enabled_strategies=["s1"], strategy_versions={"s1": "1.0"},
+            demo_category="SWAP", primary_symbol="BTC-USDT-SWAP",
+        )
+        assert resumed_state.resumed
+        assert math.isclose(resumed_state.starting_research_equity_usdt, 10_000.0)
+
+        ledger = ResearchEquityLedger(cap_usdt=resumed_state.research_equity_cap_usdt)
+        ledger.restore(resumed_state.starting_research_equity_usdt)
+        ledger.apply(
+            components_from_records(
+                closed_positions=repos.positions.closed_positions(state.experiment_id),
+                open_positions=repos.positions.open_positions(),
+                funding=repos.funding.total_for_experiment(state.experiment_id),
+            )
+        )
+        assert math.isclose(ledger.current_equity, 8_500.0), "the loss must survive the restart"
+        assert math.isclose(ledger.fees, 40.0)
+        # And the 14-day timer is untouched by any of it.
+        assert resumed_state.start == state.start
+        assert resumed_state.scheduled_end == state.scheduled_end
 
     def test_many_restarts_never_move_the_clock(self, repos, app_config):
         manager = ExperimentManager(repos.experiments, repos.system, app_config, config_hash="h")

@@ -27,6 +27,7 @@ from typing import Any
 
 from ..config.schema import AppConfig
 from ..database.repositories import ExperimentRepository, SystemRepository
+from ..execution.research_equity import ResearchEquitySnapshot
 from ..utils.errors import ExperimentError
 from ..utils.ids import experiment_id as make_experiment_id
 from ..utils.logging import get_logger
@@ -62,6 +63,11 @@ class ExperimentState:
     duration_days: int
     starting_demo_equity: float
     expected_demo_equity: float
+    # The capped, USDT-only capital this experiment actually runs on. Persisted
+    # so a restart resumes the same ledger instead of re-baselining from a
+    # balance that has moved. See execution/research_equity.py.
+    research_equity_cap_usdt: float
+    starting_research_equity_usdt: float
     shadow_equity_per_strategy: float
     enabled_strategies: list[str]
     strategy_versions: dict[str, str]
@@ -121,6 +127,8 @@ class ExperimentState:
             "is_complete": self.is_complete,
             "starting_demo_equity": self.starting_demo_equity,
             "expected_demo_equity": self.expected_demo_equity,
+            "research_equity_cap_usdt": self.research_equity_cap_usdt,
+            "starting_research_equity_usdt": self.starting_research_equity_usdt,
             "shadow_equity_per_strategy": self.shadow_equity_per_strategy,
             "strategy_count": len(self.enabled_strategies),
             "config_hash": self.config_hash,
@@ -204,8 +212,21 @@ class ExperimentManager:
         strategy_versions: dict[str, str],
         demo_category: str,
         primary_symbol: str,
+        starting_research_equity_usdt: float | None = None,
     ) -> ExperimentState:
-        """Resume the existing experiment, or start a new one if none exists."""
+        """Resume the existing experiment, or start a new one if none exists.
+
+        ``starting_research_equity_usdt`` is the capped, USDT-only capital the
+        bot will actually run on. It is persisted with the experiment so a
+        restart resumes the same ledger. When omitted it falls back to
+        ``min(cap, starting_demo_equity)``, which is correct for an account
+        holding only USDT.
+        """
+        research_equity = (
+            starting_research_equity_usdt
+            if starting_research_equity_usdt is not None
+            else min(self.config.execution.research_equity_cap_usdt, starting_demo_equity)
+        )
         if not preconditions.all_met:
             raise ExperimentError(
                 "cannot start the experiment timer — unmet preconditions: "
@@ -247,6 +268,8 @@ class ExperimentManager:
             "duration_days": duration,
             "starting_demo_equity": starting_demo_equity,
             "expected_demo_equity": self.config.experiment.expected_demo_equity,
+            "research_equity_cap_usdt": self.config.execution.research_equity_cap_usdt,
+            "starting_research_equity_usdt": research_equity,
             "shadow_equity_per_strategy": self.config.shadow.initial_equity,
             "enabled_strategies": enabled_strategies,
             "strategy_versions": strategy_versions,
@@ -314,6 +337,14 @@ class ExperimentManager:
             duration_days=int(row["duration_days"]),
             starting_demo_equity=float(row["starting_demo_equity"]),
             expected_demo_equity=float(row["expected_demo_equity"]),
+            research_equity_cap_usdt=float(
+                row["research_equity_cap_usdt"]
+                if row["research_equity_cap_usdt"] is not None
+                else self.config.execution.research_equity_cap_usdt
+            ),
+            starting_research_equity_usdt=float(
+                row["starting_research_equity_usdt"] or 0.0
+            ),
             shadow_equity_per_strategy=float(row["shadow_equity_per_strategy"]),
             enabled_strategies=list(row.get("enabled_strategies") or []),
             strategy_versions=dict(row.get("strategy_versions") or {}),
@@ -392,14 +423,29 @@ class ExperimentManager:
         )
         return True
 
-    def start_banner(self, *, strategy_count: int, actual_equity: float) -> list[str]:
-        """The mandated research-start block."""
+    def start_banner(
+        self,
+        *,
+        strategy_count: int,
+        actual_equity: float,
+        research_equity: ResearchEquitySnapshot | None = None,
+    ) -> list[str]:
+        """The mandated research-start block.
+
+        The research-capital lines come first and are unambiguous: the operator
+        must be able to tell at a glance that the bot is running on its capped
+        USDT slice and not on the whole demo account.
+        """
         state = self.require_state()
+        capital: list[str] = []
+        if research_equity is not None:
+            capital = [*research_equity.banner_lines(), ""]
         return [
             f"{state.name.replace('_', ' ')} — {state.duration_days}-DAY RESEARCH",
             "",
+            *capital,
             "Environment:               DEMO",
-            f"Starting Demo Equity:      ${actual_equity:,.2f}",
+            f"Actual OKX Total Equity:   ${actual_equity:,.2f}  (NOT used for sizing)",
             f"Expected Research Capital: ${state.expected_demo_equity:,.2f}",
             f"Shadow Equity Per Strategy: ${state.shadow_equity_per_strategy:,.2f}",
             f"Strategies:                {strategy_count}",

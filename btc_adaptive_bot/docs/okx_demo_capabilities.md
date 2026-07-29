@@ -446,6 +446,36 @@ off by configuration. `scripts/audit_safety.sh` and `tests/unit/test_safety_lock
 fail the build if a forbidden endpoint path or a non-allow-listed host string appears in
 `src/`.
 
+## 8a. Account equity vs research capital
+
+OKX's `/api/v5/account/balance` returns `totalEq` — the USD value of **every** holding in
+the account — plus a per-currency `details` array. A demo account routinely holds BTC,
+ETH, OKB and AED alongside USDT, so `totalEq` can be many times the USDT balance.
+
+This system never sizes from `totalEq`. It reads the `USDT` line of `details` only, caps
+it at `execution.research_equity_cap_usdt`, and does so exactly once — at experiment
+start. Everything afterwards is bot-attributable accounting:
+
+```
+current research equity = starting
+                        + realised PnL      (this experiment's closed positions)
+                        + unrealised PnL    (this experiment's open positions)
+                        - fees              (this experiment's fills)
+                        + funding           (signed; positive when received)
+```
+
+Fields used, and what they are used for:
+
+| Field | Source | Used for |
+|---|---|---|
+| `details[USDT].eq` | balance | research capital at start (capped) |
+| `details[USDT].availEq` | balance | available margin before every order |
+| `totalEq` | balance | display only — never sizing, limits or scoring |
+| `positions.realized_pnl` / `.fees` | local DB | realised PnL (grossed up so fees count once) |
+| `funding_events.amount` | local DB | settlement cost, signed |
+
+See `execution/research_equity.py`.
+
 ## 9. Eligibility
 
 Unchanged policy from the Bybit build: nothing here circumvents age, KYC, geographic, or

@@ -205,6 +205,57 @@ disables orders immediately.
 - **Credentials never logged.** Key, secret and passphrase are all registered with
   a redaction filter the moment they load; only a masked prefix is ever displayed.
 
+### Research capital is capped, and it is USDT only
+
+Your OKX Demo account probably holds more than USDT — BTC, ETH, OKB, AED,
+whatever the exchange topped it up with. **None of it belongs to this
+experiment.** OKX's `totalEq` is the USD value of all of it, and sizing from
+that number would mean a BTC price move silently resizing every position, a
+deposit silently raising the risk budget, and a "14-day return" that measures
+the account rather than the strategies.
+
+So the bot runs on a **research equity ledger**:
+
+```
+starting research equity = min(execution.research_equity_cap_usdt, usable USDT)
+```
+
+read from the account **exactly once**, when the 14-day experiment starts. After
+that it moves only by what this bot itself did:
+
+```
+current = starting + realised PnL + unrealised PnL - fees + funding
+```
+
+Because the account is never re-read for sizing, deposits, unrelated holdings
+and manual trades *structurally cannot* raise the research budget — there is no
+rule to defeat, they simply are not inputs. Bot-earned profit can carry current
+equity above the cap; that is the experiment succeeding, and the cap bounds what
+the bot may take *from the account*, which is the starting figure alone.
+
+If the account holds slightly less than the cap — after smoke-test fees, say —
+the actual usable USDT is used. That is not an error.
+
+Everything derived is derived from research equity: risk per trade, position
+sizing, daily and weekly loss limits, maximum drawdown, leverage decisions,
+strategy allocation, every performance percentage, and the Day-14 metrics.
+
+**Real balances are still read continuously**, and are still authoritative for
+safety: available USDT is checked before every order, and a position needing
+more margin than the account has is reduced or refused. Research equity says how
+large a position *should* be; the real account says whether it can be placed.
+Both gates apply.
+
+The dashboard shows both, side by side and separately labelled:
+
+```
+Research equity cap        $10,000.00
+Research starting equity   $10,000.00
+Current research equity    $10,142.18
+Actual OKX total equity    $84,000.00   (not used for sizing)
+Actual available USDT      $ 9,981.44
+```
+
 ---
 
 ## 4. Leverage, margin and liquidation
@@ -472,10 +523,18 @@ market:
   settle_currency_preference: ["USDT", "USDC", "USD"]
   timeframes: ["1", "3", "5", "15", "30", "60", "240"]
 
+execution:
+  # HARD CAP on the capital this experiment may use, in USDT. The rest of the
+  # demo account (BTC, ETH, OKB, …) is excluded from sizing and from every
+  # performance figure. See §3.
+  research_equity_cap_usdt: 10000
+
 risk:
   margin_mode: isolated       # cannot be changed — no cross fallback
   normal_risk_pct: 0.0075     # 0.75% risk per real demo trade
   max_risk_pct: 0.02          # hard ceiling — cannot be exceeded
+  daily_loss_limit_pct: 0.10  # of RESEARCH equity, not the account total
+  weekly_loss_limit_pct: 0.20 # of RESEARCH equity, not the account total
   leverage:
     min_leverage: 1.0
     max_leverage: 10.0        # schema-enforced ceiling
