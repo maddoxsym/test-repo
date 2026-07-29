@@ -355,6 +355,126 @@ class TestBootstrap:
             await orchestrator.shutdown()
 
 
+class TestBackfillTiming:
+    """Backfill is pagination — it must not wait for candles or touch the timer."""
+
+    async def test_bootstrap_backfill_completes_in_seconds(
+        self, monkeypatch, loaded_config, perp_instrument
+    ):
+        """The reported bug took an hour for the 60m timeframe alone."""
+        import time
+
+        from btcbot.app.orchestrator import Orchestrator
+
+        _patch_client(monkeypatch, perp_instrument)
+        orchestrator = Orchestrator(loaded_config, _credentials())
+        try:
+            started = time.monotonic()
+            await orchestrator.bootstrap()
+            elapsed = time.monotonic() - started
+
+            # The shortest configured timeframe is 5m; a single candle wait on
+            # any timeframe would blow straight past this.
+            assert elapsed < 60.0, f"bootstrap took {elapsed:.1f}s"
+            for timeframe in ("5", "15", "60", "240"):
+                assert orchestrator.store.bars_available(timeframe) > 200
+        finally:
+            await orchestrator.shutdown()
+
+    async def test_backfill_never_sleeps_for_a_timeframe(
+        self, monkeypatch, loaded_config, perp_instrument
+    ):
+        """No sleep during bootstrap may approach a candle interval."""
+        import asyncio as _asyncio
+
+        from btcbot.app.orchestrator import Orchestrator
+
+        slept: list[float] = []
+        real_sleep = _asyncio.sleep
+
+        async def recording_sleep(seconds, *args, **kwargs):
+            slept.append(seconds)
+            await real_sleep(0)
+
+        _patch_client(monkeypatch, perp_instrument)
+        monkeypatch.setattr(
+            "btcbot.market_data.historical.asyncio.sleep", recording_sleep
+        )
+        orchestrator = Orchestrator(loaded_config, _credentials())
+        try:
+            await orchestrator.bootstrap()
+        finally:
+            await orchestrator.shutdown()
+
+        # 60s is the shortest candle this system supports.
+        assert all(s < 60.0 for s in slept), f"a backfill sleep waited {max(slept)}s"
+        assert sum(slept) < 60.0, f"backfill slept {sum(slept)}s in total"
+
+    async def test_backfill_does_not_create_or_touch_an_experiment(
+        self, monkeypatch, loaded_config, perp_instrument
+    ):
+        """Requirement 12: the 14-day timer is not started during backfill."""
+        from btcbot.app.orchestrator import Orchestrator
+
+        _patch_client(monkeypatch, perp_instrument)
+        orchestrator = Orchestrator(loaded_config, _credentials())
+        try:
+            await orchestrator.bootstrap()
+            # The experiment manager is not even constructed during bootstrap,
+            # let alone asked to start a timer.
+            assert orchestrator.experiment is None or orchestrator.experiment.state is None
+            assert orchestrator.repos.experiments.find_active() is None, (
+                "backfill created an experiment row"
+            )
+        finally:
+            await orchestrator.shutdown()
+
+    async def test_a_backfill_failure_leaves_market_data_unready(
+        self, monkeypatch, loaded_config, perp_instrument
+    ):
+        """Requirement 14: report the error and keep trading disabled."""
+        from btcbot.app.orchestrator import Orchestrator
+        from btcbot.utils.errors import BackfillError
+
+        _patch_client(monkeypatch, perp_instrument)
+        orchestrator = Orchestrator(loaded_config, _credentials())
+
+        async def boom(*_args, **_kwargs):
+            raise BackfillError("BTC-USDT-SWAP 15: page request failed — 429")
+
+        try:
+            await orchestrator.bootstrap()  # build the manager first
+            monkeypatch.setattr(orchestrator.history, "backfill_series", boom)
+            assert await orchestrator._backfill() is False   # noqa: SLF001
+        finally:
+            await orchestrator.shutdown()
+
+    async def test_a_backfill_failure_is_reported_verbatim(
+        self, monkeypatch, loaded_config, perp_instrument, caplog
+    ):
+        import logging
+
+        from btcbot.app.orchestrator import Orchestrator
+        from btcbot.utils.errors import BackfillError
+
+        _patch_client(monkeypatch, perp_instrument)
+        orchestrator = Orchestrator(loaded_config, _credentials())
+
+        async def boom(*_args, **_kwargs):
+            raise BackfillError("exchange said 50011 rate limited")
+
+        try:
+            await orchestrator.bootstrap()
+            monkeypatch.setattr(orchestrator.history, "backfill_series", boom)
+            caplog.set_level(logging.INFO)
+            await orchestrator._backfill()   # noqa: SLF001
+        finally:
+            await orchestrator.shutdown()
+
+        assert "50011 rate limited" in caplog.text
+        assert "FAILED" in caplog.text
+
+
 class TestDryRunDoesNotStartTheTimer:
     async def test_dry_run_never_creates_an_experiment(
         self, monkeypatch, loaded_config, perp_instrument
@@ -456,6 +576,41 @@ class TestDryRunDoesNotStartTheTimer:
             json.dumps(state, default=str)
         finally:
             await orchestrator.shutdown()
+
+
+class TestStreamsStartImmediatelyAfterBackfill:
+    async def test_streams_start_with_no_wait_between(
+        self, monkeypatch, loaded_config, perp_instrument
+    ):
+        """Requirement 11: backfill finishes, streams start — nothing in between."""
+        import time
+
+        from btcbot.app.orchestrator import Orchestrator
+
+        _patch_client(monkeypatch, perp_instrument)
+        orchestrator = Orchestrator(loaded_config, _credentials(), dry_run=True)
+        order: list[str] = []
+        started_at: dict[str, float] = {}
+
+        async def record_streams(**_kwargs):
+            order.append("streams")
+            started_at["streams"] = time.monotonic()
+
+        real_backfill = None
+        try:
+            await orchestrator.bootstrap()
+            order.append("backfill")
+            started_at["backfill"] = time.monotonic()
+            monkeypatch.setattr(orchestrator, "_start_streams", record_streams)
+            orchestrator._shutdown_event.set()          # noqa: SLF001
+            await orchestrator._run_dry_run(duration_seconds=0)   # noqa: SLF001
+        finally:
+            del real_backfill
+            await orchestrator.shutdown()
+
+        assert order == ["backfill", "streams"]
+        gap = started_at["streams"] - started_at["backfill"]
+        assert gap < 60.0, f"waited {gap:.1f}s between backfill and streams"
 
 
 class TestResearchModeGating:

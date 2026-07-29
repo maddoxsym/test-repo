@@ -654,6 +654,22 @@ is persisted when it arrives. If an order genuinely cannot be confirmed within
 the budget, the bot enters SAFE_MODE, leaves the ledger untouched and never
 sends a replacement order.
 
+**Backfill takes an hour, finishing on candle boundaries**
+Fixed. Historical backfill is pagination and now completes in seconds for all
+five timeframes together. The old paging loop had no progress guard: when the
+exchange could not supply the full 1500 bars, the cursor stopped advancing,
+every further request returned the same boundary candle, and the loop could
+only progress when a *new candle closed* — which is why 1m finished at the next
+minute and 60m an hour later. The walk now stops the moment a page fails to
+reach further back, with a hard page cap and a 45-second backstop (deliberately
+below the smallest candle). Progress is logged per page:
+
+```
+[BACKFILL] 15m page 1/6 — 300 candles (300/1500 total)
+[BACKFILL] 15m complete — 1500 candles (0 cached, 1500 fetched) in 2.4s
+[BACKFILL] Total complete — 7500 candles in 14.8s
+```
+
 **403 Forbidden reaching OKX**
 Either a proxy/firewall is blocking the configured REST host, or your IP is in a region OKX
 refuses, or your account isn't eligible from your location. The error lists all

@@ -318,6 +318,22 @@ else
 fi
 
 # ---------------------------------------------------------------
+# Historical backfill is pagination. Coupling it to candle timing once cost an
+# hour per timeframe at startup; these keep the two jobs separated.
+if grep -qE 'wait_until_next_candle|seconds_until_next|next_candle_close' \
+     src/btcbot/market_data/historical.py; then
+  failure "historical backfill references a next-candle waiting helper"
+else
+  pass "historical backfill never waits for a candle to close"
+fi
+
+if grep -q 'oldest >= cursor_end' src/btcbot/market_data/historical.py &&
+   grep -q 'MAX_BACKFILL_PAGES' src/btcbot/market_data/historical.py; then
+  pass "backfill pagination has a no-progress guard and a hard page cap"
+else
+  failure "the backfill pagination guards are missing"
+fi
+
 section "7. Look-ahead protection"
 if grep -q 'def is_closed' src/btcbot/exchange/models.py && \
    grep -q 'LookAheadError' src/btcbot/market_data/candles.py; then

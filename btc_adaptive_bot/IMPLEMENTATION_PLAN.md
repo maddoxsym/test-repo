@@ -214,6 +214,34 @@ external changes are structurally incapable of touching it — there is no clamp
 - [x] `tests/unit/test_research_equity.py` (50) + orchestrator, restart and sizing tests;
       3 new audit checks
 
+## Phase R9 — Backfill timing fix  `[x]`
+
+Live logs showed startup backfill taking one candle interval **per timeframe** — 1m
+finished at the next minute boundary, 5m at the next five, 60m an hour later. Nothing
+slept for the timeframe.
+
+**Root cause.** `backfill_series` paged backwards with `cursor_end = oldest` and only
+three exits: enough candles, empty page, reached `start_ms`. OKX's recent-candles window
+is shorter than 1500 bars for small timeframes, so the cursor bottomed out: each further
+request returned the same single boundary candle, `oldest == cursor_end`, no exit fired,
+and the loop span at the 0.12s inter-request delay. It could only gain candles when a new
+one closed — hence completion on candle boundaries. `_download_range` had a `max_pages`
+cap and a `len(candles) < 2` check and never hung; the two paths had diverged.
+
+- [x] **No-progress guard** — `if oldest >= cursor_end: break` (the fix), plus a
+      no-new-data guard, a hard `MAX_BACKFILL_PAGES` cap, and a 45s wall-clock backstop
+      deliberately below the 60s smallest candle
+- [x] Same guard added to `_download_range`
+- [x] `_fetch_page` with a fixed, error-triggered `PAGE_RETRY_BACKOFF` — identical for
+      1m and 4h, never derived from the timeframe
+- [x] Cache reuse: the window is loaded first and paging starts from the newest cached
+      candle, so a restart fetches only the tail
+- [x] `BackfillReport` returned instead of a bare list; `BackfillError` raised on
+      persistent failure so the orchestrator leaves `market_data_ready` False
+- [x] `[BACKFILL]` per-page and per-timeframe progress logging with timings
+- [x] `tests/unit/test_backfill_timing.py` (38) + orchestrator and timer tests;
+      2 new audit checks
+
 ---
 
 # Part I — Bybit Demo build (historical record, complete)

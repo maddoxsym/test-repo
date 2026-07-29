@@ -250,6 +250,38 @@ class TestExperimentTimer:
         )
         assert math.isclose(resumed.research_equity_cap_usdt, 10_000.0)
 
+    def test_backfill_does_not_move_the_experiment_window(self, repos, app_config):
+        """Requirement 13: backfill preserves the experiment ID and end time.
+
+        Backfill runs during bootstrap, before the experiment manager is even
+        asked for a state, so a restart that re-backfills must land on exactly
+        the same window.
+        """
+        manager = ExperimentManager(
+            repos.experiments, repos.system, app_config, config_hash="backfill"
+        )
+        original = manager.start_or_resume(
+            mode=ExperimentMode.RESEARCH, preconditions=_met(),
+            starting_demo_equity=10_000.0, enabled_strategies=["s1"],
+            strategy_versions={"s1": "1.0"}, demo_category="SWAP",
+            primary_symbol="BTC-USDT-SWAP",
+        )
+
+        # A restart: bootstrap (and its backfill) runs again, then resume.
+        resumed = ExperimentManager(
+            repos.experiments, repos.system, app_config, config_hash="backfill"
+        ).start_or_resume(
+            mode=ExperimentMode.RESEARCH, preconditions=_met(),
+            starting_demo_equity=10_000.0, enabled_strategies=["s1"],
+            strategy_versions={"s1": "1.0"}, demo_category="SWAP",
+            primary_symbol="BTC-USDT-SWAP",
+        )
+
+        assert resumed.experiment_id == original.experiment_id
+        assert resumed.start == original.start, "the 14-day timer was restarted"
+        assert resumed.scheduled_end == original.scheduled_end
+        assert resumed.resumed is True
+
     def test_the_research_ledger_survives_a_restart_with_its_pnl(self, repos, app_config):
         """The whole point of persisting the starting figure."""
         from btcbot.execution.research_equity import (

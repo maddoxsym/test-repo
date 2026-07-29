@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from datetime import timedelta
+from time import monotonic
 from typing import Any
 
 from ..backtesting.data_split import split_candles
@@ -64,6 +65,7 @@ from ..strategies.base import Strategy, StrategyContext, StrategySignal
 from ..strategies.registry import StrategyRegistry
 from ..utils.errors import (
     ApiError,
+    BackfillError,
     BtcBotError,
     DemoVerificationError,
     TransportError,
@@ -279,9 +281,12 @@ class Orchestrator:
             )
 
         # --- backfill ----------------------------------------------------
+        # Historical pagination only. A failure here leaves market data unready,
+        # which leaves order submission disabled — it never silently proceeds.
+        backfilled = True
         if self.config.data.backfill_on_start:
-            await self._backfill()
-        preconditions.market_data_ready = await self._verify_market_data()
+            backfilled = await self._backfill()
+        preconditions.market_data_ready = backfilled and await self._verify_market_data()
 
         return preconditions
 
@@ -300,19 +305,47 @@ class Orchestrator:
         needed.add(self.config.market.regime_context_timeframe)
         return {tf for tf in needed if tf in self.config.market.timeframes}
 
-    async def _backfill(self) -> None:
-        """Warm the live candle series so strategies can evaluate immediately."""
+    async def _backfill(self) -> bool:
+        """Warm the live candle series so strategies can evaluate immediately.
+
+        Pure historical pagination — it must complete in seconds regardless of
+        the timeframes involved. Nothing here waits for a candle to close; that
+        is the live stream's job. Returns False when a timeframe could not be
+        backfilled, which keeps trading disabled rather than running strategies
+        on a short series.
+        """
         assert self.history and self.store and self.registry
         needed = self._required_timeframes()
-        log.info("DATA", f"Backfilling {len(needed)} timeframe(s)…")
+        started = monotonic()
+        log.info("BACKFILL", f"Starting — {len(needed)} timeframe(s), no candle waits")
+
+        total = 0
+        failures: list[str] = []
         for timeframe in sorted(needed, key=lambda tf: interval_seconds(tf)):
-            candles = await self.history.backfill_series(
-                timeframe, bars=self.config.data.candle_buffer
-            )
+            try:
+                report = await self.history.backfill_series(
+                    timeframe, bars=self.config.data.candle_buffer
+                )
+            except BackfillError as exc:
+                # Reported exactly, never swallowed into a silent short series.
+                log.error("BACKFILL", f"{timeframe}m FAILED — {exc}")
+                failures.append(f"{timeframe}m: {exc}")
+                continue
             series = self.store.series.get(timeframe)
-            if series is not None and candles:
-                series.extend(candles)
-            log.info("DATA", f"  {timeframe}m: {len(candles)} candles")
+            if series is not None and report.candles:
+                series.extend(report.candles)
+            total += report.count
+
+        elapsed = monotonic() - started
+        if failures:
+            log.error(
+                "BACKFILL",
+                f"Total INCOMPLETE — {total} candles in {elapsed:.1f}s; "
+                f"{len(failures)} timeframe(s) failed: {'; '.join(failures)}",
+            )
+            return False
+        log.info("BACKFILL", f"Total complete — {total} candles in {elapsed:.1f}s")
+        return True
 
     async def _verify_market_data(self) -> bool:
         """Confirm BTC market data is genuinely functioning."""
@@ -645,7 +678,11 @@ class Orchestrator:
 
     async def _run_live(self) -> None:
         self._running = True
+        # Straight from backfill into the live streams — there is no wait
+        # between them, and none is ever appropriate.
+        started = monotonic()
         await self._start_streams()
+        log.info("STREAM", f"All required streams started in {monotonic() - started:.1f}s")
 
         self._tasks = [
             asyncio.create_task(self._bar_worker(), name="bars"),

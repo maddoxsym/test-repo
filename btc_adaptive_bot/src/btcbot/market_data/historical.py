@@ -5,17 +5,54 @@ long BTC history spanning genuinely different regimes. This module fetches it in
 pages (OKX caps recent-candle responses at 300 and deep history at 100 — the
 client handles the endpoint switch), stores it in SQLite, and repairs gaps
 rather than silently backtesting over holes.
+
+Backfill is *historical pagination*. It is not, and must never become, live
+candle scheduling
+------------------------------------------------------------------------------
+
+These are two different jobs and they were once entangled here, with a
+spectacular symptom: backfilling 1500 bars took **one full candle interval per
+timeframe** — 1m finished at the next minute boundary, 5m at the next
+five-minute boundary, 1h an hour later.
+
+Nothing slept for the timeframe. The cause was subtler and worse: the paging
+loop had no progress guard. Its only exits were "collected enough", "empty
+page" and "reached start_ms". When the exchange could not supply the requested
+number of bars — its recent-candles window is shorter than 1500 for small
+timeframes — the cursor stopped moving: each further request returned the same
+single boundary candle, ``oldest == cursor_end``, no exit condition fired, and
+the loop span at the inter-request delay. It could then only make progress when
+a *new candle closed* and shifted the window forward, which is exactly why
+completion landed on candle boundaries.
+
+So the paging loop now guarantees termination on the exchange's data, never on
+the clock:
+
+* **no-progress guard** — a page that does not reach further back than the
+  cursor ends the walk immediately (this is the bug above);
+* **no-new-data guard** — a page containing nothing we do not already hold ends
+  the walk;
+* **hard page cap** — bounded by the bars requested, never unbounded;
+* **wall-clock budget** — a final backstop measured in seconds, deliberately
+  smaller than the smallest supported timeframe, so "waited for a candle" is
+  not a reachable state;
+* **bounded retry/backoff** — applied only after an actual API error or rate
+  limit, never speculatively.
+
+Whatever the exchange returns, backfill finishes in seconds. Waiting for a
+candle to close is the live stream's job, and it happens in ``ws.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from time import monotonic
 
 from ..database.repositories import MarketRepository
 from ..exchange.models import Candle
 from ..exchange.rest import OkxDemoClient
-from ..utils.errors import ApiError, TransportError
+from ..utils.errors import ApiError, BackfillError, RateLimitError, TransportError
 from ..utils.logging import get_logger
 from ..utils.timeutil import interval_ms, now_ms
 from .candles import build_closed_only
@@ -23,6 +60,53 @@ from .candles import build_closed_only
 log = get_logger(__name__)
 
 PAGE_LIMIT = 300  # documented maximum for /api/v5/market/candles
+
+# Retry delays after a *real* failure (rate limit, transport error). Bounded and
+# short: the point is to ride out a 429, not to wait for anything.
+PAGE_RETRY_BACKOFF: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0)
+
+# Wall-clock backstop for one timeframe's backfill. Deliberately below 60s —
+# the smallest supported candle — so no code path can ever be mistaken for
+# "waited for the timeframe". Reaching it is a bug, and it is logged as one.
+BACKFILL_DEADLINE_SECONDS = 45.0
+
+# Absolute ceiling on pages per timeframe, on top of the computed estimate.
+MAX_BACKFILL_PAGES = 40
+
+
+@dataclass(slots=True)
+class BackfillReport:
+    """What one timeframe's backfill actually did.
+
+    Returned rather than logged-and-discarded so the orchestrator can decide
+    whether market data is good enough to trade on, and say why not when it
+    is not.
+    """
+
+    symbol: str
+    timeframe: str
+    requested: int
+    candles: list[Candle] = field(default_factory=list)
+    from_cache: int = 0
+    fetched: int = 0
+    pages: int = 0
+    elapsed_seconds: float = 0.0
+    stop_reason: str = ""
+
+    @property
+    def count(self) -> int:
+        return len(self.candles)
+
+    @property
+    def complete(self) -> bool:
+        return self.count >= self.requested
+
+    def describe(self) -> str:
+        return (
+            f"{self.timeframe}m — {self.count} candles "
+            f"({self.from_cache} cached, {self.fetched} fetched, {self.pages} page(s)) "
+            f"in {self.elapsed_seconds:.1f}s"
+        )
 
 
 @dataclass(slots=True)
@@ -143,7 +227,9 @@ class HistoricalDataManager:
             total += len(closed)
 
             oldest = min(c.open_ms for c in closed)
-            if oldest <= page_start or len(candles) < 2:
+            # Same no-progress guard as backfill_series: a page that does not
+            # reach further back than the cursor means there is no more history.
+            if oldest >= cursor_end or oldest <= page_start or len(candles) < 2:
                 break
             cursor_end = oldest
             await asyncio.sleep(self._delay)
@@ -189,45 +275,188 @@ class HistoricalDataManager:
             for row in rows
         ]
 
-    async def backfill_series(self, timeframe: str, *, bars: int) -> list[Candle]:
-        """Fetch the most recent ``bars`` closed candles for the live store."""
+    async def _fetch_page(
+        self, timeframe: str, *, start_ms: int, end_ms: int, limit: int
+    ) -> list[Candle]:
+        """One page, with bounded backoff after an actual failure.
+
+        The backoff schedule is fixed, short and error-triggered. Nothing here
+        is derived from the timeframe: a 4h backfill retries on exactly the
+        same schedule as a 1m one.
+        """
+        last_error: Exception | None = None
+        for attempt, delay in enumerate((0.0, *PAGE_RETRY_BACKOFF), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                return await self._client.get_klines(
+                    self.symbol, timeframe, start_ms=start_ms, end_ms=end_ms, limit=limit
+                )
+            except RateLimitError as exc:
+                last_error = exc
+                log.debug(
+                    "BACKFILL", f"{timeframe} page rate-limited (attempt {attempt}) — backing off"
+                )
+            except (ApiError, TransportError) as exc:
+                last_error = exc
+                log.debug("BACKFILL", f"{timeframe} page failed (attempt {attempt}): {exc}")
+        raise BackfillError(
+            f"{self.symbol} {timeframe}: page request failed after "
+            f"{len(PAGE_RETRY_BACKOFF) + 1} attempts — {last_error}"
+        ) from last_error
+
+    def cached_series(self, timeframe: str, *, bars: int) -> list[Candle]:
+        """The closed candles already stored for the most recent ``bars`` window."""
+        step = interval_ms(timeframe)
+        end_ms = now_ms()
+        return self.load(timeframe, start_ms=end_ms - (bars + 5) * step, end_ms=end_ms)
+
+    async def backfill_series(
+        self,
+        timeframe: str,
+        *,
+        bars: int,
+        deadline_seconds: float = BACKFILL_DEADLINE_SECONDS,
+    ) -> BackfillReport:
+        """Fetch the most recent ``bars`` closed candles for the live store.
+
+        Pure historical pagination: it asks the exchange for pages as fast as
+        the rate limit allows and stops as soon as the exchange stops yielding
+        candles it does not already have. It never waits for a candle to close,
+        and its termination does not depend on the clock — see the module
+        docstring for the bug that made it look as though it did.
+
+        Restart behaviour: whatever is already cached for the window is loaded
+        first, and paging begins from the newest cached candle, so a restart
+        fetches only what has happened since rather than all ``bars`` again.
+        """
+        started = monotonic()
         step = interval_ms(timeframe)
         end_ms = now_ms()
         start_ms = end_ms - (bars + 5) * step
-        collected: dict[int, Candle] = {}
-        cursor_end = end_ms
 
-        while len(collected) < bars:
-            try:
-                page = await self._client.get_klines(
-                    self.symbol,
-                    timeframe,
-                    start_ms=start_ms,
-                    end_ms=cursor_end,
-                    limit=min(PAGE_LIMIT, bars + 10),
-                )
-            except (ApiError, TransportError) as exc:
-                log.warning("DATA", f"Backfill failed for {timeframe}: {exc}")
+        # --- reuse the cache -------------------------------------------
+        cached = {c.open_ms: c for c in self.load(timeframe, start_ms=start_ms, end_ms=end_ms)}
+        collected: dict[int, Candle] = dict(cached)
+        newest_cached = max(collected) if collected else None
+        last_closed_open = self._last_closed_open(timeframe, now=end_ms)
+
+        if len(collected) >= bars and newest_cached is not None and newest_cached >= last_closed_open:
+            elapsed = monotonic() - started
+            log.info(
+                "BACKFILL",
+                f"{timeframe}m complete — {len(collected)} candles from cache, "
+                f"0 fetched in {elapsed:.1f}s",
+            )
+            return BackfillReport(
+                symbol=self.symbol, timeframe=timeframe, requested=bars,
+                candles=self._tail(collected, bars), from_cache=len(cached),
+                fetched=0, pages=0, elapsed_seconds=elapsed,
+            )
+
+        # Only the missing tail is needed when the cache already covers the span.
+        needed_from = newest_cached if (newest_cached and len(cached) >= bars) else start_ms
+        estimated_pages = max(1, -(-(bars - len(cached)) // PAGE_LIMIT)) if len(cached) < bars else 1
+        max_pages = min(MAX_BACKFILL_PAGES, max(2, estimated_pages + 2))
+
+        cursor_end = end_ms
+        pages = 0
+        fetched = 0
+        stop_reason = "target reached"
+
+        while len(collected) < bars or newest_cached is None or cursor_end > needed_from:
+            if pages >= max_pages:
+                stop_reason = f"page cap ({max_pages}) reached"
                 break
+            if monotonic() - started > deadline_seconds:
+                # A backstop, not a schedule. Reaching it means something is
+                # wrong with pagination, and it is reported as such.
+                stop_reason = f"deadline ({deadline_seconds:.0f}s) reached"
+                log.warning(
+                    "BACKFILL",
+                    f"{timeframe}m hit the {deadline_seconds:.0f}s budget after {pages} page(s) — "
+                    "returning what was fetched",
+                )
+                break
+
+            pages += 1
+            page = await self._fetch_page(
+                timeframe,
+                start_ms=max(start_ms, needed_from),
+                end_ms=cursor_end,
+                limit=PAGE_LIMIT,
+            )
             closed = build_closed_only(page)
             if not closed:
+                stop_reason = "exchange returned no further candles"
+                log.info("BACKFILL", f"{timeframe}m page {pages}/{max_pages} — 0 candles (end of data)")
                 break
+
+            new = [c for c in closed if c.open_ms not in collected]
             for candle in closed:
                 collected[candle.open_ms] = candle
-            oldest = min(c.open_ms for c in closed)
-            if oldest <= start_ms:
-                break
-            cursor_end = oldest
-            await asyncio.sleep(self._delay)
+            fetched += len(new)
+            log.info(
+                "BACKFILL",
+                f"{timeframe}m page {pages}/{max_pages} — {len(new)} candles "
+                f"({len(collected)}/{bars} total)",
+            )
 
-        result = sorted(collected.values(), key=lambda c: c.open_ms)[-bars:]
+            oldest = min(c.open_ms for c in closed)
+            # THE guard. A page that does not reach further back than the cursor
+            # means the exchange has no more history for this window; without
+            # this the loop re-requested the same boundary candle forever and
+            # could only advance when a new candle closed.
+            if oldest >= cursor_end:
+                stop_reason = "exchange has no candles older than the cursor"
+                break
+            if not new:
+                stop_reason = "page contained nothing new"
+                break
+            if oldest <= start_ms:
+                stop_reason = "reached the start of the requested window"
+                break
+            if len(collected) >= bars:
+                stop_reason = "target reached"
+                break
+
+            cursor_end = oldest
+            await asyncio.sleep(self._delay)   # rate-limit courtesy, not a candle wait
+
+        result = self._tail(collected, bars)
         if result:
             self._repo.save_klines(
                 self.symbol,
                 timeframe,
                 [(c.open_ms, c.open, c.high, c.low, c.close, c.volume, c.turnover) for c in result],
             )
-        return result
+        elapsed = monotonic() - started
+        log.info(
+            "BACKFILL",
+            f"{timeframe}m complete — {len(result)} candles "
+            f"({len(cached)} cached, {fetched} fetched) in {elapsed:.1f}s [{stop_reason}]",
+        )
+        return BackfillReport(
+            symbol=self.symbol, timeframe=timeframe, requested=bars, candles=result,
+            from_cache=len(cached), fetched=fetched, pages=pages,
+            elapsed_seconds=elapsed, stop_reason=stop_reason,
+        )
+
+    @staticmethod
+    def _tail(collected: dict[int, Candle], bars: int) -> list[Candle]:
+        """Newest ``bars`` candles, ordered oldest-first and de-duplicated.
+
+        ``collected`` is keyed by ``open_ms`` for one symbol/timeframe, so
+        duplicate opens collapse by construction.
+        """
+        return sorted(collected.values(), key=lambda c: c.open_ms)[-bars:]
+
+    @staticmethod
+    def _last_closed_open(timeframe: str, *, now: int) -> int:
+        """Open time of the most recently *closed* candle."""
+        step = interval_ms(timeframe)
+        forming_open = (now // step) * step
+        return forming_open - step
 
     async def recover_missing(self, timeframe: str, since_ms: int) -> list[Candle]:
         """Re-fetch candles after an outage so the live series has no hole."""

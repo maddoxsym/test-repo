@@ -157,6 +157,16 @@ class StaleDataError(MarketDataError):
     """A stream exceeded its staleness budget; trading must pause."""
 
 
+class BackfillError(MarketDataError):
+    """Historical backfill could not obtain usable candles.
+
+    Raised rather than swallowed: a silent backfill failure would leave
+    strategies evaluating on a short or holed series, which looks like a
+    working system producing bad signals. The caller keeps trading disabled
+    and reports the exchange's actual reason.
+    """
+
+
 class LookAheadError(MarketDataError):
     """Code attempted to read a candle at or beyond the replay cursor.
 
