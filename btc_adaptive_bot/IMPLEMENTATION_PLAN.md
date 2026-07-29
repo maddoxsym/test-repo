@@ -5,7 +5,7 @@ Status legend: `[x]` done · `[~]` partial · `[ ]` not started
 The plan has three parts: the original **Bybit Demo build** (Phases 1–17, complete — kept
 below as the historical record), the **OKX Demo migration** (Phases M1–M7), which replaced
 the active exchange integration with OKX Demo / BTC X-Perp, and the **regional profile
-migration** (Phases R1–R5), which generalised the EEA-only pin into a demo profile
+migration** (Phases R1–R6), which generalised the EEA-only pin into a demo profile
 registry defaulting to OKX Global / UAE. Every exchange-independent system is preserved
 throughout.
 
@@ -138,6 +138,30 @@ that allow-list stays exact-match and the nine live URLs stay explicitly forbidd
 - [x] Full test suite green; `ruff check` clean; `audit_safety.sh` passing
 - [x] No authenticated verification claimed — the sandbox cannot reach any exchange and
       no credentials were supplied to it
+
+## Phase R6 — Order-response handling fix  `[x]`
+
+Found by the first live smoke test: entry order returned `code=1 "All operations
+failed"` and the real reason was never seen. OKX trade endpoints are batch-shaped even
+for one order — the envelope `code` describes the batch (0 all ok, 1 all failed, 2
+partial) and the rejection is per item (`sCode`/`sMsg`/`subCode`). The transport was
+raising on the envelope, destroying the only diagnostic that exists.
+
+- [x] `ORDER_OPERATION_PATHS`, `ITEM_LEVEL_ENVELOPE_CODES` and `ITEM_DIAGNOSTIC_FIELDS`
+      in `endpoints.py`
+- [x] `_request(item_level_errors=True)` defers codes 1 and 2 to the endpoint parser —
+      order paths only, and only when a usable data array is present; requesting it on
+      any other path raises `ValueError`
+- [x] `OrderRejectedError(ApiError)` carrying `s_code`/`s_msg`/`sub_code`/`clOrdId`,
+      with `ret_code` set to the real `sCode` so every existing handler keeps working
+- [x] `place_order` inspects every item and accepts only `sCode == 0`; `cancel_order`
+      and the cancel batch loop do the same, the batch counting mixed results honestly
+- [x] Envelope-level rejection preserved for auth, signature, environment mismatch,
+      rate limits, malformed bodies and empty/malformed data arrays
+- [x] Smoke test prints `OKX sCode=` / `sMsg=` / `subCode=` on separate lines
+- [x] `tests/unit/test_order_response_handling.py` — 39 tests driving the real client
+      against a stubbed transport, including the reported payload verbatim and a
+      credential-leakage check
 
 ---
 

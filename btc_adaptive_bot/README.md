@@ -566,6 +566,24 @@ regional entity and does not exist on the others. Set `exchange.region` in
 code. If the region is right, confirm the key was created
 *inside* Demo Trading rather than on the live account.
 
+**`code=1 All operations failed` when placing an order**
+That is OKX's *batch* envelope, not the reason. Every trade endpoint is
+batch-shaped even for one order, and the real rejection is per item. The bot
+reads it and prints it:
+
+```
+[FAIL] Place minimum-size demo order
+OKX sCode=51008
+sMsg=Order placement failed due to insufficient balance
+subCode=1000
+```
+
+Look up the `sCode` in OKX's error list — common ones are `51008` (insufficient
+balance — top up demo funds in the OKX Demo Trading UI), `51000` (a parameter
+was malformed), and `51400` (the order no longer exists). If you only ever see
+`code=1` with no `sCode` line, the response carried no item to inspect, which is
+reported as a plain envelope error.
+
 **403 Forbidden reaching OKX**
 Either a proxy/firewall is blocking the configured REST host, or your IP is in a region OKX
 refuses, or your account isn't eligible from your location. The error lists all

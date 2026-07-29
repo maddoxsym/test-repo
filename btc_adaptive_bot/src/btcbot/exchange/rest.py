@@ -30,13 +30,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
 from ..utils.errors import (
     ApiError,
     MainnetRejectedError,
+    OrderRejectedError,
     RateLimitError,
     TransportError,
 )
@@ -47,8 +48,11 @@ from .endpoints import (
     DEFAULT_PROFILE,
     DEMO_PROFILES,
     ENVIRONMENT_MISMATCH_CODE,
+    ITEM_DIAGNOSTIC_FIELDS,
+    ITEM_LEVEL_ENVELOPE_CODES,
     KEY_NOT_FOUND_CODE,
     NEGATIVE_CONTROL_PATH,
+    ORDER_OPERATION_PATHS,
     SIMULATED_TRADING_HEADER,
     SIMULATED_TRADING_VALUE,
     DemoProfile,
@@ -85,6 +89,43 @@ AUTH_FAILURE_CODES = frozenset({50111, 50113, 50119, 50100, 50103, 50104, 50105}
 
 CANDLES_MAX_LIMIT = 300       # documented maximum for /api/v5/market/candles
 HISTORY_CANDLES_MAX_LIMIT = 100
+
+
+def _item_code(item: dict[str, Any]) -> int:
+    """An order item's ``sCode``. An unreadable code is treated as a failure."""
+    raw = item.get("sCode")
+    if raw in (None, ""):
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _item_diagnostic(item: dict[str, Any]) -> str:
+    """A sanitized, human-readable reason for one rejected order operation.
+
+    Built from an allow-list of response fields (``ITEM_DIAGNOSTIC_FIELDS``)
+    so nothing unexpected in a future OKX payload can reach a log. Requests —
+    which carry the signature and auth headers — are never referenced here.
+    """
+    reason = str(item.get("sMsg") or "").strip() or "no reason supplied by the exchange"
+    extras = [
+        f"{field}={item[field]}"
+        for field in ITEM_DIAGNOSTIC_FIELDS
+        if field not in ("sCode", "sMsg") and item.get(field) not in (None, "")
+    ]
+    return f"{reason} ({', '.join(extras)})" if extras else reason
+
+
+def _has_usable_items(payload: dict[str, Any]) -> bool:
+    """Whether an order-operation envelope carries per-item results to inspect.
+
+    Without this, an envelope code of 1 or 2 with a missing or malformed data
+    array would be silently handed to a parser that has nothing to reject on.
+    """
+    data = payload.get("data")
+    return bool(isinstance(data, list) and data and all(isinstance(i, dict) for i in data))
 
 
 class OkxDemoClient:
@@ -200,10 +241,26 @@ class OkxDemoClient:
         params: dict[str, Any] | None = None,
         body: dict[str, Any] | list[Any] | None = None,
         authenticated: bool = False,
+        item_level_errors: bool = False,
     ) -> dict[str, Any]:
-        """Send one v5 request with retries and error mapping."""
+        """Send one v5 request with retries and error mapping.
+
+        ``item_level_errors`` is permitted only on the trade endpoints listed
+        in :data:`ORDER_OPERATION_PATHS`. It lets envelope codes 1 (all failed)
+        and 2 (partial) through to the endpoint parser *when a usable data
+        array is present*, because on those endpoints the real rejection lives
+        in each item's ``sCode``/``sMsg`` and the envelope ``msg`` is only
+        "All operations failed". Everything else still raises here.
+        """
         if authenticated and not self.has_credentials:
             raise ApiError(-1, "authenticated request attempted without credentials", path)
+        if item_level_errors and path not in ORDER_OPERATION_PATHS:
+            # A programming error, not a runtime condition: no non-order
+            # endpoint may opt out of envelope-level rejection.
+            raise ValueError(
+                f"item-level error handling is not permitted on {path!r}; "
+                f"it is limited to {sorted(ORDER_OPERATION_PATHS)}"
+            )
 
         last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
@@ -259,6 +316,16 @@ class OkxDemoClient:
                 if code == 0:
                     self._consecutive_errors = 0
                     return payload
+                if (
+                    item_level_errors
+                    and code in ITEM_LEVEL_ENVELOPE_CODES
+                    and _has_usable_items(payload)
+                ):
+                    # Not a success: the caller's parser inspects every item and
+                    # raises on the real sCode. Handing the payload over is the
+                    # only way that detail survives. The error counter is left
+                    # alone here and incremented by the parser if it rejects.
+                    return payload
                 if code in TIMESTAMP_ERROR_CODES and attempt < self._max_retries:
                     # Our timestamp was rejected: re-measure the drift once and
                     # retry. Persistent drift is caught by clock_drift_exceeds.
@@ -306,6 +373,53 @@ class OkxDemoClient:
     @staticmethod
     def _data(payload: dict[str, Any]) -> list[dict[str, Any]]:
         return payload.get("data", []) or []
+
+    # --- per-item (order operation) result handling -----------------------
+
+    def _raise_item_error(self, item: dict[str, Any], path: str) -> NoReturn:
+        """Reject an order operation using its own ``sCode``, not the envelope."""
+        self._consecutive_errors += 1
+        raise OrderRejectedError(
+            _item_code(item),
+            str(item.get("sMsg") or "").strip() or "no reason supplied by the exchange",
+            path,
+            sub_code=str(item.get("subCode") or ""),
+            client_order_id=str(item.get("clOrdId") or ""),
+            order_id=str(item.get("ordId") or ""),
+        )
+
+    def _check_items(
+        self, payload: dict[str, Any], path: str, *, expected: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Validate every item of an order-operation response.
+
+        Returns the items only when *all* of them carry ``sCode == 0``. The
+        first failure raises with that item's real code and reason. A missing,
+        empty, or non-object data array is itself a failure: without items
+        there is nothing to prove the operation was accepted.
+        """
+        # A clean envelope with nothing in it is still a failure, so the error
+        # never reports code 0 — that would read as success.
+        envelope_code = int(payload.get("code", -1)) or -1
+        items = self._data(payload)
+        if not items or not all(isinstance(item, dict) for item in items):
+            self._consecutive_errors += 1
+            raise ApiError(
+                envelope_code,
+                f"{payload.get('msg', '')} (no usable data array in the response)".strip(),
+                path,
+            )
+        if expected is not None and len(items) != expected:
+            self._consecutive_errors += 1
+            raise ApiError(
+                envelope_code,
+                f"expected {expected} result(s) but the response carried {len(items)}",
+                path,
+            )
+        for item in items:
+            if _item_code(item) != 0:
+                self._raise_item_error(item, path)
+        return items
 
     # --- public market data ----------------------------------------------
 
@@ -502,26 +616,29 @@ class OkxDemoClient:
 
         Callers must have passed the full validation pipeline first; this
         method deliberately performs no sizing or leverage logic of its own.
-        OKX carries per-order results inside ``data`` with their own
-        ``sCode``/``sMsg`` — both envelope levels are checked.
+
+        OKX's trade endpoint is batch-shaped: the envelope ``code`` describes
+        the batch (0 all succeeded, 1 all failed, 2 partial) and the actual
+        rejection is per item. An envelope of 1 with ``msg="All operations
+        failed"`` says nothing useful, so 1 and 2 are passed through to this
+        method (see :data:`ORDER_OPERATION_PATHS`) and the order is accepted
+        **only** when its item carries ``sCode == 0``.
         """
-        try:
-            payload = await self._request(
-                "POST", Paths.ORDER, body=request.to_payload(), authenticated=True
-            )
-        except ApiError as exc:
-            # Outer code 1 = all orders failed; the useful reason is per-item.
-            raise exc
-        data = self._data(payload)
-        item = data[0] if data else {}
-        s_code = int(item.get("sCode") or 0)
-        if s_code != 0:
-            raise ApiError(s_code, str(item.get("sMsg", "")), Paths.ORDER)
+        payload = await self._request(
+            "POST",
+            Paths.ORDER,
+            body=request.to_payload(),
+            authenticated=True,
+            item_level_errors=True,
+        )
+        # Raises on the first non-zero sCode, and on a response that carries no
+        # item to check. One order in, exactly one result expected out.
+        item = self._check_items(payload, Paths.ORDER, expected=1)[0]
         return OrderResult(
-            client_order_id=item.get("clOrdId", request.client_order_id),
+            client_order_id=item.get("clOrdId") or request.client_order_id,
             exchange_order_id=item.get("ordId", ""),
             accepted=True,
-            s_code=s_code,
+            s_code=0,
             s_msg=str(item.get("sMsg", "")),
             raw=payload,
         )
@@ -540,37 +657,60 @@ class OkxDemoClient:
             Paths.CANCEL_ORDER,
             body={"instId": inst_id, "ordId": order_id, "clOrdId": client_order_id},
             authenticated=True,
+            item_level_errors=True,
         )
-        data = self._data(payload)
-        item = data[0] if data else {}
-        s_code = int(item.get("sCode") or 0)
-        if s_code != 0:
-            raise ApiError(s_code, str(item.get("sMsg", "")), Paths.CANCEL_ORDER)
-        return item
+        return self._check_items(payload, Paths.CANCEL_ORDER, expected=1)[0]
 
     async def cancel_all(self, inst_id: str) -> dict[str, Any]:
         """Cancel every pending order on ``inst_id``.
 
         OKX has no single cancel-all call; pending orders are listed and then
         cancelled in documented batches of up to 20.
+
+        A batch legitimately reports mixed results (envelope code 2), so this
+        method counts each item individually and returns both tallies rather
+        than raising. It never reports a cancellation it cannot see an
+        ``sCode == 0`` for — a batch that comes back without a usable data
+        array is counted as entirely failed, not silently as success.
         """
         pending = await self.get_open_orders(inst_id)
         cancelled = 0
         failures: list[str] = []
         for start in range(0, len(pending), 20):
             batch = pending[start : start + 20]
-            payload = await self._request(
-                "POST",
-                Paths.CANCEL_BATCH_ORDERS,
-                body=[{"instId": inst_id, "ordId": order.order_id} for order in batch],
-                authenticated=True,
-            )
-            for item in self._data(payload):
-                if int(item.get("sCode") or 0) == 0:
+            try:
+                payload = await self._request(
+                    "POST",
+                    Paths.CANCEL_BATCH_ORDERS,
+                    body=[{"instId": inst_id, "ordId": order.order_id} for order in batch],
+                    authenticated=True,
+                    item_level_errors=True,
+                )
+            except ApiError as exc:
+                if exc.ret_code not in ITEM_LEVEL_ENVELOPE_CODES:
+                    # Authentication, environment, rate-limit and malformed
+                    # responses are not this method's to absorb.
+                    raise
+                # The batch failed and OKX sent no per-item detail. Record every
+                # order in it as failed rather than losing the batch silently.
+                failures.extend(f"{order.order_id}: {exc.ret_msg}" for order in batch)
+                continue
+            items = self._data(payload)
+            if not _has_usable_items(payload):
+                self._consecutive_errors += 1
+                failures.extend(
+                    f"{order.order_id}: no result returned "
+                    f"(envelope code={payload.get('code')} {payload.get('msg', '')})"
+                    for order in batch
+                )
+                continue
+            for item in items:
+                if _item_code(item) == 0:
                     cancelled += 1
                 else:
-                    failures.append(f"{item.get('ordId')}: {item.get('sMsg')}")
+                    failures.append(f"{item.get('ordId', '?')}: {_item_diagnostic(item)}")
         if failures:
+            self._consecutive_errors += 1
             log.warning("OKX", f"cancel_all: {len(failures)} cancellations failed: {failures[:3]}")
         return {"cancelled": cancelled, "failed": failures}
 

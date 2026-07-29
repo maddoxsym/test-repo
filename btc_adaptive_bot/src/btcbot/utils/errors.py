@@ -71,6 +71,61 @@ class ApiError(ExchangeError):
         super().__init__(f"okx code={ret_code} msg={ret_msg!r} endpoint={endpoint}")
 
 
+class OrderRejectedError(ApiError):
+    """One order operation was rejected by its own per-item ``sCode``.
+
+    OKX's trade endpoints are batch-shaped: the envelope ``code`` reports only
+    whether the *batch* succeeded (``1`` = "All operations failed"), while the
+    actual reason lives in each item's ``sCode``/``sMsg``/``subCode``. This
+    error carries those fields separately so a caller can render them without
+    re-parsing a message string.
+
+    It subclasses :class:`ApiError` with ``ret_code`` set to the item's
+    ``sCode``, so every existing ``except ApiError`` path keeps working and
+    sees the real code rather than a bare ``1``.
+
+    Only exchange *response* fields are carried here. Nothing from the signed
+    request — key, signature, passphrase, headers — is ever attached.
+    """
+
+    def __init__(
+        self,
+        s_code: int,
+        s_msg: str,
+        endpoint: str = "",
+        *,
+        sub_code: str = "",
+        client_order_id: str = "",
+        order_id: str = "",
+    ) -> None:
+        self.s_code = s_code
+        self.s_msg = s_msg
+        self.sub_code = sub_code
+        self.client_order_id = client_order_id
+        self.order_id = order_id
+        detail = ", ".join(
+            f"{label}={value}"
+            for label, value in (
+                ("subCode", sub_code),
+                ("clOrdId", client_order_id),
+                ("ordId", order_id),
+            )
+            if value
+        )
+        super().__init__(s_code, f"{s_msg} ({detail})" if detail else s_msg, endpoint)
+
+    def report_lines(self) -> list[str]:
+        """The rejection as operator-facing lines, one field per line."""
+        lines = [f"OKX sCode={self.s_code}", f"sMsg={self.s_msg}"]
+        if self.sub_code:
+            lines.append(f"subCode={self.sub_code}")
+        if self.client_order_id:
+            lines.append(f"clOrdId={self.client_order_id}")
+        if self.endpoint:
+            lines.append(f"endpoint={self.endpoint}")
+        return lines
+
+
 class RateLimitError(ExchangeError):
     """Rate limited by the exchange; the caller should back off."""
 

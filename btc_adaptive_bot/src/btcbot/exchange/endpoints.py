@@ -287,6 +287,48 @@ class Paths:
     CLOSE_POSITION = "/api/v5/trade/close-position"
 
 
+# =====================================================================
+#  ORDER-OPERATION RESPONSE CODES
+#
+#  OKX's trade endpoints are batch-shaped even for a single order. The
+#  envelope `code` describes the *batch*:
+#
+#     0 — every operation succeeded
+#     1 — every operation failed
+#     2 — partial success (some items succeeded, some did not)
+#
+#  With 1 and 2 the useful reason is never in the envelope `msg` (it is
+#  the useless "All operations failed"); it is in each item's `sCode` /
+#  `sMsg` / `subCode`. So for these endpoints — and ONLY these — the
+#  transport hands 1 and 2 to the endpoint parser instead of raising,
+#  provided a usable data array is present. The parser then rejects on
+#  the real per-item code.
+#
+#  This is not a success path: no caller ever treats 1 or 2 as accepted.
+#  Every other envelope code, on every endpoint, still raises in the
+#  transport layer exactly as before.
+# =====================================================================
+ORDER_OPERATION_PATHS: frozenset[str] = frozenset(
+    {
+        Paths.ORDER,
+        Paths.CANCEL_ORDER,
+        Paths.CANCEL_BATCH_ORDERS,
+        Paths.CLOSE_POSITION,
+    }
+)
+
+ALL_OPERATIONS_FAILED_CODE = 1
+PARTIAL_SUCCESS_CODE = 2
+ITEM_LEVEL_ENVELOPE_CODES: frozenset[int] = frozenset(
+    {ALL_OPERATIONS_FAILED_CODE, PARTIAL_SUCCESS_CODE}
+)
+
+# The only per-item fields ever copied into an error message. Responses are
+# not credential-bearing, but the diagnostic is built from an allow-list so a
+# future OKX field cannot end up in a log by accident.
+ITEM_DIAGNOSTIC_FIELDS: tuple[str, ...] = ("sCode", "sMsg", "subCode", "clOrdId", "ordId")
+
+
 # Endpoint fragments that must never appear anywhere in this codebase.
 # Asserted by tests/unit/test_safety_lock.py and scripts/audit_safety.sh.
 # These are the fund-movement and account-administration surfaces: a demo

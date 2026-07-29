@@ -247,6 +247,39 @@ loans, staking. `scripts/audit_safety.sh` fails the build if any of these paths 
 
 WS candle payloads carry the same `confirm` flag; only confirmed candles reach strategies.
 
+### Order responses are batch-shaped — the envelope is not the rejection
+
+Every OKX trade endpoint returns a batch envelope, even when you send one order:
+
+```json
+{"code": "1", "msg": "All operations failed",
+ "data": [{"ordId": "", "clOrdId": "…", "sCode": "51000",
+           "sMsg": "…the actual reason…", "subCode": "1000"}]}
+```
+
+| Envelope `code` | Meaning |
+|---|---|
+| `0` | every operation succeeded |
+| `1` | every operation failed |
+| `2` | partial success — some items succeeded, some did not |
+
+With `1` and `2` the envelope `msg` is only `"All operations failed"`, which names no
+cause. The real rejection is per item: `sCode`, `sMsg`, and often a `subCode`. A transport
+that raises on the envelope therefore throws away the only diagnostic that exists — the
+exact failure this project hit on its first live smoke test.
+
+So the transport (`rest.py`) defers **only** codes 1 and 2, **only** on the four paths in
+`ORDER_OPERATION_PATHS`, and **only** when a usable data array is present; the endpoint
+parser then accepts an operation solely on `sCode == 0` and raises `OrderRejectedError`
+(an `ApiError` whose `ret_code` is the real `sCode`) otherwise. Every other envelope code
+— authentication, environment mismatch, rate limit, malformed body, an empty data array —
+still fails immediately in the transport layer, unchanged. Requesting the relaxation on a
+non-order path raises `ValueError`, so it cannot spread by accident.
+
+Note the two independent checks this implies: a clean envelope (`code: 0`) with a rejected
+item is still a rejection, and a rejected envelope with no item to inspect is still a
+failure. Neither level alone is trusted.
+
 ---
 
 ## 4. How this system proves it is on Demo

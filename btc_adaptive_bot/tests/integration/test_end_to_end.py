@@ -457,6 +457,40 @@ class TestGatesBlockBeforeAnyRequest:
         assert stored["status"] == "rejected"
         assert "51008" in stored["reject_reason"]
 
+    async def test_a_per_item_rejection_is_recorded_by_its_real_scode(
+        self, repos, capabilities
+    ):
+        """Not the envelope's code=1: the journal must name the actual reason."""
+        from btcbot.utils.errors import OrderRejectedError
+
+        client = MockOkxClient(
+            fail_with=OrderRejectedError(
+                51008,
+                "Order placement failed due to insufficient balance",
+                "/api/v5/trade/order",
+                sub_code="1000",
+                client_order_id="c-1",
+            )
+        )
+        executor, ledger = _executor(repos, client, _verified_guard())
+
+        result = await _submit(executor, _signal(), capabilities)
+
+        assert not result.success
+        assert not ledger.has_open_position
+        stored = repos.demo_orders.get(result.client_order_id)
+        assert stored["status"] == "rejected"
+        assert "51008" in stored["reject_reason"]
+        assert "code=1 " not in stored["reject_reason"]
+        assert "All operations failed" not in stored["reject_reason"]
+        assert "insufficient balance" in stored["reject_reason"]
+        # The rejection is journalled at the exchange layer with the real code.
+        rejections = repos.rejected.recent(5)
+        assert any(
+            r["layer_name"] == "exchange_rejection" and "51008" in r["reason"]
+            for r in rejections
+        )
+
     async def test_transport_failure_leaves_the_order_for_reconciliation(
         self, repos, capabilities
     ):

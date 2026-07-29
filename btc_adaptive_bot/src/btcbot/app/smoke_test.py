@@ -41,7 +41,12 @@ from ..exchange.models import (
     TdMode,
 )
 from ..exchange.rest import OkxDemoClient
-from ..utils.errors import ApiError, InstrumentNotFoundError, TransportError
+from ..utils.errors import (
+    ApiError,
+    InstrumentNotFoundError,
+    OrderRejectedError,
+    TransportError,
+)
 from ..utils.ids import new_uuid
 from ..utils.logging import get_logger
 from ..utils.numeric import format_qty
@@ -61,6 +66,10 @@ class SmokeStep:
     name: str
     passed: bool
     detail: str = ""
+    # Extra operator-facing lines printed beneath the step, one per line.
+    # Used for per-order rejections, where the useful fields (sCode, sMsg,
+    # subCode) do not read well crammed onto one line after an em dash.
+    lines: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -73,15 +82,32 @@ class SmokeReport:
     def passed(self) -> bool:
         return bool(self.steps) and all(step.passed for step in self.steps)
 
-    def add(self, name: str, passed: bool, detail: str = "") -> bool:
-        self.steps.append(SmokeStep(name, passed, detail))
+    def add(
+        self,
+        name: str,
+        passed: bool,
+        detail: str = "",
+        *,
+        lines: list[str] | None = None,
+    ) -> bool:
+        extra = list(lines or [])
+        self.steps.append(SmokeStep(name, passed, detail, extra))
         marker = "PASS" if passed else "FAIL"
-        message = f"[{marker}] {name}" + (f" — {detail}" if detail else "")
-        if passed:
-            log.info("SMOKE", message)
-        else:
-            log.error("SMOKE", message)
+        message = f"[{marker}] {name}" + (f" — {detail}" if detail and not extra else "")
+        emit = log.info if passed else log.error
+        emit("SMOKE", message)
+        for line in extra:
+            emit("SMOKE", line)
         return passed
+
+
+def _rejection_lines(exc: Exception) -> list[str] | None:
+    """The per-order fields to print under a failed order step.
+
+    Returns ``None`` for anything that is not a per-item rejection, so the
+    step falls back to its single-line detail.
+    """
+    return exc.report_lines() if isinstance(exc, OrderRejectedError) else None
 
 
 async def _wait_for_position(
@@ -226,7 +252,14 @@ async def run_smoke_test(loaded: LoadedConfig, credentials: Credentials) -> Smok
         try:
             result = await client.place_order(entry)
         except (ApiError, TransportError) as exc:
-            report.add("Place minimum-size demo order", False, str(exc))
+            # A rejected order carries its real sCode/sMsg/subCode. Print those
+            # rather than the envelope's useless "code=1 All operations failed".
+            report.add(
+                "Place minimum-size demo order",
+                False,
+                str(exc),
+                lines=_rejection_lines(exc),
+            )
             return report
         report.order_ids["entry"] = result.exchange_order_id
         report.order_ids["entry_client"] = result.client_order_id
@@ -287,6 +320,12 @@ async def run_smoke_test(loaded: LoadedConfig, credentials: Credentials) -> Smok
                 "Close the position",
                 False,
                 f"{exc} — CHECK YOUR OKX DEMO ACCOUNT: a position may still be open",
+                lines=(
+                    [*_rejection_lines(exc),
+                     "CHECK YOUR OKX DEMO ACCOUNT: a position may still be open"]
+                    if isinstance(exc, OrderRejectedError)
+                    else None
+                ),
             )
             return report
         report.order_ids["exit"] = close_result.exchange_order_id
@@ -325,8 +364,9 @@ def print_report(report: SmokeReport) -> None:
     lines = ["OKX DEMO SMOKE TEST", ""]
     for step in report.steps:
         lines.append(f"  [{'PASS' if step.passed else 'FAIL'}] {step.name}")
-        if step.detail:
+        if step.detail and not step.lines:
             lines.append(f"         {step.detail}")
+        lines.extend(f"         {line}" for line in step.lines)
     if report.order_ids:
         lines.append("")
         lines.append("  Order IDs:")
