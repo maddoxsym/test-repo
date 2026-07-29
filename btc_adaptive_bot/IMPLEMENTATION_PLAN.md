@@ -163,6 +163,32 @@ raising on the envelope, destroying the only diagnostic that exists.
       against a stubbed transport, including the reported payload verbatim and a
       credential-leakage check
 
+## Phase R7 — Fill reconciliation  `[x]`
+
+Found by the first fully successful live smoke test: the round trip worked end to end
+(order filled, position opened, closed reduce-only, account flat) but the fill step
+reported "no fill matched the client order ID". Two causes, both real:
+
+1. OKX's read endpoints are eventually consistent and settle in a fixed order — order
+   details, then positions, then **fills last**. The fills endpoint was asked immediately.
+2. OKX left `clOrdId` blank on the fills endpoint, so matching on it found nothing even
+   once the fill published.
+
+- [x] `OrderDetails` model + `client.get_order(instId, ordId|clOrdId)` — `51603` returns
+      `None` (a real answer), everything else still raises
+- [x] `execution/reconciliation.py`: order details are the authority, polled
+      immediate/0.25/0.5/1/2/2/2s (7.75s); fills polled separately on a shorter schedule
+- [x] `match_fills` keys on `ordId` first, `clOrdId` only as fallback
+- [x] Partial fills count as confirmed (contracts moved); canceled is terminal
+- [x] Executor and smoke test share the one reconciler — no smoke-test-only path
+- [x] Fill persistence resolves the order by `ordId`, so a blank-`clOrdId` fill is
+      attributed rather than orphaned; late fills are persisted idempotently
+- [x] Unconfirmed after the budget → `BreakerType.UNCONFIRMED_FILL` SAFE_MODE, ledger
+      untouched, no replacement order (the `UNIQUE(setup_id, intent)` reservation makes
+      resubmission structurally impossible)
+- [x] Smoke test PASSES on order-details proof; a delayed per-fill record is `[WARN]`
+- [x] `tests/unit/test_fill_reconciliation.py` (36) + executor scenarios + audit checks
+
 ---
 
 # Part I — Bybit Demo build (historical record, complete)

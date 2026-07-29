@@ -510,6 +510,21 @@ class DemoOrderRepository(BaseRepository):
             self.db.query_one("SELECT * FROM demo_orders WHERE client_order_id = ?", (client_order_id,))
         )
 
+    def get_by_exchange_order_id(self, exchange_order_id: str) -> dict[str, Any] | None:
+        """Look an order up by OKX's ``ordId``.
+
+        Fills frequently arrive with an empty ``clOrdId`` — OKX only echoes it
+        on some surfaces — so ``ordId`` is the identifier that reliably ties a
+        fill back to the order that produced it.
+        """
+        if not exchange_order_id:
+            return None
+        return row_to_dict(
+            self.db.query_one(
+                "SELECT * FROM demo_orders WHERE exchange_order_id = ?", (exchange_order_id,)
+            )
+        )
+
     def has_open_intent(self, setup_id: str, intent: str) -> bool:
         return (
             self.db.query_one(

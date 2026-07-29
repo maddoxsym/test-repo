@@ -71,6 +71,7 @@ from .models import (
     InstType,
     LeverageInfo,
     OpenOrder,
+    OrderDetails,
     OrderRequest,
     OrderResult,
     Ticker,
@@ -86,6 +87,11 @@ RETRYABLE_CODES = frozenset({50004, 50011, 50013, 50026})
 TIMESTAMP_ERROR_CODES = frozenset({50102})
 # Authentication failures (invalid key / signature / passphrase).
 AUTH_FAILURE_CODES = frozenset({50111, 50113, 50119, 50100, 50103, 50104, 50105})
+# "Order does not exist" — a real answer from an order lookup, not a failure.
+# Reconciliation must be able to ask about an order that was never accepted.
+# Deliberately narrow: anything else (parameter errors, auth, instrument
+# problems) still raises, because "not found" must not mask a real fault.
+ORDER_NOT_FOUND_CODES = frozenset({51603})
 
 CANDLES_MAX_LIMIT = 300       # documented maximum for /api/v5/market/candles
 HISTORY_CANDLES_MAX_LIMIT = 100
@@ -713,6 +719,40 @@ class OkxDemoClient:
             self._consecutive_errors += 1
             log.warning("OKX", f"cancel_all: {len(failures)} cancellations failed: {failures[:3]}")
         return {"cancelled": cancelled, "failed": failures}
+
+    async def get_order(
+        self,
+        inst_id: str,
+        *,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> OrderDetails | None:
+        """Read one order's authoritative state from ``GET /api/v5/trade/order``.
+
+        ``order_id`` (OKX's ``ordId``) is preferred: it is assigned by the
+        exchange and is the identifier every other endpoint keys on.
+        ``client_order_id`` is a fallback for orders whose ``ordId`` we never
+        received — a transport failure mid-submission, for instance.
+
+        Returns ``None`` when OKX says the order does not exist. That is a
+        legitimate answer during reconciliation (the order may never have been
+        accepted), not an error, so the caller decides what it means.
+        """
+        if not order_id and not client_order_id:
+            raise ApiError(-1, "order lookup requires order_id or client_order_id", Paths.ORDER)
+        params: dict[str, Any] = {"instId": inst_id}
+        if order_id:
+            params["ordId"] = order_id
+        else:
+            params["clOrdId"] = client_order_id
+        try:
+            payload = await self._request("GET", Paths.ORDER, params=params, authenticated=True)
+        except ApiError as exc:
+            if exc.ret_code in ORDER_NOT_FOUND_CODES:
+                return None
+            raise
+        data = self._data(payload)
+        return OrderDetails.from_response(data[0]) if data else None
 
     async def get_open_orders(self, inst_id: str) -> list[OpenOrder]:
         payload = await self._request(

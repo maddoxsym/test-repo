@@ -250,6 +250,22 @@ else
   failure "the demo verification gate is missing from the executor"
 fi
 
+# Reconciliation runs after an order was accepted, when state is uncertain.
+# It must be structurally incapable of sending anything.
+if grep -qE 'place_order|cancel_order|cancel_all|set_leverage' \
+     src/btcbot/execution/reconciliation.py; then
+  failure "the fill reconciler references an order-submitting call"
+else
+  pass "fill reconciliation is read-only — it cannot submit or cancel anything"
+fi
+
+if grep -q 'record_unconfirmed_order' src/btcbot/execution/demo_executor.py &&
+   grep -q 'record_unconfirmed_order' src/btcbot/safety/circuit_breakers.py; then
+  pass "an unconfirmed fill enters SAFE_MODE instead of being guessed at"
+else
+  failure "the unconfirmed-fill SAFE_MODE path is missing"
+fi
+
 if grep -q 'max_risk_pct' src/btcbot/risk/position_sizing.py && \
    grep -q 'clamp(risk_pct' src/btcbot/risk/position_sizing.py; then
   pass "position sizing is hard-clamped to the configured risk ceiling"

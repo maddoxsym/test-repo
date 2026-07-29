@@ -280,6 +280,40 @@ Note the two independent checks this implies: a clean envelope (`code: 0`) with 
 item is still a rejection, and a rejected envelope with no item to inspect is still a
 failure. Neither level alone is trusted.
 
+### Read endpoints are eventually consistent, and not in the same order
+
+After a market order is accepted, OKX's read surfaces become consistent on
+different schedules. Observed order, fastest first:
+
+| Endpoint | What it settles | Timing |
+|---|---|---|
+| `GET /api/v5/trade/order` | `state`, `accFillSz`, `avgPx`, `fee`, `uTime` | first — reflects the match engine |
+| `GET /api/v5/account/positions` | the position | shortly after |
+| `GET /api/v5/trade/fills` | the individual trades (`tradeId`, `fillPx`, `fillSz`, per-fill `fee`) | **last**, sometimes by a second or more |
+
+Asking the fills endpoint immediately therefore produces a false negative: a
+real, filled, visible position reported as "no fill matched the client order
+ID". That is exactly what the first successful live smoke test hit.
+
+So `execution/reconciliation.py` encodes: **order details are the authority on
+whether the order filled; the fills endpoint is the authority on per-fill
+detail.** Order details are polled on a bounded schedule — immediate, then
+0.25s, 0.5s, 1s, 2s, 2s, 2s (7.75s of waiting) — stopping on `filled`,
+`partially_filled` or `canceled`. Once a fill is proven, fills are polled on a
+shorter schedule (0/0.25/0.5/1s); a miss there is a delay, not a failure.
+
+Two more things this costs nothing to get right:
+
+* **`ordId`, not `clOrdId`.** OKX does not always echo `clOrdId` on the fills
+  endpoint — in the live run it came back empty. Matching on `clOrdId` alone
+  finds nothing; matching on `ordId` finds it. `clOrdId` remains a fallback for
+  an order whose `ordId` we never received.
+* **Unconfirmed is not "did not fill".** If the budget expires without the
+  order settling, the system does not know whether it holds a position. It
+  enters SAFE_MODE, leaves the ledger untouched, and never sends a replacement
+  order — the `UNIQUE(setup_id, intent)` reservation makes a second submission
+  for that setup structurally impossible.
+
 ---
 
 ## 4. How this system proves it is on Demo

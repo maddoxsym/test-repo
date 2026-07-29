@@ -44,6 +44,7 @@ class BreakerType(str, Enum):
     DEMO_UNVERIFIED = "demo_unverified"
     CLOCK_DRIFT = "clock_drift"
     LIQUIDATION_RISK = "liquidation_risk"
+    UNCONFIRMED_FILL = "unconfirmed_fill"
 
 
 @dataclass(slots=True)
@@ -292,6 +293,24 @@ class CircuitBreakers:
                 BreakerType.DATABASE_FAILURE, f"{self._db_failures} database failures: {error}"
             )
         return None
+
+    def record_unconfirmed_order(
+        self, *, order_id: str, client_order_id: str, detail: str
+    ) -> BreakerTrip:
+        """An accepted order whose outcome the exchange would not confirm.
+
+        This is the one state where the system genuinely does not know whether
+        it holds a position, so it stops rather than guessing. Trading pauses,
+        the caller reconciles against the exchange, and **no replacement order
+        is ever sent** — a blind retry here is how one intended position
+        becomes two.
+        """
+        return self._trip(
+            BreakerType.UNCONFIRMED_FILL,
+            f"order {order_id or client_order_id} accepted but not confirmed: {detail}",
+            order_id=order_id,
+            client_order_id=client_order_id,
+        )
 
     def record_order_submitted(self) -> None:
         self._order_times.append(now_utc())

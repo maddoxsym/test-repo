@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import ROUND_FLOOR, Decimal
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar
 
 from ..utils.numeric import round_step_down, round_to_tick, to_decimal
 from ..utils.timeutil import is_candle_closed
@@ -640,6 +640,110 @@ class OpenOrder:
             status=item.get("state", ""),
             leverage=float(item.get("lever") or 0.0),
             created_ms=int(item.get("cTime") or 0),
+            raw=item,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OrderDetails:
+    """One order from ``GET /api/v5/trade/order`` — the authority on its state.
+
+    This is the endpoint that settles "did my order fill?". The positions
+    endpoint and the fills endpoint both become consistent on their own
+    schedules, and the fills endpoint is routinely the *last* to update; order
+    details reflect the match engine directly, so this is what reconciliation
+    polls.
+
+    ``state`` is OKX's own vocabulary: ``live``, ``partially_filled``,
+    ``filled``, ``canceled``, ``mmp_canceled``.
+    """
+
+    order_id: str
+    client_order_id: str
+    inst_id: str
+    state: str
+    side: Side
+    pos_side: str
+    order_type: str
+    size: float                  # contracts requested
+    filled_size: float           # accFillSz — contracts filled so far
+    avg_price: float             # avgPx over all fills
+    last_fill_price: float       # fillPx of the most recent fill, if reported
+    last_fill_size: float        # fillSz of the most recent fill, if reported
+    fee: float                   # cost-positive: >0 means the order cost money
+    fee_currency: str
+    leverage: float
+    created_ms: int
+    updated_ms: int              # uTime
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    # OKX order states, named once so no caller compares raw strings.
+    FILLED: ClassVar[str] = "filled"
+    PARTIALLY_FILLED: ClassVar[str] = "partially_filled"
+    CANCELED: ClassVar[str] = "canceled"
+    MMP_CANCELED: ClassVar[str] = "mmp_canceled"
+    LIVE: ClassVar[str] = "live"
+
+    @property
+    def is_filled(self) -> bool:
+        """Completely filled *and* the exchange agrees size moved."""
+        return self.state == self.FILLED and self.filled_size > 0
+
+    @property
+    def is_partially_filled(self) -> bool:
+        return self.state == self.PARTIALLY_FILLED and self.filled_size > 0
+
+    @property
+    def is_canceled(self) -> bool:
+        return self.state in (self.CANCELED, self.MMP_CANCELED)
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether polling can stop: the order will not change further."""
+        return self.is_filled or self.is_canceled
+
+    @property
+    def proves_fill(self) -> bool:
+        """Whether these details are sufficient evidence that size moved.
+
+        A partial fill counts: contracts really did change hands, so the
+        position is real even though the order is not finished.
+        """
+        return self.filled_size > 0 and self.state in (
+            self.FILLED,
+            self.PARTIALLY_FILLED,
+        )
+
+    def describe(self) -> str:
+        detail = f"state={self.state} accFillSz={self.filled_size:g}"
+        if self.avg_price > 0:
+            detail += f" avgPx={self.avg_price:,.2f}"
+        if self.fee:
+            detail += f" fee={self.fee:.6f} {self.fee_currency}".rstrip()
+        return detail
+
+    @classmethod
+    def from_response(cls, item: dict[str, Any]) -> OrderDetails:
+        return cls(
+            order_id=item.get("ordId", ""),
+            client_order_id=item.get("clOrdId", ""),
+            inst_id=item.get("instId", ""),
+            state=item.get("state", ""),
+            side=Side(item.get("side", "buy")),
+            pos_side=item.get("posSide", ""),
+            order_type=item.get("ordType", ""),
+            size=float(item.get("sz") or 0.0),
+            filled_size=float(item.get("accFillSz") or 0.0),
+            avg_price=float(item.get("avgPx") or 0.0),
+            last_fill_price=float(item.get("fillPx") or 0.0),
+            last_fill_size=float(item.get("fillSz") or 0.0),
+            # OKX reports fees negative-when-charged; flip to cost-positive so
+            # every fee in this system reads the same way.
+            fee=-float(item.get("fee") or 0.0),
+            fee_currency=item.get("feeCcy", ""),
+            leverage=float(item.get("lever") or 0.0),
+            created_ms=int(item.get("cTime") or 0),
+            updated_ms=int(item.get("uTime") or 0),
             raw=item,
         )
 

@@ -459,6 +459,79 @@ class TestTopLevelErrorsStillFailImmediately:
         assert exc.value.ret_code == 1
 
 
+class TestOrderDetailsLookup:
+    """GET /api/v5/trade/order — the authority reconciliation polls."""
+
+    async def test_it_queries_by_instid_and_ordid(self):
+        client = _client(
+            {"code": "0", "msg": "", "data": [{
+                "instId": "BTC-USDT-SWAP", "ordId": "3785756861732241408",
+                "clOrdId": "smoke8b811244a1cc40d7ab27ca33", "state": "filled",
+                "side": "buy", "posSide": "net", "ordType": "market", "sz": "0.01",
+                "accFillSz": "0.01", "avgPx": "118000.1", "fillPx": "118000.1",
+                "fillSz": "0.01", "fee": "-0.0708", "feeCcy": "USDT", "lever": "1",
+                "cTime": "1700000000000", "uTime": "1700000000450"}]}
+        )
+        try:
+            details = await client.get_order(
+                "BTC-USDT-SWAP", order_id="3785756861732241408"
+            )
+            query = client.requests[-1].url.params   # type: ignore[attr-defined]
+        finally:
+            await client.close()
+
+        assert query["instId"] == "BTC-USDT-SWAP"
+        assert query["ordId"] == "3785756861732241408"
+        assert "clOrdId" not in query, "ordId is available — clOrdId must not be sent too"
+        assert details is not None
+        assert details.is_filled
+        assert details.proves_fill
+        assert details.fee == pytest.approx(0.0708)
+
+    async def test_clordid_is_used_only_when_no_ordid_is_known(self):
+        client = _client({"code": "0", "msg": "", "data": []})
+        try:
+            await client.get_order("BTC-USDT-SWAP", client_order_id="smoke8b")
+            query = client.requests[-1].url.params   # type: ignore[attr-defined]
+        finally:
+            await client.close()
+        assert query["clOrdId"] == "smoke8b"
+        assert "ordId" not in query
+
+    async def test_an_unknown_order_returns_none_rather_than_raising(self):
+        """51603 is a real answer during reconciliation, not a fault."""
+        client = _client({"code": "51603", "msg": "Order does not exist", "data": []})
+        try:
+            assert await client.get_order("BTC-USDT-SWAP", order_id="nope") is None
+        finally:
+            await client.close()
+
+    async def test_other_errors_still_raise(self):
+        """'Not found' must never mask an auth or parameter failure."""
+        client = _client({"code": "50113", "msg": "Invalid signature", "data": []})
+        try:
+            with pytest.raises(ApiError) as exc:
+                await client.get_order("BTC-USDT-SWAP", order_id="x")
+        finally:
+            await client.close()
+        assert exc.value.ret_code == 50113
+
+    async def test_an_identifier_is_required(self):
+        client = _client({"code": "0", "msg": "", "data": []})
+        try:
+            with pytest.raises(ApiError):
+                await client.get_order("BTC-USDT-SWAP")
+        finally:
+            await client.close()
+
+    async def test_an_empty_data_array_returns_none(self):
+        client = _client({"code": "0", "msg": "", "data": []})
+        try:
+            assert await client.get_order("BTC-USDT-SWAP", order_id="x") is None
+        finally:
+            await client.close()
+
+
 class TestTheRelaxationIsNarrow:
     def test_only_trade_endpoints_are_eligible(self):
         expected = frozenset(

@@ -584,6 +584,17 @@ was malformed), and `51400` (the order no longer exists). If you only ever see
 `code=1` with no `sCode` line, the response carried no item to inspect, which is
 reported as a plain envelope error.
 
+**`Fill recorded — no fill matched the client order ID`**
+Fixed. OKX's read endpoints settle at different speeds: order details first,
+then the position, then the per-fill records. The bot now confirms fills from
+`GET /api/v5/trade/order` — the authority — polling on a bounded schedule
+(immediate, then 0.25s, 0.5s, 1s, 2s, 2s, 2s), and matches fills by `ordId`
+rather than `clOrdId`, which OKX often leaves blank on the fills endpoint. A
+per-fill record that has not appeared yet is now a `[WARN]`, not a failure; it
+is persisted when it arrives. If an order genuinely cannot be confirmed within
+the budget, the bot enters SAFE_MODE, leaves the ledger untouched and never
+sends a replacement order.
+
 **403 Forbidden reaching OKX**
 Either a proxy/firewall is blocking the configured REST host, or your IP is in a region OKX
 refuses, or your account isn't eligible from your location. The error lists all

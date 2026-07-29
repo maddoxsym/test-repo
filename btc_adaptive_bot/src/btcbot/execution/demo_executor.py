@@ -66,6 +66,7 @@ from ..utils.numeric import format_qty
 from ..utils.timeutil import iso, now_utc
 from .order_safety import OrderSafetyGuard, disclose_order
 from .position_ledger import LedgerPosition, PositionLedger
+from .reconciliation import FillReconciler, ReconciliationOutcome
 
 log = get_logger(__name__)
 
@@ -124,8 +125,12 @@ class DemoExecutor:
         experiment_id: str,
         position_mode: PositionMode = PositionMode.NET,
         dry_run: bool = False,
+        reconciler: FillReconciler | None = None,
     ) -> None:
         self.client = client
+        # One reconciliation behaviour, shared with the smoke test. Injectable
+        # so tests can shorten the backoff without changing what is tested.
+        self.reconciler = reconciler or FillReconciler(client)
         self.guard = guard
         self.breakers = breakers
         self.sizer = sizer
@@ -533,6 +538,25 @@ class DemoExecutor:
                 strategy=signal.strategy_id,
             )
 
+            # Accepted is not filled. OKX settles its read endpoints on
+            # different schedules, so the outcome is established from order
+            # details (the authority) before a position is booked.
+            outcome = await self._confirm_fill(
+                instrument.inst_id,
+                order_id=result.exchange_order_id,
+                client_order_id=order_id,
+            )
+            if not outcome.confirmed:
+                return self._handle_unconfirmed(
+                    outcome,
+                    inst_id=instrument.inst_id,
+                    order_id=result.exchange_order_id,
+                    client_order_id=order_id,
+                    signal=signal,
+                    setup_id=setup_id,
+                    signal_id=signal_id,
+                )
+
             # Best-effort: read back the live position for its actual
             # liquidation price so the protection layer monitors real numbers.
             liq_price = await self._read_liq_price(instrument.inst_id, signal.direction)
@@ -739,25 +763,195 @@ class DemoExecutor:
             )
             self.breakers.record_order_submitted()
             self.submitted_orders += 1
+
+            # Same reconciliation as the entry path: confirm the exit really
+            # filled and persist its fills (and its fee) rather than assuming.
+            # An exit that cannot be confirmed is reported but does not enter
+            # SAFE_MODE here — the trade manager re-reads the position, and a
+            # stale "still open" reading is the safe direction to be wrong in.
+            outcome = await self._confirm_fill(
+                position.symbol,
+                order_id=result.exchange_order_id,
+                client_order_id=order_id,
+            )
+            if not outcome.confirmed:
+                log.warning(
+                    "RECONCILE",
+                    f"Exit order {result.exchange_order_id} not confirmed within the "
+                    f"reconciliation budget ({outcome.detail}) — the position will be "
+                    "re-read from the exchange rather than assumed closed",
+                )
             return DemoExecutionResult(
                 True, client_order_id_value=order_id, exchange_order_id=result.exchange_order_id
             )
         finally:
             self.safety.finish(position.setup_id, intent)
 
-    # --- fills ------------------------------------------------------------
+    # --- fills and reconciliation -----------------------------------------
+
+    async def _confirm_fill(
+        self, inst_id: str, *, order_id: str, client_order_id: str
+    ) -> ReconciliationOutcome:
+        """Establish whether an accepted order actually filled, and persist it.
+
+        Order details are the authority (see ``execution/reconciliation.py``);
+        the fills endpoint lags them and supplies the per-fill detail. Any
+        fill records that do arrive are persisted here, and any that arrive
+        later are picked up by :meth:`record_fill` from the private stream or
+        by startup reconciliation — both idempotent on ``fill_id``.
+        """
+        try:
+            outcome = await self.reconciler.reconcile(
+                inst_id, order_id=order_id, client_order_id=client_order_id
+            )
+        except (ApiError, TransportError) as exc:
+            # Reads failed outright. Unknown outcome — treated exactly like a
+            # timeout: never assumed filled, never assumed not filled.
+            log.error("RECONCILE", f"Could not read back order {order_id}: {exc}")
+            return ReconciliationOutcome(
+                order=None, detail=f"reconciliation reads failed: {exc}"
+            )
+
+        for execution in outcome.fills:
+            self.record_fill(execution)
+
+        if outcome.confirmed:
+            self.orders.mark_result(
+                client_order_id,
+                status="partially_filled" if outcome.partially_filled else "filled",
+                exchange_order_id=outcome.order.order_id if outcome.order else order_id,
+                raw_response=outcome.order.raw if outcome.order else None,
+            )
+            log.info("RECONCILE", f"Order {order_id} confirmed — {outcome.detail}")
+            if outcome.fills_delayed:
+                # Bookkeeping only: the fill is proven, its per-fill record is
+                # simply not published yet. The stream or the next startup
+                # reconciliation will persist it.
+                log.warning(
+                    "RECONCILE",
+                    f"Order {order_id} filled but its fill record has not appeared yet — "
+                    "it will be persisted when it does",
+                )
+        return outcome
+
+    def _handle_unconfirmed(
+        self,
+        outcome: ReconciliationOutcome,
+        *,
+        inst_id: str,
+        order_id: str,
+        client_order_id: str,
+        signal: StrategySignal,
+        setup_id: str,
+        signal_id: str | None,
+    ) -> DemoExecutionResult:
+        """An accepted order whose outcome could not be established.
+
+        Two distinct situations, handled differently:
+
+        * **Canceled** — a known outcome. No position exists, nothing is
+          ambiguous, so trading continues.
+        * **Unconfirmed** — the exchange never settled the order within the
+          budget. We do not know whether we hold a position, so SAFE_MODE is
+          entered and the position ledger is left untouched.
+
+        In neither case is a replacement order sent. The order row keeps its
+        ``UNIQUE(setup_id, intent)`` reservation, so a second submission for
+        this setup is structurally impossible.
+        """
+        if outcome.canceled:
+            self.orders.mark_result(
+                client_order_id,
+                status="cancelled",
+                exchange_order_id=order_id,
+                reject_reason=f"canceled at the exchange: {outcome.detail}",
+            )
+            log.warning("ORDER", f"Order {order_id} was canceled at the exchange — no position")
+            self._journal_rejection(
+                layer_index=10,
+                layer_name="order_canceled",
+                reason=outcome.detail,
+                signal=signal,
+                setup_id=setup_id,
+                signal_id=signal_id,
+            )
+            self.system.event(
+                "order_canceled",
+                f"{signal.strategy_id} entry canceled at the exchange before filling",
+                level="WARNING",
+                experiment_id=self.experiment_id,
+                payload={"order_id": order_id, "client_order_id": client_order_id},
+            )
+            return DemoExecutionResult(
+                False, reason=f"order canceled: {outcome.detail}",
+                client_order_id_value=client_order_id, exchange_order_id=order_id,
+            )
+
+        # Unknown. Stop trading and reconcile — never guess, never resubmit.
+        self.orders.mark_result(
+            client_order_id,
+            status="accepted",
+            exchange_order_id=order_id,
+            reject_reason=f"unconfirmed: {outcome.detail}",
+        )
+        self.breakers.record_unconfirmed_order(
+            order_id=order_id, client_order_id=client_order_id, detail=outcome.detail
+        )
+        log.critical(
+            "RECONCILE",
+            f"Order {order_id} ({inst_id}) was accepted but never confirmed. SAFE_MODE is "
+            "active and no replacement order will be sent. Reconcile positions against the "
+            "exchange before resuming.",
+        )
+        self._journal_rejection(
+            layer_index=10,
+            layer_name="unconfirmed_fill",
+            reason=outcome.detail,
+            signal=signal,
+            setup_id=setup_id,
+            signal_id=signal_id,
+        )
+        self.system.event(
+            "order_unconfirmed",
+            f"{signal.strategy_id} entry accepted but not confirmed — SAFE_MODE entered, "
+            "position ledger left untouched pending reconciliation",
+            level="ERROR",
+            experiment_id=self.experiment_id,
+            payload={
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "state": outcome.state,
+                "waited_seconds": round(outcome.waited_seconds, 2),
+                "attempts": outcome.order_attempts,
+            },
+        )
+        return DemoExecutionResult(
+            False, reason=f"unconfirmed fill: {outcome.detail}",
+            client_order_id_value=client_order_id, exchange_order_id=order_id,
+        )
 
     def record_fill(self, execution: Execution) -> None:
         """Persist a fill from the private stream or a REST reconciliation.
 
         OKX fill quantities are in contracts; the base-unit conversion for
         PnL accounting happens in the ledger, which knows the instrument.
+
+        Attribution resolves by ``ordId`` first. OKX does not always echo
+        ``clOrdId`` on the fills endpoint, and a fill whose ``clOrdId`` is
+        blank would otherwise be persisted orphaned — recorded, but attached
+        to no order, no strategy and no experiment.
         """
-        order = self.orders.get(execution.client_order_id) if execution.client_order_id else None
+        order = self.orders.get_by_exchange_order_id(execution.order_id)
+        if order is None and execution.client_order_id:
+            order = self.orders.get(execution.client_order_id)
+        # The order row is the authority on which client order this belongs to.
+        client_order_id = (
+            order.get("client_order_id") if order else execution.client_order_id
+        ) or None
         inserted = self.orders.record_fill(
             {
                 "fill_id": execution.exec_id,
-                "client_order_id": execution.client_order_id or None,
+                "client_order_id": client_order_id,
                 "exchange_order_id": execution.order_id,
                 "experiment_id": self.experiment_id,
                 "strategy_id": order.get("strategy_id") if order else None,
@@ -778,8 +972,11 @@ class DemoExecutor:
                 f"{execution.qty:g} contract(s) {execution.inst_id} @ {execution.price:,.2f} "
                 f"(fee {execution.fee:.6f} {execution.fee_currency})",
             )
-            if order:
-                self.orders.mark_result(execution.client_order_id, status="filled")
+            # Only promote to "filled" once the order is known and not already
+            # in a terminal state — a late fill must never reopen a cancelled
+            # order or downgrade one already reconciled.
+            if order and client_order_id and order.get("status") in ("submitted", "accepted"):
+                self.orders.mark_result(client_order_id, status="filled")
 
     # --- helpers ----------------------------------------------------------
 

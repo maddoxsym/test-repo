@@ -12,11 +12,17 @@ What it does, in order:
 3. Choose the **minimum safe leverage** (1x by default, never above 2x).
 4. Set the leverage and read it back to confirm it applied.
 5. Submit the **minimum valid size** — ``minSz`` contracts, nothing larger.
-6. Confirm the fill.
-7. Read the resulting position, including its liquidation price.
-8. Close it with a reduce-only order.
+6. Read the resulting position, including its liquidation price.
+7. Confirm the fill from ``GET /api/v5/trade/order`` — the authority — and
+   then look up the per-fill record, which OKX publishes later.
+8. Close it with a reduce-only order and confirm that fill the same way.
 9. Confirm the account is flat again.
 10. Print every order and fill ID, then PASS or FAIL.
+
+A per-fill record that has not appeared yet is reported as a **warning**, not
+a failure: order details already proved the contracts moved, and the position
+and flat checks prove it independently. Failing on fills-endpoint lag would
+mean failing a round trip that demonstrably worked.
 
 It never starts the 14-day timer: no experiment row is created, and the
 experiment manager is not involved at all.
@@ -41,6 +47,7 @@ from ..exchange.models import (
     TdMode,
 )
 from ..exchange.rest import OkxDemoClient
+from ..execution.reconciliation import FillReconciler
 from ..utils.errors import (
     ApiError,
     InstrumentNotFoundError,
@@ -70,6 +77,16 @@ class SmokeStep:
     # Used for per-order rejections, where the useful fields (sCode, sMsg,
     # subCode) do not read well crammed onto one line after an em dash.
     lines: list[str] = field(default_factory=list)
+    # A warning is something worth telling the operator that is not a failure
+    # — a delayed per-fill record when the fill itself is already proven, for
+    # instance. Warnings never fail the run.
+    warn: bool = False
+
+    @property
+    def marker(self) -> str:
+        if self.warn:
+            return "WARN"
+        return "PASS" if self.passed else "FAIL"
 
 
 @dataclass(slots=True)
@@ -89,16 +106,21 @@ class SmokeReport:
         detail: str = "",
         *,
         lines: list[str] | None = None,
+        warn: bool = False,
     ) -> bool:
         extra = list(lines or [])
-        self.steps.append(SmokeStep(name, passed, detail, extra))
-        marker = "PASS" if passed else "FAIL"
-        message = f"[{marker}] {name}" + (f" — {detail}" if detail and not extra else "")
-        emit = log.info if passed else log.error
+        step = SmokeStep(name, passed, detail, extra, warn)
+        self.steps.append(step)
+        message = f"[{step.marker}] {name}" + (f" — {detail}" if detail and not extra else "")
+        emit = log.warning if warn else (log.info if passed else log.error)
         emit("SMOKE", message)
         for line in extra:
             emit("SMOKE", line)
         return passed
+
+    def warn(self, name: str, detail: str = "") -> bool:
+        """Record something the operator should see that is not a failure."""
+        return self.add(name, True, detail, warn=True)
 
 
 def _rejection_lines(exc: Exception) -> list[str] | None:
@@ -145,6 +167,9 @@ async def run_smoke_test(loaded: LoadedConfig, credentials: Credentials) -> Smok
         profile=profile,
     )
     reach_label = f"Reach {profile.label} host"
+    # The same reconciler the research executor uses — the smoke test must not
+    # prove a code path that production does not run.
+    reconciler = FillReconciler(client)
 
     try:
         # --- 1. demo safety lock -------------------------------------
@@ -269,7 +294,7 @@ async def run_smoke_test(loaded: LoadedConfig, credentials: Credentials) -> Smok
             f"{size} contract(s) LONG · ordId {result.exchange_order_id}",
         )
 
-        # --- 6–7. confirm the fill and read the position ---------------
+        # --- 6–7. read the position, then confirm the fill --------------
         position = await _wait_for_position(client, spec.inst_id, want_open=True)
         if not report.add(
             "Position opened and confirmed",
@@ -284,17 +309,42 @@ async def run_smoke_test(loaded: LoadedConfig, credentials: Credentials) -> Smok
         ):
             return report
 
+        # OKX settles its read endpoints on different schedules — order details
+        # first, then positions, then fills. Ask the authority (order details)
+        # whether it filled, and treat a late per-fill record as a delay.
         try:
-            fills = await client.get_executions(spec.inst_id, limit=10)
-            report.fill_ids = [f.exec_id for f in fills if f.client_order_id == entry_id]
-            report.add(
-                "Fill recorded",
-                bool(report.fill_ids),
-                f"tradeIds {report.fill_ids}" if report.fill_ids
-                else "no fill matched the client order ID (the position exists regardless)",
+            outcome = await reconciler.reconcile(
+                spec.inst_id,
+                order_id=result.exchange_order_id,
+                client_order_id=entry_id,
             )
         except (ApiError, TransportError) as exc:
-            report.add("Fill recorded", False, str(exc))
+            report.add("Entry fill confirmed", False, str(exc))
+            return report
+
+        if not report.add(
+            "Entry fill confirmed",
+            outcome.confirmed,
+            outcome.detail,
+        ):
+            return report
+
+        report.fill_ids = outcome.fill_ids
+        if outcome.fills_delayed:
+            # Requirement of the fix: order details already proved the fill, so
+            # a missing per-fill record is bookkeeping lag, not a failure.
+            report.warn(
+                "Per-fill record published",
+                "not visible yet — the fill is already proven by order details "
+                f"(accFillSz {outcome.filled_size:g} @ {outcome.avg_price:,.2f}); "
+                "the research executor persists it when it appears",
+            )
+        else:
+            report.add(
+                "Per-fill record published",
+                True,
+                f"tradeIds {outcome.fill_ids} after {outcome.fill_attempts} poll(s)",
+            )
 
         # --- 8. close it, reduce-only ---------------------------------
         exit_id = f"smoke{new_uuid().replace('-', '')[:24]}"
@@ -336,6 +386,26 @@ async def run_smoke_test(loaded: LoadedConfig, credentials: Credentials) -> Smok
             f"{close_size} contract(s) · ordId {close_result.exchange_order_id}",
         )
 
+        # The exit gets the same treatment: order details decide, not the
+        # fills endpoint. A delayed exit fill record is likewise a warning —
+        # step 9 below independently proves the account really is flat.
+        try:
+            exit_outcome = await reconciler.reconcile(
+                spec.inst_id,
+                order_id=close_result.exchange_order_id,
+                client_order_id=exit_id,
+            )
+        except (ApiError, TransportError) as exc:
+            report.add("Exit fill confirmed", False, str(exc))
+            return report
+        if report.add("Exit fill confirmed", exit_outcome.confirmed, exit_outcome.detail):
+            report.fill_ids.extend(exit_outcome.fill_ids)
+            if exit_outcome.fills_delayed:
+                report.warn(
+                    "Exit per-fill record published",
+                    "not visible yet — the exit fill is already proven by order details",
+                )
+
         # --- 9. confirm flat ------------------------------------------
         await _wait_for_position(client, spec.inst_id, want_open=False)
         try:
@@ -363,7 +433,7 @@ def print_report(report: SmokeReport) -> None:
     """Print the PASS/FAIL summary block."""
     lines = ["OKX DEMO SMOKE TEST", ""]
     for step in report.steps:
-        lines.append(f"  [{'PASS' if step.passed else 'FAIL'}] {step.name}")
+        lines.append(f"  [{step.marker}] {step.name}")
         if step.detail and not step.lines:
             lines.append(f"         {step.detail}")
         lines.extend(f"         {line}" for line in step.lines)

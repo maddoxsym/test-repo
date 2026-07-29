@@ -28,6 +28,7 @@ from btcbot.exchange.instruments import ExchangeCapabilities
 from btcbot.exchange.models import (
     Execution,
     LeverageInfo,
+    OrderDetails,
     OrderResult,
     PositionMode,
     Side,
@@ -38,13 +39,14 @@ from btcbot.execution.allocator import DemoAllocator
 from btcbot.execution.demo_executor import DemoExecutor
 from btcbot.execution.order_safety import OrderSafetyGuard
 from btcbot.execution.position_ledger import PositionLedger
+from btcbot.execution.reconciliation import FillReconciler
 from btcbot.execution.trade_manager import TradeManager
 from btcbot.regime.classifier import Regime
 from btcbot.risk.leverage_engine import LeverageEngine
 from btcbot.risk.position_sizing import PositionSizer
 from btcbot.safety.circuit_breakers import CircuitBreakers
 from btcbot.strategies.base import Direction, ExitMechanism, ExitPolicy, StrategySignal
-from btcbot.utils.errors import ApiError
+from btcbot.utils.errors import ApiError, TransportError
 from btcbot.utils.timeutil import now_utc
 
 pytestmark = pytest.mark.integration
@@ -62,6 +64,9 @@ class MockOkxClient:
         *,
         fail_with: Exception | None = None,
         leverage_confirm_mismatch: bool = False,
+        order_state: str = "filled",
+        order_visible_after: int = 1,
+        fills_visible_after: int = 1,
     ) -> None:
         self.base_url = DEFAULT_PROFILE.rest_host
         self.profile = DEFAULT_PROFILE
@@ -72,6 +77,47 @@ class MockOkxClient:
         self._leverage_confirm_mismatch = leverage_confirm_mismatch
         self._current_leverage = "0"
         self.consecutive_errors = 0
+        # Eventual consistency knobs. OKX settles order details before the
+        # fills endpoint, so both are modelled with their own visibility lag.
+        self._order_state = order_state
+        self._order_visible_after = order_visible_after
+        self._fills_visible_after = fills_visible_after
+        self.order_lookups = 0
+        self.fill_lookups = 0
+
+    async def get_order(self, inst_id, *, order_id=None, client_order_id=None):
+        self.order_lookups += 1
+        if self.order_lookups < self._order_visible_after:
+            return None
+        filled = "0.001" if self._order_state in ("filled", "partially_filled") else "0"
+        return OrderDetails.from_response(
+            {
+                "instId": inst_id, "ordId": order_id or "mock-1",
+                "clOrdId": client_order_id or "", "state": self._order_state,
+                "side": "buy", "posSide": "net", "ordType": "market",
+                "sz": "0.001", "accFillSz": filled, "avgPx": "50000",
+                "fillPx": "50000", "fillSz": filled, "fee": "-0.02",
+                "feeCcy": "USDT", "lever": self._current_leverage or "1",
+                "cTime": "1700000000000", "uTime": "1700000000500",
+            }
+        )
+
+    async def get_executions(self, inst_id, *, limit=100, start_ms=None):
+        self.fill_lookups += 1
+        if self.fill_lookups < self._fills_visible_after:
+            return []
+        if self._order_state not in ("filled", "partially_filled"):
+            return []
+        return [
+            Execution.from_response(
+                {
+                    "tradeId": f"trade-{self.fill_lookups}", "ordId": "mock-1",
+                    "clOrdId": "", "instId": inst_id, "side": "buy", "posSide": "net",
+                    "fillPx": "50000", "fillSz": "0.001", "fee": "-0.02",
+                    "feeCcy": "USDT", "execType": "T", "ts": "1700000000500",
+                }
+            )
+        ]
 
     @property
     def has_credentials(self) -> bool:
@@ -83,7 +129,7 @@ class MockOkxClient:
         self.orders.append(request)
         return OrderResult(
             client_order_id=request.client_order_id,
-            exchange_order_id=f"mock-{len(self.orders)}",
+            exchange_order_id="mock-1",
             accepted=True,
             raw={"code": "0"},
         )
@@ -187,12 +233,18 @@ def _executor(
     *,
     dry_run: bool = False,
     position_mode: PositionMode = PositionMode.NET,
+    breakers: CircuitBreakers | None = None,
 ) -> tuple[DemoExecutor, PositionLedger]:
     ledger = PositionLedger(repos.positions, experiment_id="exp_test")
     executor = DemoExecutor(
         client,
+        # Same reconciliation logic as production; only the waits are zeroed so
+        # the tests do not spend the real 8-second budget.
+        reconciler=FillReconciler(
+            client, order_backoff=(0.0,) * 5, fills_backoff=(0.0,) * 3
+        ),
         guard=guard,
-        breakers=CircuitBreakers(SafetyConfig()),
+        breakers=breakers or CircuitBreakers(SafetyConfig()),
         sizer=PositionSizer(RiskConfig()),
         leverage_engine=LeverageEngine(LeverageConfig()),
         ledger=ledger,
@@ -260,7 +312,11 @@ class TestHappyPath:
         assert stored["setup_id"] == "set_1"
         assert stored["signal_id"] == "sig_1"
         assert stored["experiment_id"] == "exp_test"
-        assert stored["status"] == "accepted"
+        # Reconciliation ran: the order is not left at "accepted" but confirmed
+        # filled from order details, and its fill record is persisted.
+        assert stored["status"] == "filled"
+        assert stored["exchange_order_id"] == "mock-1"
+        assert repos.demo_orders.fills_for(result.client_order_id)
         assert stored["signal_ts_utc"]
         assert stored["sizing_reasoning"]
         assert stored["td_mode"] == "isolated"
@@ -313,8 +369,195 @@ class TestHappyPath:
         executor.record_fill(execution)
 
         fills = repos.demo_orders.fills_for(result.client_order_id)
-        assert len(fills) == 1, "the same execId was stored twice"
+        assert [f["fill_id"] for f in fills].count("exec_1") == 1, "the same execId was stored twice"
+        # The reconciliation fill and this one are both attributed to the order.
+        assert {f["fill_id"] for f in fills} == {"trade-1", "exec_1"}
         assert repos.demo_orders.get(result.client_order_id)["status"] == "filled"
+
+    async def test_a_fill_with_no_client_order_id_is_still_attributed(
+        self, repos, capabilities
+    ):
+        """OKX does not always echo clOrdId on the fills endpoint."""
+        client = MockOkxClient()
+        executor, _ = _executor(repos, client, _verified_guard())
+        result = await _submit(executor, _signal(), capabilities)
+
+        executor.record_fill(
+            Execution(
+                exec_id="exec_no_clordid", order_id="mock-1", client_order_id="",
+                inst_id="BTC-USDT-SWAP", side=Side.BUY, pos_side="net", price=50_010.0,
+                qty=0.1, fee=0.0275, fee_currency="USDT", is_maker=False,
+                exec_ts_ms=1_700_000_000_000,
+            )
+        )
+
+        fills = repos.demo_orders.fills_for(result.client_order_id)
+        orphan = next(f for f in fills if f["fill_id"] == "exec_no_clordid")
+        assert orphan["client_order_id"] == result.client_order_id
+        assert orphan["strategy_id"] == "ema_trend_cross_15m"
+        assert orphan["experiment_id"] == "exp_test"
+
+
+class TestFillReconciliationInTheExecutor:
+    """The production path must be as robust as the smoke test — not more, not less."""
+
+    async def test_a_delayed_fill_record_still_books_the_position(self, repos, capabilities):
+        """Order details prove the fill; the fills endpoint lagging is not a failure."""
+        client = MockOkxClient(fills_visible_after=3)
+        executor, ledger = _executor(repos, client, _verified_guard())
+
+        result = await _submit(executor, _signal(), capabilities)
+
+        assert result.success
+        assert ledger.has_open_position
+        assert repos.demo_orders.get(result.client_order_id)["status"] == "filled"
+        assert client.fill_lookups >= 3, "the fills endpoint was re-polled"
+        assert repos.demo_orders.fills_for(result.client_order_id)
+
+    async def test_the_position_is_booked_when_fills_never_publish(self, repos, capabilities):
+        """The reported live symptom: a real fill with no per-fill record yet."""
+        client = MockOkxClient(fills_visible_after=99)
+        executor, ledger = _executor(repos, client, _verified_guard())
+
+        result = await _submit(executor, _signal(), capabilities)
+
+        assert result.success, "a fill proven by order details must not be discarded"
+        assert ledger.has_open_position
+        assert repos.demo_orders.get(result.client_order_id)["status"] == "filled"
+        assert repos.demo_orders.fills_for(result.client_order_id) == []
+
+    async def test_a_late_fill_is_persisted_with_its_fee_when_it_arrives(
+        self, repos, capabilities
+    ):
+        """Requirement: late-arriving fill information must be persisted."""
+        client = MockOkxClient(fills_visible_after=99)
+        executor, _ = _executor(repos, client, _verified_guard())
+        result = await _submit(executor, _signal(), capabilities)
+        assert repos.demo_orders.fills_for(result.client_order_id) == []
+
+        # The private stream (or startup reconciliation) delivers it later.
+        executor.record_fill(
+            Execution(
+                exec_id="late-1", order_id="mock-1", client_order_id="",
+                inst_id="BTC-USDT-SWAP", side=Side.BUY, pos_side="net",
+                price=50_012.5, qty=0.1, fee=0.0331, fee_currency="USDT",
+                is_maker=False, exec_ts_ms=1_700_000_003_000,
+            )
+        )
+
+        fills = repos.demo_orders.fills_for(result.client_order_id)
+        assert [f["fill_id"] for f in fills] == ["late-1"]
+        assert fills[0]["fee"] == pytest.approx(0.0331)
+        assert fills[0]["fee_currency"] == "USDT"
+        assert fills[0]["strategy_id"] == "ema_trend_cross_15m"
+
+    async def test_a_partial_fill_books_the_position(self, repos, capabilities):
+        client = MockOkxClient(order_state="partially_filled")
+        executor, ledger = _executor(repos, client, _verified_guard())
+
+        result = await _submit(executor, _signal(), capabilities)
+
+        assert result.success, "contracts changed hands — the position is real"
+        assert ledger.has_open_position
+        assert repos.demo_orders.get(result.client_order_id)["status"] == "partially_filled"
+
+    async def test_a_canceled_order_books_no_position_and_does_not_stop_trading(
+        self, repos, capabilities
+    ):
+        breakers = CircuitBreakers(SafetyConfig())
+        client = MockOkxClient(order_state="canceled")
+        executor, ledger = _executor(
+            repos, client, _verified_guard(), breakers=breakers
+        )
+
+        result = await _submit(executor, _signal(), capabilities)
+
+        assert not result.success
+        assert not ledger.has_open_position
+        assert repos.demo_orders.get(result.client_order_id)["status"] == "cancelled"
+        assert not breakers.safe_mode.active, "a clean cancellation is a known outcome"
+        assert any(r["layer_name"] == "order_canceled" for r in repos.rejected.recent(5))
+
+
+class TestUnconfirmedFillEntersSafeMode:
+    async def test_an_order_that_never_settles_enters_safe_mode(self, repos, capabilities):
+        breakers = CircuitBreakers(SafetyConfig())
+        client = MockOkxClient(order_state="live")
+        executor, ledger = _executor(
+            repos, client, _verified_guard(), breakers=breakers
+        )
+
+        result = await _submit(executor, _signal(), capabilities)
+
+        assert not result.success
+        assert "unconfirmed" in result.reason
+        assert breakers.safe_mode.active
+        assert "not confirmed" in breakers.safe_mode.reason
+        # The ledger is NOT updated: we do not know whether we hold a position.
+        assert not ledger.has_open_position
+        # The order stays visible for reconciliation rather than being guessed at.
+        stored = repos.demo_orders.get(result.client_order_id)
+        assert stored["status"] == "accepted"
+        assert "unconfirmed" in stored["reject_reason"]
+        assert stored["exchange_order_id"] == "mock-1"
+
+    async def test_safe_mode_blocks_the_next_order_before_any_request(
+        self, repos, capabilities
+    ):
+        """Requirement: never place a duplicate replacement order blindly."""
+        breakers = CircuitBreakers(SafetyConfig())
+        client = MockOkxClient(order_state="live")
+        executor, _ = _executor(repos, client, _verified_guard(), breakers=breakers)
+
+        await _submit(executor, _signal(), capabilities)
+        assert len(client.orders) == 1
+
+        # A different setup, immediately afterwards: SAFE_MODE must stop it.
+        second = await _submit(
+            executor, _signal(setup_key="setup_key_2"), capabilities,
+            setup_id="set_2", signal_id="sig_2",
+        )
+        assert not second.success
+        assert len(client.orders) == 1, "no further order may be sent while unconfirmed"
+
+    async def test_the_same_setup_can_never_be_resubmitted(self, repos, capabilities):
+        """The UNIQUE(setup_id, intent) reservation outlives SAFE_MODE.
+
+        A zero cooldown is used so SAFE_MODE genuinely clears — otherwise this
+        would prove nothing beyond the previous test.
+        """
+        breakers = CircuitBreakers(SafetyConfig(safe_mode_cooldown_seconds=0))
+        client = MockOkxClient(order_state="live")
+        executor, _ = _executor(repos, client, _verified_guard(), breakers=breakers)
+
+        await _submit(executor, _signal(), capabilities)
+        assert breakers.orders_allowed()[0] is True, "SAFE_MODE really did clear"
+
+        retry = await _submit(executor, _signal(), capabilities)
+
+        assert not retry.success
+        assert len(client.orders) == 1, "the same setup must never produce a second order"
+
+    async def test_reconciliation_read_failure_is_treated_as_unconfirmed(
+        self, repos, capabilities
+    ):
+        """A failed read is never resolved as 'filled' or as 'not filled'."""
+        breakers = CircuitBreakers(SafetyConfig())
+        client = MockOkxClient()
+
+        async def _boom(*_args, **_kwargs):
+            raise TransportError("order lookup unavailable")
+
+        client.get_order = _boom                   # type: ignore[assignment]
+        executor, ledger = _executor(
+            repos, client, _verified_guard(), breakers=breakers
+        )
+
+        result = await _submit(executor, _signal(), capabilities)
+
+        assert not result.success
+        assert breakers.safe_mode.active
+        assert not ledger.has_open_position
 
 
 class TestGatesBlockBeforeAnyRequest:
