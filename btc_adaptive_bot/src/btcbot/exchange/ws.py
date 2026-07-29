@@ -1,8 +1,9 @@
 """WebSocket clients: public market data, business (candles), private account.
 
-All three connect to the **EEA demo** WS hosts pinned in ``endpoints.py`` —
-unlike REST, OKX separates demo and live by hostname (``wseeapap`` vs
-``wseea``), and the allow-list check is exact-string, never substring.
+All three connect to the demo WS hosts of the configured region, pinned in
+``endpoints.py`` — unlike REST, OKX separates demo and live by hostname
+(``wspap`` vs ``ws``, ``wseeapap`` vs ``wseea``, ``wsuspap`` vs ``wsus``), and
+the allow-list check is exact-string, never substring.
 
 OKX WS protocol specifics implemented here:
 
@@ -38,9 +39,8 @@ from ..utils.errors import MainnetRejectedError
 from ..utils.logging import get_logger
 from ..utils.timeutil import now_ms
 from .endpoints import (
-    DEMO_WS_BUSINESS,
-    DEMO_WS_PRIVATE,
-    DEMO_WS_PUBLIC,
+    DEFAULT_PROFILE,
+    DemoProfile,
     candle_channel,
     from_okx_bar,
     is_allowed_ws_url,
@@ -93,7 +93,8 @@ class _ReconnectingSocket:
             # Same structural guarantee as the REST client: a socket to a
             # non-demo host cannot even be constructed.
             raise MainnetRejectedError(
-                f"refusing to open a websocket to {url!r} — not an EEA demo endpoint"
+                f"refusing to open a websocket to {url!r} — not a recognised OKX "
+                "demo endpoint. Live streams are rejected by construction."
             )
         self.url = url
         self.name = name
@@ -270,20 +271,22 @@ class PublicMarketStream:
         orderbook_depth: int = 50,
         ping_interval: float = PING_IDLE_SECONDS,
         max_backoff: float = 60.0,
+        profile: DemoProfile = DEFAULT_PROFILE,
     ) -> None:
         self.inst_id = inst_id
         self.timeframes = timeframes
         self.orderbook_depth = orderbook_depth
+        self.profile = profile
         self.health: dict[str, StreamHealth] = {}
         self._public = _ReconnectingSocket(
-            DEMO_WS_PUBLIC,
+            profile.ws_public,
             name="public",
             ping_interval=ping_interval,
             max_backoff=max_backoff,
             on_connect=self._subscribe_public,
         )
         self._business = _ReconnectingSocket(
-            DEMO_WS_BUSINESS,
+            profile.ws_business,
             name="business",
             ping_interval=ping_interval,
             max_backoff=max_backoff,
@@ -467,7 +470,7 @@ class PublicMarketStream:
 
 
 class PrivateAccountStream:
-    """Private orders / account / positions stream on the EEA demo host."""
+    """Private orders / account / positions stream on the region's demo host."""
 
     def __init__(
         self,
@@ -477,14 +480,16 @@ class PrivateAccountStream:
         passphrase: str,
         ping_interval: float = PING_IDLE_SECONDS,
         max_backoff: float = 60.0,
+        profile: DemoProfile = DEFAULT_PROFILE,
     ) -> None:
         self._api_key = api_key
         self._api_secret = api_secret
         self._passphrase = passphrase
+        self.profile = profile
         self._logged_in = asyncio.Event()
         self.health: dict[str, StreamHealth] = {}
         self._socket = _ReconnectingSocket(
-            DEMO_WS_PRIVATE,
+            profile.ws_private,
             name="private",
             ping_interval=ping_interval,
             max_backoff=max_backoff,

@@ -30,6 +30,7 @@ from typing import Any
 
 from ..config.loader import Credentials, LoadedConfig
 from ..exchange.demo_guard import DemoGuard
+from ..exchange.endpoints import profile_for
 from ..exchange.instruments import CapabilityDiscovery
 from ..exchange.models import (
     OrderRequest,
@@ -108,22 +109,25 @@ async def run_smoke_test(loaded: LoadedConfig, credentials: Credentials) -> Smok
     config = loaded.config
     report = SmokeReport()
 
+    profile = profile_for(config.exchange.region)
     client = OkxDemoClient(
         api_key=credentials.api_key,
         api_secret=credentials.api_secret,
         passphrase=credentials.passphrase,
         timeout_seconds=config.exchange.request_timeout_seconds,
         max_retries=config.exchange.max_retries,
+        profile=profile,
     )
+    reach_label = f"Reach {profile.label} host"
 
     try:
         # --- 1. demo safety lock -------------------------------------
         try:
             await client.sync_clock()
         except (ApiError, TransportError) as exc:
-            report.add("Reach OKX EEA demo host", False, str(exc))
+            report.add(reach_label, False, str(exc))
             return report
-        report.add("Reach OKX EEA demo host", True, f"clock offset {client.clock_offset_ms}ms")
+        report.add(reach_label, True, f"clock offset {client.clock_offset_ms}ms")
 
         guard = DemoGuard(
             client,
@@ -131,6 +135,7 @@ async def run_smoke_test(loaded: LoadedConfig, credentials: Credentials) -> Smok
             api_secret=credentials.api_secret,
             passphrase=credentials.passphrase,
             run_mainnet_negative_control=config.safety.mainnet_negative_control,
+            profile=profile,
         )
         verification = await guard.verify()
         if not report.add(

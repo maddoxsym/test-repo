@@ -1,4 +1,4 @@
-"""BTC Adaptive Bot — OKX Europe Demo-only trading research system."""
+"""BTC Adaptive Bot — OKX Demo-only trading research system."""
 
 from .version import __version__, git_commit
 

@@ -1,6 +1,6 @@
 """Runtime instrument and capability discovery — the "BTCUSD UM X-Perp" finder.
 
-"BTCUSD UM X-Perp" is a *display name* in the OKX Europe UI; the API-level
+"BTCUSD UM X-Perp" is a *display name* in the OKX UI; the API-level
 ``instId`` behind it is **never hardcoded** (and was deliberately not assumed
 during research — see ``docs/okx_demo_capabilities.md`` §5). On startup — and
 on a timer, because size limits can change — the system asks the exchange

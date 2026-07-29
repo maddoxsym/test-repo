@@ -265,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="btcbot",
         description=(
-            "Adaptive BTC trading research system — OKX Europe Demo only "
+            "Adaptive BTC trading research system — OKX Demo only "
             "(BTC X-Perp). This build has no real-money trading mode."
         ),
     )

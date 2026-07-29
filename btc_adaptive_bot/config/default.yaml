@@ -34,12 +34,21 @@ market:
   regime_context_timeframe: "240"
 
 exchange:
+  # Which OKX regional entity issued your Demo Trading API key.
+  #   global -> OKX Global / UAE   https://openapi.okx.com   wspap.okx.com
+  #   eea    -> OKX Europe (EEA)   https://eea.okx.com       wseeapap.okx.com
+  #   us     -> OKX US             https://us.okx.com        wsuspap.okx.com
+  # A key belongs to exactly one entity; using the wrong one returns
+  # "50119 API key doesn't exist". Every option here is a DEMO profile —
+  # there is no value that reaches a live endpoint.
+  region: global
   request_timeout_seconds: 15
   max_retries: 4
   retry_backoff_base_seconds: 0.75
   instrument_refresh_minutes: 60
-  # Public + business (candles) + private streams all use the EEA DEMO
-  # WebSocket hosts (wseeapap.okx.com) — pinned in code, not configurable.
+  # Public + business (candles) + private streams use the DEMO WebSocket hosts
+  # for the region above (the "pap" infix). The URLs are pinned in code and
+  # checked against an exact-match allow-list — they are not configurable.
   public_ws_enabled: true
   private_ws_enabled: true
   orderbook_depth: 50

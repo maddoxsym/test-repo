@@ -17,16 +17,18 @@ from btcbot.exchange.demo_guard import SAFETY_LOCK_BANNER, DemoGuard, DemoVerifi
 from btcbot.exchange.endpoints import (
     ALLOWED_DEMO_HOSTS,
     ALLOWED_WS_URLS,
+    DEFAULT_PROFILE,
+    DEFAULT_REGION,
+    DEMO_PROFILES,
     DEMO_REST_HOST,
-    DEMO_WS_BUSINESS,
-    DEMO_WS_PRIVATE,
-    DEMO_WS_PUBLIC,
     FORBIDDEN_ENDPOINT_FRAGMENTS,
-    FORBIDDEN_HOSTS,
+    FORBIDDEN_WS_URLS,
+    GLOBAL_DEMO,
     SIMULATED_TRADING_HEADER,
     SIMULATED_TRADING_VALUE,
     is_allowed_authenticated_host,
     is_allowed_ws_url,
+    profile_for,
 )
 from btcbot.exchange.rest import LiveEnvironmentNegativeControlProbe, OkxDemoClient
 from btcbot.safety.circuit_breakers import BreakerType, CircuitBreakers
@@ -43,81 +45,161 @@ def _demo_client(**overrides) -> OkxDemoClient:
     return OkxDemoClient(**kwargs)
 
 
-class TestHostAllowList:
-    def test_demo_host_is_the_eea_entity(self):
-        assert DEMO_REST_HOST == "https://eea.okx.com"
-        assert DEMO_REST_HOST in ALLOWED_DEMO_HOSTS
+class TestRegionProfiles:
+    """The demo profile registry: every entry is demo, and only demo."""
 
+    def test_default_region_is_the_global_uae_entity(self):
+        assert DEFAULT_REGION == "global"
+        assert DEFAULT_PROFILE is GLOBAL_DEMO
+        assert DEMO_REST_HOST == "https://openapi.okx.com"
+
+    def test_global_profile_matches_the_documented_endpoints(self):
+        assert GLOBAL_DEMO.rest_host == "https://openapi.okx.com"
+        assert GLOBAL_DEMO.ws_public == "wss://wspap.okx.com:8443/ws/v5/public"
+        assert GLOBAL_DEMO.ws_private == "wss://wspap.okx.com:8443/ws/v5/private"
+        # Candle channels live on the business endpoint, which the SDK matrix
+        # spells with the demo brokerId query.
+        assert GLOBAL_DEMO.ws_business.startswith("wss://wspap.okx.com:8443/ws/v5/business")
+
+    def test_www_okx_com_is_an_accepted_alternative_global_rest_host(self):
+        """OKX's own SDK uses www.okx.com as the Global base; openapi is the default."""
+        assert "https://www.okx.com" in GLOBAL_DEMO.rest_hosts
+        assert is_allowed_authenticated_host("https://www.okx.com")
+
+    @pytest.mark.parametrize(
+        ("region", "rest", "ws_infix"),
+        [
+            ("global", "https://openapi.okx.com", "wspap"),
+            ("eea", "https://eea.okx.com", "wseeapap"),
+            ("us", "https://us.okx.com", "wsuspap"),
+        ],
+    )
+    def test_every_region_resolves_to_its_demo_endpoints(self, region, rest, ws_infix):
+        profile = profile_for(region)
+        assert profile.rest_host == rest
+        for url in profile.ws_urls:
+            assert url.startswith(f"wss://{ws_infix}.okx.com:8443/ws/v5/")
+            assert is_allowed_ws_url(url)
+
+    def test_region_lookup_is_case_and_space_insensitive(self):
+        assert profile_for("  GLOBAL ") is GLOBAL_DEMO
+
+    def test_unknown_region_raises_rather_than_defaulting(self):
+        with pytest.raises(ValueError) as exc:
+            profile_for("mainnet")
+        assert "unknown OKX region" in str(exc.value)
+
+    def test_no_profile_is_a_live_profile(self):
+        """Structural: every registered region dials a 'pap' (demo) WS host."""
+        for region, profile in DEMO_PROFILES.items():
+            for url in profile.ws_urls:
+                host = url.split("//", 1)[1].split(".", 1)[0]
+                assert "pap" in host, f"{region} dials non-demo WS host {host}"
+
+    def test_config_offers_exactly_the_registered_regions(self):
+        """A region in YAML that the registry doesn't know would fail at runtime."""
+        from btcbot.config.schema import ExchangeConfig
+
+        field = ExchangeConfig.model_fields["region"]
+        allowed = set(field.annotation.__args__)  # type: ignore[union-attr]
+        assert allowed == set(DEMO_PROFILES)
+        assert ExchangeConfig().region == DEFAULT_REGION
+
+
+class TestHostAllowList:
     def test_allow_lists_are_immutable(self):
         assert isinstance(ALLOWED_DEMO_HOSTS, frozenset)
         assert isinstance(ALLOWED_WS_URLS, frozenset)
+        assert isinstance(FORBIDDEN_WS_URLS, frozenset)
         with pytest.raises(AttributeError):
-            ALLOWED_DEMO_HOSTS.add("https://www.okx.com")  # type: ignore[attr-defined]
+            ALLOWED_DEMO_HOSTS.add("https://evil.example")  # type: ignore[attr-defined]
+
+    def test_every_profile_host_is_allow_listed(self):
+        for profile in DEMO_PROFILES.values():
+            assert profile.rest_hosts <= ALLOWED_DEMO_HOSTS
 
     @pytest.mark.parametrize(
         "host",
         [
-            "https://www.okx.com",
-            "https://us.okx.com",
-            "https://openapi.okx.com",
             "https://my.okx.com",
+            "https://openapi.okx.com.evil.example",
             "https://eea.okx.com.evil.example",
-            "http://eea.okx.com",
+            "http://eea.okx.com",          # plaintext
+            "https://openapi.okx.com/v5",  # path appended
             "https://localhost",
             "",
         ],
     )
-    def test_non_demo_hosts_are_refused(self, host):
+    def test_unrecognised_hosts_are_refused(self, host):
         assert not is_allowed_authenticated_host(host)
 
-    def test_ws_urls_are_the_eea_demo_endpoints(self):
-        assert DEMO_WS_PUBLIC == "wss://wseeapap.okx.com:8443/ws/v5/public"
-        assert DEMO_WS_PRIVATE == "wss://wseeapap.okx.com:8443/ws/v5/private"
-        # Candle channels live on the business endpoint, which carries the
-        # demo brokerId query.
-        assert DEMO_WS_BUSINESS == "wss://wseeapap.okx.com:8443/ws/v5/business?brokerId=9999"
-        for url in (DEMO_WS_PUBLIC, DEMO_WS_PRIVATE, DEMO_WS_BUSINESS):
-            assert is_allowed_ws_url(url)
+    @pytest.mark.parametrize(
+        ("demo", "live"),
+        [("wspap", "ws"), ("wseeapap", "wseea"), ("wsuspap", "wsus")],
+    )
+    def test_live_ws_differs_by_one_infix_and_is_refused(self, demo, live):
+        """Each live host is a single dropped 'pap' away — exact matching only."""
+        demo_url = f"wss://{demo}.okx.com:8443/ws/v5/private"
+        live_url = f"wss://{live}.okx.com:8443/ws/v5/private"
+        assert is_allowed_ws_url(demo_url)
+        assert not is_allowed_ws_url(live_url)
+        assert live_url in FORBIDDEN_WS_URLS
 
-    def test_eea_live_ws_differs_by_one_infix_and_is_refused(self):
-        """The live host is a single dropped 'pap' away — exact matching only."""
-        live = DEMO_WS_PRIVATE.replace("wseeapap", "wseea")
-        assert live == "wss://wseea.okx.com:8443/ws/v5/private"
-        assert not is_allowed_ws_url(live)
-        assert live in FORBIDDEN_HOSTS
+    def test_no_forbidden_url_leaked_into_the_allow_list(self):
+        assert not (ALLOWED_WS_URLS & FORBIDDEN_WS_URLS)
+        for url in FORBIDDEN_WS_URLS:
+            assert not is_allowed_ws_url(url)
+
+    def test_all_nine_live_ws_urls_are_forbidden(self):
+        expected = {
+            f"wss://{host}.okx.com:8443/ws/v5/{channel}"
+            for host in ("ws", "wseea", "wsus")
+            for channel in ("public", "private", "business")
+        }
+        assert expected == FORBIDDEN_WS_URLS
 
     @pytest.mark.parametrize(
         "url",
         [
-            "wss://ws.okx.com:8443/ws/v5/private",       # global live
-            "wss://wspap.okx.com:8443/ws/v5/private",    # global demo, wrong entity
-            "wss://wsuspap.okx.com:8443/ws/v5/private",  # US demo, wrong entity
-            "wss://wseea.okx.com:8443/ws/v5/public",     # EEA LIVE
-            "wss://wseeapap.okx.com:8443/ws/v5/business",  # missing brokerId query
+            "wss://ws.okx.com:8443/ws/v5/private",         # global live
+            "wss://wseea.okx.com:8443/ws/v5/public",       # EEA live
+            "wss://wsus.okx.com:8443/ws/v5/business",      # US live
+            "wss://wspap.okx.com:8443/ws/v5/private?x=1",  # unknown query
+            "wss://wspap.okx.com:8443/ws/v5/admin",        # unknown channel
+            "ws://wspap.okx.com:8443/ws/v5/public",        # plaintext
+            "wss://wspap.okx.com.evil.example:8443/ws/v5/public",
             "",
         ],
     )
     def test_every_other_ws_url_is_refused(self, url):
         assert not is_allowed_ws_url(url)
 
+    def test_business_url_is_accepted_with_or_without_the_broker_query(self):
+        """The two maintained SDKs disagree; neither spelling is a live host."""
+        base = "wss://wspap.okx.com:8443/ws/v5/business"
+        assert is_allowed_ws_url(base)
+        assert is_allowed_ws_url(f"{base}?brokerId=9999")
+
     def test_ws_socket_construction_refuses_live_urls(self):
         from btcbot.exchange.ws import _ReconnectingSocket
 
-        with pytest.raises(MainnetRejectedError):
-            _ReconnectingSocket("wss://wseea.okx.com:8443/ws/v5/private", name="x")
+        for url in sorted(FORBIDDEN_WS_URLS):
+            with pytest.raises(MainnetRejectedError):
+                _ReconnectingSocket(url, name="x")
 
 
 class TestLiveEnvironmentRejection:
     @pytest.mark.parametrize(
         "host",
         [
-            "https://www.okx.com",
-            "https://us.okx.com",
-            "https://openapi.okx.com",
             "https://my.okx.com",
+            "https://api.okx.com",
+            "https://openapi.okx.com.evil.example",
+            "http://openapi.okx.com",
+            "https://localhost:8443",
         ],
     )
-    def test_client_construction_refuses_non_demo_hosts(self, host):
+    def test_client_construction_refuses_unrecognised_hosts(self, host):
         """Refusal happens at construction, before any network activity."""
         with pytest.raises(MainnetRejectedError) as exc:
             _demo_client(base_url=host)
@@ -126,10 +208,34 @@ class TestLiveEnvironmentRejection:
     def test_demo_host_construction_succeeds(self):
         client = _demo_client()
         assert client.base_url == DEMO_REST_HOST
+        assert client.profile is DEFAULT_PROFILE
+
+    @pytest.mark.parametrize("region", sorted(DEMO_PROFILES))
+    def test_each_region_binds_the_client_to_its_own_host(self, region):
+        profile = profile_for(region)
+        client = _demo_client(profile=profile)
+        assert client.base_url == profile.rest_host
+        assert client.profile is profile
+        # The demo switch is region-independent — it is what keeps REST on demo.
+        assert client.demo_header_enforced() is True
 
     def test_trailing_slash_is_normalised(self):
         client = OkxDemoClient(base_url=DEMO_REST_HOST + "/")
         assert client.base_url == DEMO_REST_HOST
+
+    def test_key_not_found_hint_names_the_region_and_the_alternatives(self):
+        """OKX 50119 reads as a bad key but is nearly always the wrong entity."""
+        hint = _demo_client(profile=profile_for("eea"))._region_mismatch_hint()  # noqa: SLF001
+        assert "eea" in hint
+        assert "https://openapi.okx.com" in hint   # the region they likely want
+        assert "https://us.okx.com" in hint
+        assert "exchange.region" in hint
+
+    def test_negative_control_probe_targets_the_active_region(self):
+        probe = LiveEnvironmentNegativeControlProbe(
+            "k" * 20, "s" * 20, "p" * 12, profile=profile_for("eea")
+        )
+        assert probe._profile.rest_host == "https://eea.okx.com"  # noqa: SLF001
 
     def test_negative_control_probe_has_no_order_capability(self):
         """The live-environment probe must be structurally incapable of trading."""
@@ -352,6 +458,41 @@ class TestDemoGuardGating:
             "OKX DEMO ENVIRONMENT COULD NOT BE VERIFIED",
             "ORDER SUBMISSION DISABLED",
         )
+
+
+class TestGuardHostPinIsRegionAware:
+    """Signal 1 must audit the profile the client is actually bound to."""
+
+    @pytest.mark.parametrize("region", sorted(DEMO_PROFILES))
+    def test_host_pin_passes_for_every_demo_region(self, region):
+        profile = profile_for(region)
+        guard = DemoGuard(
+            OkxDemoClient(profile=profile), run_mainnet_negative_control=False
+        )
+        signal = guard._signal_host_pin()   # noqa: SLF001 - the check itself
+        assert signal.passed, signal.detail
+        assert profile.label in signal.detail
+
+    def test_guard_adopts_the_profile_its_client_is_bound_to(self):
+        """No second source of truth: the guard follows the transport."""
+        profile = profile_for("us")
+        guard = DemoGuard(OkxDemoClient(profile=profile))
+        assert guard.profile is profile
+
+    def test_host_pin_fails_if_the_profile_names_a_live_socket(self):
+        """A tampered profile must be caught by the signal, not trusted."""
+        from dataclasses import replace
+
+        live = replace(
+            profile_for("global"),
+            ws_private="wss://ws.okx.com:8443/ws/v5/private",
+        )
+        guard = DemoGuard(
+            OkxDemoClient(), run_mainnet_negative_control=False, profile=live
+        )
+        signal = guard._signal_host_pin()   # noqa: SLF001
+        assert not signal.passed
+        assert "outside the demo allow-list" in signal.detail
 
 
 class TestSecretHandling:

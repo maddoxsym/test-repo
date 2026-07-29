@@ -2,10 +2,12 @@
 
 Status legend: `[x]` done · `[~]` partial · `[ ]` not started
 
-The plan has two parts: the original **Bybit Demo build** (Phases 1–17, complete — kept
-below as the historical record) and the **OKX Europe Demo migration** (Phases M1–M12),
-which replaces the active exchange integration with OKX EEA Demo / BTC X-Perp while
-preserving every exchange-independent system.
+The plan has three parts: the original **Bybit Demo build** (Phases 1–17, complete — kept
+below as the historical record), the **OKX Demo migration** (Phases M1–M7), which replaced
+the active exchange integration with OKX Demo / BTC X-Perp, and the **regional profile
+migration** (Phases R1–R5), which generalised the EEA-only pin into a demo profile
+registry defaulting to OKX Global / UAE. Every exchange-independent system is preserved
+throughout.
 
 ---
 
@@ -78,6 +80,64 @@ allow-list, never substring matching.
 - [x] Full test suite green (all existing + new OKX tests, mocked-client integration)
 - [x] `ruff` clean; `audit_safety.sh` updated for OKX (header enforcement, host confinement)
 - [x] Dry run offline; audit for live endpoints / missing demo headers / contract maths
+
+---
+
+# Part III — Regional profile migration (OKX Global / UAE default)
+
+**Why.** The build pinned `https://eea.okx.com`. A Demo Trading key created on an OKX
+Dubai/UAE account is issued by a *different* regional entity, so that host answers
+`50119 API key doesn't exist` — which reads like a bad key but is a region mismatch.
+
+**Key finding.** REST is *not* environment-separated on OKX: every region serves demo and
+live from the same host, switched by `x-simulated-trading: 1`. So widening the REST
+allow-list across regions does not weaken the lock — the header plus the negative control
+are what protect REST. WebSockets *are* environment-separated, by a single `pap` infix, so
+that allow-list stays exact-match and the nine live URLs stay explicitly forbidden.
+
+## Phase R1 — Region profiles  `[x]`
+
+- [x] Re-verified endpoints against the maintained SDKs (primary docs still 403 — recorded
+      in `docs/okx_demo_capabilities.md` §0)
+- [x] `DemoProfile` dataclass + `DEMO_PROFILES` registry (global / eea / us), all demo-only
+- [x] Default `global`: REST `https://openapi.okx.com` (alt `https://www.okx.com`),
+      WS `wss://wspap.okx.com:8443/ws/v5/{public,private,business}`
+- [x] `ALLOWED_DEMO_HOSTS` / `ALLOWED_WS_URLS` derived from the registry;
+      `FORBIDDEN_WS_URLS` names all nine live URLs; business URL allowed with and
+      without `?brokerId=9999`
+- [x] `profile_for()` raises on an unknown region rather than defaulting
+
+## Phase R2 — Thread the region through the exchange layer  `[x]`
+
+- [x] `OkxDemoClient(profile=…)`; `LiveEnvironmentNegativeControlProbe(profile=…)`
+- [x] `PublicMarketStream` / `PrivateAccountStream` dial the profile's URLs
+- [x] `DemoGuard` adopts the profile its client is bound to; signal 1 validates that
+      profile's WS URLs instead of three EEA constants
+- [x] `exchange.region` config field (`global` | `eea` | `us`, default `global`)
+- [x] 50119 responses carry a region-mismatch diagnostic naming the alternatives
+
+## Phase R3 — App wiring  `[x]`
+
+- [x] Orchestrator resolves the profile once and passes it to client, guard, both streams
+- [x] `verify_demo.py` labels checks with the active region; prints the full region table
+      on a 50119
+- [x] `smoke_test.py` region-aware; dashboard shows environment, region, REST + WS hosts
+
+## Phase R4 — Tests, audit, docs  `[x]`
+
+- [x] `test_safety_lock.py`: region registry, per-region resolution, allow/deny-list
+      invariants, guard host pin per region, tampered-profile rejection
+- [x] `test_orchestrator_bootstrap.py`: region reaches client, guard and dashboard
+- [x] `audit_safety.sh` section 2 rewritten region-general (demo/live pairs per region +
+      an import-based invariant check that no live URL is reachable)
+- [x] `okx_demo_capabilities.md` §1a, README region table + 50119 troubleshooting,
+      `config/default.yaml`, `.env.example`
+
+## Phase R5 — Verification  `[x]`
+
+- [x] Full test suite green; `ruff check` clean; `audit_safety.sh` passing
+- [x] No authenticated verification claimed — the sandbox cannot reach any exchange and
+      no credentials were supplied to it
 
 ---
 

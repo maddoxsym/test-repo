@@ -23,6 +23,7 @@ from btcbot.config.schema import (
     ShadowConfig,
 )
 from btcbot.exchange.demo_guard import DemoGuard, DemoVerification, SignalResult
+from btcbot.exchange.endpoints import DEFAULT_PROFILE
 from btcbot.exchange.instruments import ExchangeCapabilities
 from btcbot.exchange.models import (
     Execution,
@@ -62,7 +63,8 @@ class MockOkxClient:
         fail_with: Exception | None = None,
         leverage_confirm_mismatch: bool = False,
     ) -> None:
-        self.base_url = "https://eea.okx.com"
+        self.base_url = DEFAULT_PROFILE.rest_host
+        self.profile = DEFAULT_PROFILE
         self.orders: list[Any] = []
         self.cancels: list[Any] = []
         self.leverage_sets: list[tuple[str, str, str | None]] = []

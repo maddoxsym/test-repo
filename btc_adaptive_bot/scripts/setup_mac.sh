@@ -104,8 +104,8 @@ cat <<'NEXT'
 
 Next steps:
 
-  1. Create OKX Europe DEMO API credentials:
-       - Log in to your OKX Europe account
+  1. Create OKX DEMO API credentials:
+       - Log in to your OKX account
        - Switch to "Demo Trading"
        - Profile -> API -> create a new DEMO key
        - Give it Read + Trade permissions (no withdrawal needed or used)

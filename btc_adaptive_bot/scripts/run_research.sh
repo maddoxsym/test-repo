@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start (or resume) the 14-day OKX Europe Demo research experiment.
+# Start (or resume) the 14-day OKX Demo research experiment.
 # Restarting this script does NOT restart the 14-day timer.
 source "$(dirname "$0")/_common.sh"
 echo "Starting OKX_DEMO_RESEARCH…"

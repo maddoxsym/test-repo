@@ -2,9 +2,9 @@
 
 Runs every check the brief lists and **never places an order**:
 
- 1. reach the EEA demo host, measure the clock offset
+ 1. reach the configured region's demo host, measure the clock offset
  2. clock drift within the trading budget
- 3. REST host pin + WebSocket URLs on the EEA demo allow-list
+ 3. REST host pin + WebSocket URLs on the demo allow-list
  4. demo header enforcement (``x-simulated-trading: 1`` from the single path)
  5. authenticated demo reachability (account config)
  6. live-environment negative control (same key, no header → must fail 50101)
@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 from ..config.loader import Credentials, LoadedConfig
 from ..exchange.demo_guard import DemoGuard
+from ..exchange.endpoints import DEMO_PROFILES, KEY_NOT_FOUND_CODE, DemoProfile, profile_for
 from ..exchange.instruments import CapabilityDiscovery
 from ..exchange.models import Capability
 from ..exchange.rest import OkxDemoClient
@@ -75,22 +76,27 @@ async def verify_demo_connection(
     config = loaded.config
     report = VerificationReport()
 
+    profile = profile_for(config.exchange.region)
     client = OkxDemoClient(
         api_key=credentials.api_key,
         api_secret=credentials.api_secret,
         passphrase=credentials.passphrase,
         timeout_seconds=config.exchange.request_timeout_seconds,
         max_retries=config.exchange.max_retries,
+        profile=profile,
     )
-    log.info("OKX", f"Host: {client.base_url} (demo environment)")
+    reach_label = f"1. Reach {profile.label} host"
+    log.info("OKX", f"Region: {profile.describe()}")
+    for url in profile.ws_urls:
+        log.info("OKX", f"WebSocket: {url}")
 
     try:
         # --- 1. connectivity + clock ---------------------------------
         try:
             offset = await client.sync_clock()
-            report.add("1. Reach OKX EEA demo host", True, f"clock offset {offset}ms")
+            report.add(reach_label, True, f"clock offset {offset}ms")
         except (ApiError, TransportError) as exc:
-            report.add("1. Reach OKX EEA demo host", False, str(exc))
+            report.add(reach_label, False, str(exc))
             return report
 
         # --- 2. clock drift budget ------------------------------------
@@ -109,10 +115,11 @@ async def verify_demo_connection(
             api_secret=credentials.api_secret,
             passphrase=credentials.passphrase,
             run_mainnet_negative_control=config.safety.mainnet_negative_control,
+            profile=profile,
         )
         verification = await guard.verify()
         signal_labels = {
-            "host pin": "3. Host pin (REST + WS on EEA demo allow-list)",
+            "host pin": "3. Host pin (REST + WS on the demo allow-list)",
             "demo header enforcement": "4. Demo header enforcement (x-simulated-trading: 1)",
             "authenticated reachability": "5. Authenticated demo reachability",
             "live-environment negative control": "6. Live-environment negative control",
@@ -124,6 +131,10 @@ async def verify_demo_connection(
                 signal.detail,
                 fatal=signal.required,
             )
+            # 50119 is reported as "API key doesn't exist", which reads like a
+            # bad key but is nearly always the wrong regional entity. Say so.
+            if not signal.passed and str(KEY_NOT_FOUND_CODE) in signal.detail:
+                _print_region_hint(profile)
         report.add(
             "7. Demo environment verified (all signals)",
             verification.verified,
@@ -271,6 +282,31 @@ async def verify_demo_connection(
         await client.close()
 
     return report
+
+
+def _print_region_hint(profile: DemoProfile) -> None:
+    """Explain OKX 50119 and list every demo region that could be configured."""
+    lines = [
+        f"OKX ERROR 50119 — API KEY NOT FOUND ON {profile.label.upper()}",
+        "",
+        "An OKX API key is issued by ONE regional entity and is unknown to the",
+        "others, so this error is usually a region mismatch rather than a bad key.",
+        "",
+        f"Currently configured: exchange.region: {profile.region}  ({profile.rest_host})",
+        "",
+        "Available demo regions:",
+    ]
+    for region, candidate in sorted(DEMO_PROFILES.items()):
+        marker = "->" if region == profile.region else "  "
+        lines.append(f"  {marker} {region:<7} {candidate.label} — {candidate.rest_host}")
+    lines += [
+        "",
+        "Set the matching value under `exchange.region` in config/default.yaml.",
+        "Also confirm the key was created inside OKX's Demo Trading area — a key",
+        "made on the live account will not work here, and this system has no",
+        "live mode to fall back to.",
+    ]
+    log.banner(lines, tag="OKX")
 
 
 def print_report(report: VerificationReport) -> None:

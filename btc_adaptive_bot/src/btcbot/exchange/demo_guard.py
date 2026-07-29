@@ -7,8 +7,9 @@ configuration flag, CLI switch, or environment variable that bypasses this.
 The four signals, translated to OKX's environment model (see
 ``docs/okx_demo_capabilities.md`` §4):
 
-1. **Host pin** — the REST client is bound to the EEA host and every WS URL is
-   on the exact-match EEA-demo allow-list.
+1. **Host pin** — the REST client is bound to the active region profile's host
+   and every WS URL that profile will dial is on the exact-match demo
+   allow-list. No region is hardcoded; the profile is chosen by config.
 2. **Demo header enforcement** — the client's single header-builder path
    injects ``x-simulated-trading: 1``; verified at runtime, not assumed.
 3. **Authenticated demo reachability** — account config + balance succeed
@@ -29,9 +30,8 @@ from ..utils.logging import get_logger
 from ..utils.timeutil import now_utc
 from .endpoints import (
     ALLOWED_DEMO_HOSTS,
-    DEMO_WS_BUSINESS,
-    DEMO_WS_PRIVATE,
-    DEMO_WS_PUBLIC,
+    DEFAULT_PROFILE,
+    DemoProfile,
     is_allowed_authenticated_host,
     is_allowed_ws_url,
 )
@@ -95,17 +95,25 @@ class DemoGuard:
         api_secret: str | None = None,
         passphrase: str | None = None,
         run_mainnet_negative_control: bool = True,
+        profile: DemoProfile | None = None,
     ) -> None:
         self._client = client
         self._api_key = api_key
         self._api_secret = api_secret
         self._passphrase = passphrase
+        # Prefer the profile the client is actually bound to: the guard should
+        # audit the transport in front of it, not a region it was told about.
+        self._profile = profile or getattr(client, "profile", DEFAULT_PROFILE)
         # Config key `safety.mainnet_negative_control` — "mainnet" here means
         # OKX's live (real-money) environment, selected by *omitting* the demo
         # header rather than by a different host.
         self._run_negative_control = run_mainnet_negative_control
         self._verified = False
         self._last_verification: DemoVerification | None = None
+
+    @property
+    def profile(self) -> DemoProfile:
+        return self._profile
 
     @property
     def verified(self) -> bool:
@@ -164,18 +172,23 @@ class DemoGuard:
 
     def _signal_host_pin(self) -> SignalResult:
         """Signal 1 — REST host and WS URLs are on the exact-match allow-lists."""
+        profile = self._profile
         host = self._client.base_url
         host_ok = is_allowed_authenticated_host(host)
-        ws_ok = all(
-            is_allowed_ws_url(url) for url in (DEMO_WS_PUBLIC, DEMO_WS_PRIVATE, DEMO_WS_BUSINESS)
-        )
-        passed = host_ok and ws_ok
+        # The REST host does not distinguish demo from live on OKX — the header
+        # does — but every demo WS host carries the "pap" infix, so this list is
+        # a genuine environment check rather than a formality.
+        bad_ws = [url for url in profile.ws_urls if not is_allowed_ws_url(url)]
+        passed = host_ok and not bad_ws
         if passed:
-            detail = f"authenticated host is {host}; WS endpoints are EEA demo"
+            detail = (
+                f"authenticated host is {host}; WS endpoints are "
+                f"{profile.label} demo ({profile.region})"
+            )
         elif not host_ok:
             detail = f"host {host} is not in the demo allow-list {sorted(ALLOWED_DEMO_HOSTS)}"
         else:
-            detail = "a WebSocket URL is outside the EEA demo allow-list"
+            detail = f"WebSocket URL outside the demo allow-list: {bad_ws[0]}"
         return SignalResult(name="host pin", passed=passed, detail=detail)
 
     def _signal_demo_header(self) -> SignalResult:
@@ -263,7 +276,7 @@ class DemoGuard:
             )
 
         probe = LiveEnvironmentNegativeControlProbe(
-            self._api_key, self._api_secret, self._passphrase
+            self._api_key, self._api_secret, self._passphrase, profile=self._profile
         )
         rejected, detail = await probe.credentials_are_rejected()
         return SignalResult(

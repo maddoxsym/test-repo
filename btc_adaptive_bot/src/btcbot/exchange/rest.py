@@ -1,4 +1,4 @@
-"""OKX API v5 REST client — EEA host, demo environment only.
+"""OKX API v5 REST client — region-pinned, demo environment only.
 
 Two classes live here:
 
@@ -15,9 +15,15 @@ Two classes live here:
   live environment is not demo-scoped, and the system refuses to trade with
   it.
 
+The region (Global/UAE, EEA, US) comes from a
+:class:`~btcbot.exchange.endpoints.DemoProfile` chosen by ``exchange.region``.
+Every entry in that registry is a demo profile. Every OKX region serves demo
+and live from the same REST host, so the host is *not* what keeps this on
+demo — the unconditional header is, backed by the negative control.
+
 There is no order, transfer, withdrawal, or deposit code anywhere except the
-order methods on :class:`OkxDemoClient`, which cannot point at a live host and
-cannot omit the demo header.
+order methods on :class:`OkxDemoClient`, which cannot point at an unrecognised
+host and cannot omit the demo header.
 """
 
 from __future__ import annotations
@@ -38,11 +44,14 @@ from ..utils.logging import get_logger
 from ..utils.timeutil import now_ms
 from .endpoints import (
     ALLOWED_DEMO_HOSTS,
-    DEMO_REST_HOST,
+    DEFAULT_PROFILE,
+    DEMO_PROFILES,
     ENVIRONMENT_MISMATCH_CODE,
+    KEY_NOT_FOUND_CODE,
     NEGATIVE_CONTROL_PATH,
     SIMULATED_TRADING_HEADER,
     SIMULATED_TRADING_VALUE,
+    DemoProfile,
     Paths,
     is_allowed_authenticated_host,
     to_okx_bar,
@@ -79,7 +88,7 @@ HISTORY_CANDLES_MAX_LIMIT = 100
 
 
 class OkxDemoClient:
-    """Async REST client bound to the OKX EEA host, demo environment."""
+    """Async REST client bound to one OKX region, demo environment."""
 
     def __init__(
         self,
@@ -87,17 +96,20 @@ class OkxDemoClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         passphrase: str | None = None,
-        base_url: str = DEMO_REST_HOST,
+        profile: DemoProfile = DEFAULT_PROFILE,
+        base_url: str | None = None,
         timeout_seconds: float = 15.0,
         max_retries: int = 4,
         backoff_base_seconds: float = 0.75,
     ) -> None:
-        normalized = base_url.rstrip("/")
+        self.profile = profile
+        normalized = (base_url or profile.rest_host).rstrip("/")
         if not is_allowed_authenticated_host(normalized):
             # The structural guarantee. Raised before any network activity.
             raise MainnetRejectedError(
                 f"refusing to construct an exchange client for host {normalized!r}. "
-                f"Only the OKX EEA demo host is permitted: {sorted(ALLOWED_DEMO_HOSTS)}. "
+                f"Only recognised OKX demo hosts are permitted: "
+                f"{sorted(ALLOWED_DEMO_HOSTS)}. "
                 "This system has no real-money trading mode."
             )
         self.base_url = normalized
@@ -233,7 +245,7 @@ class OkxDemoClient:
                 if response.status_code not in (200, 401):
                     if response.status_code == 403:
                         self._consecutive_errors += 1
-                        raise TransportError(_transport_hint_403(path))
+                        raise TransportError(_transport_hint_403(path, self.base_url))
                     response.raise_for_status()
                 payload = response.json()
 
@@ -258,13 +270,38 @@ class OkxDemoClient:
                     last_error = ApiError(code, str(payload.get("msg", "")), path)
                 else:
                     self._consecutive_errors += 1
-                    raise ApiError(code, str(payload.get("msg", "")), path)
+                    msg = str(payload.get("msg", ""))
+                    if code == KEY_NOT_FOUND_CODE:
+                        msg = f"{msg}\n{self._region_mismatch_hint()}"
+                    raise ApiError(code, msg, path)
 
             if attempt < self._max_retries:
                 await asyncio.sleep(self._backoff_base * (2**attempt))
 
         assert last_error is not None
         raise last_error
+
+    def _region_mismatch_hint(self) -> str:
+        """Explain OKX 50119, which is almost always a *region* mistake.
+
+        An OKX API key is issued by one regional entity and is simply unknown
+        to the others, so a Global/UAE demo key asked against the EEA host
+        returns "API key doesn't exist" rather than anything that names the
+        real cause.
+        """
+        others = ", ".join(
+            f"{name} ({p.rest_host})"
+            for name, p in sorted(DEMO_PROFILES.items())
+            if name != self.profile.region
+        )
+        return (
+            f"OKX says this API key does not exist on {self.profile.describe()}. "
+            "An OKX key belongs to ONE regional entity, so this usually means the key was "
+            "created on a different one. Check which OKX site you created the Demo Trading "
+            f"key on and set exchange.region in config accordingly — other demo regions: "
+            f"{others}. Also confirm the key was created inside Demo Trading, not on the "
+            "live account."
+        )
 
     @staticmethod
     def _data(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -576,7 +613,8 @@ class LiveEnvironmentNegativeControlProbe:
     """Read-only probe whose job is to *fail*.
 
     Sends the supplied credentials once, **without** the ``x-simulated-trading``
-    header, to a single read-only endpoint on the EEA host. A demo-scoped key
+    header, to a single read-only endpoint on the active region's host. A
+    demo-scoped key
     must be rejected with OKX error 50101 ("APIKey does not match current
     environment"). If the call *succeeds*, the key can act on the live
     environment and the demo guard hard-refuses to trade with it.
@@ -587,14 +625,21 @@ class LiveEnvironmentNegativeControlProbe:
     builds a request without the demo header.
     """
 
-    __slots__ = ("_api_key", "_api_secret", "_passphrase", "_timeout")
+    __slots__ = ("_api_key", "_api_secret", "_passphrase", "_profile", "_timeout")
 
     def __init__(
-        self, api_key: str, api_secret: str, passphrase: str, *, timeout_seconds: float = 10.0
+        self,
+        api_key: str,
+        api_secret: str,
+        passphrase: str,
+        *,
+        profile: DemoProfile = DEFAULT_PROFILE,
+        timeout_seconds: float = 10.0,
     ) -> None:
         self._api_key = api_key
         self._api_secret = api_secret
         self._passphrase = passphrase
+        self._profile = profile
         self._timeout = timeout_seconds
 
     async def credentials_are_rejected(self) -> tuple[bool, str]:
@@ -608,7 +653,7 @@ class LiveEnvironmentNegativeControlProbe:
             timestamp=okx_timestamp(now_ms_value=now_ms()),
             params=None,
         )
-        url = f"{DEMO_REST_HOST}{NEGATIVE_CONTROL_PATH}"
+        url = f"{self._profile.rest_host}{NEGATIVE_CONTROL_PATH}"
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(self._timeout)) as client:
                 # NOTE: deliberately no x-simulated-trading header — that IS the test.
@@ -638,7 +683,7 @@ class LiveEnvironmentNegativeControlProbe:
                 True,
                 f"live environment rejected the key as expected (code={code}: environment mismatch)",
             )
-        if code == 50119:
+        if code == KEY_NOT_FOUND_CODE:
             # "API key doesn't exist" — the key genuinely does not exist in the
             # live environment, which equally proves it cannot act there.
             return (True, f"live environment does not know this key (code={code})")
@@ -648,8 +693,8 @@ class LiveEnvironmentNegativeControlProbe:
         )
 
 
-def _transport_hint_403(path: str) -> str:
-    host = DEMO_REST_HOST.removeprefix("https://")
+def _transport_hint_403(path: str, host: str = DEFAULT_PROFILE.rest_host) -> str:
+    host = host.removeprefix("https://")
     return (
         f"OKX returned HTTP 403 for {path}.\n"
         "  A 403 while reaching OKX usually means one of:\n"

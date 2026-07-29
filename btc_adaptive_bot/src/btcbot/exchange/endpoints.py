@@ -5,84 +5,208 @@ boundary of this system.
 else imports from here. The safety audit (``scripts/audit_safety.sh``) enforces
 that, so a future edit cannot quietly introduce a live-trading host elsewhere.
 
-OKX structures its environments differently from a host-per-environment
-exchange, and both mechanisms are enforced here:
+Regions
+-------
 
-* **REST**: demo and live share the EEA host ``eea.okx.com``; the environment
-  is selected per-request by the ``x-simulated-trading: 1`` header. The header
-  is therefore injected by the transport layer for *every* request (see
-  ``rest.py``) — there is no code path that builds authenticated headers
-  without it.
-* **WebSocket**: demo and live use *different* hosts (``wseeapap`` vs
-  ``wseea`` — one dropped infix apart), so WS URLs are checked against an
-  exact-string allow-list, never a substring match.
+OKX operates several entities, and an API key belongs to exactly one of them.
+A key created on a Global/UAE account does not exist on the EEA entity — the
+exchange answers ``50119 API key doesn't exist`` — so the region is a
+first-class, configurable property rather than a hardcoded constant.
 
-Sources: the official ``okxapi/python-okx`` SDK (endpoint paths, signing) and
-the maintained ``tiagosiebler/okx-api`` SDK (EEA host matrix), corroborated by
-web search. The primary docs site was unreachable from the build environment;
-see ``docs/okx_demo_capabilities.md`` §0 for the full sourcing note.
+Each region is described by a :class:`DemoProfile` holding **only** demo
+endpoints. There is no live profile anywhere in this module; live hosts appear
+solely in :data:`FORBIDDEN_WS_URLS`, which exists so they can be rejected.
+
+Two enforcement mechanisms, because OKX uses two
+------------------------------------------------
+
+* **REST**: demo and live share the same host *in every region*; the
+  environment is selected per-request by the ``x-simulated-trading: 1``
+  header. The header is therefore injected by the transport layer for *every*
+  request (see ``rest.py``) — there is no code path that builds authenticated
+  headers without it, and no configuration that can switch it off.
+* **WebSocket**: demo and live use *different* hosts (``wspap`` vs ``ws``,
+  ``wseeapap`` vs ``wseea``, ``wsuspap`` vs ``wsus``) — a single infix apart —
+  so WS URLs are checked against an exact-string allow-list, never a substring
+  match.
+
+Sources: the official ``okxapi/python-okx`` SDK (endpoint paths, signing,
+``API_URL = 'https://www.okx.com'``) and the maintained
+``tiagosiebler/okx-api`` SDK (the per-region host matrix), corroborated by web
+search. The primary docs site was unreachable from the build environment; see
+``docs/okx_demo_capabilities.md`` §0 for the full sourcing note.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from types import MappingProxyType
+
 # =====================================================================
 #  DEMO ENVIRONMENT SWITCH
 #
-#  Every REST request — authenticated or public — carries this header.
-#  It is a module constant consumed by exactly one header builder in
-#  rest.py; it is not configurable and cannot be turned off.
+#  Every REST request — authenticated or public, in every region —
+#  carries this header. It is a module constant consumed by exactly one
+#  header builder in rest.py; it is not configurable and cannot be
+#  turned off.
 # =====================================================================
 SIMULATED_TRADING_HEADER = "x-simulated-trading"
 SIMULATED_TRADING_VALUE = "1"
 
+
+@dataclass(frozen=True, slots=True)
+class DemoProfile:
+    """The demo endpoints for one OKX entity. Demo only — by construction.
+
+    ``alt_rest_hosts`` holds additional REST hosts the same entity serves.
+    OKX Global is reachable both at ``www.okx.com`` (the official SDK's
+    primary) and ``openapi.okx.com`` (the alternative endpoint); either works
+    with a Global key, so both are accepted and the operator can pick.
+    """
+
+    region: str
+    label: str
+    rest_host: str
+    ws_public: str
+    ws_private: str
+    ws_business: str
+    alt_rest_hosts: frozenset[str] = field(default_factory=frozenset)
+
+    @property
+    def rest_hosts(self) -> frozenset[str]:
+        return frozenset({self.rest_host}) | self.alt_rest_hosts
+
+    @property
+    def ws_urls(self) -> tuple[str, str, str]:
+        return (self.ws_public, self.ws_private, self.ws_business)
+
+    def describe(self) -> str:
+        return f"{self.label} ({self.region}) — REST {self.rest_host}"
+
+
+# =====================================================================
+#  DEMO PROFILE REGISTRY
+#
+#  A compile-time table. Not read from YAML, not extendable at runtime:
+#  the *selection* is configurable, the *contents* are not. Adding an
+#  entity requires editing this file, which is the level of friction a
+#  demo-only research system should have.
+#
+#  Every URL below is a DEMO endpoint. No live endpoint appears here.
+# =====================================================================
+
+GLOBAL_DEMO = DemoProfile(
+    region="global",
+    label="OKX Global / UAE Demo",
+    # The user-facing default. OKX Global serves the same API from
+    # www.okx.com; both are accepted (see alt_rest_hosts).
+    rest_host="https://openapi.okx.com",
+    alt_rest_hosts=frozenset({"https://www.okx.com"}),
+    ws_public="wss://wspap.okx.com:8443/ws/v5/public",
+    ws_private="wss://wspap.okx.com:8443/ws/v5/private",
+    # The maintained SDK appends ?brokerId=9999 to every demo business URL;
+    # the plain form is also accepted so either documented spelling works.
+    ws_business="wss://wspap.okx.com:8443/ws/v5/business?brokerId=9999",
+)
+
+EEA_DEMO = DemoProfile(
+    region="eea",
+    label="OKX Europe (EEA) Demo",
+    rest_host="https://eea.okx.com",
+    ws_public="wss://wseeapap.okx.com:8443/ws/v5/public",
+    ws_private="wss://wseeapap.okx.com:8443/ws/v5/private",
+    ws_business="wss://wseeapap.okx.com:8443/ws/v5/business?brokerId=9999",
+)
+
+US_DEMO = DemoProfile(
+    region="us",
+    label="OKX US Demo",
+    rest_host="https://us.okx.com",
+    ws_public="wss://wsuspap.okx.com:8443/ws/v5/public",
+    ws_private="wss://wsuspap.okx.com:8443/ws/v5/private",
+    ws_business="wss://wsuspap.okx.com:8443/ws/v5/business?brokerId=9999",
+)
+
+DEMO_PROFILES: MappingProxyType[str, DemoProfile] = MappingProxyType(
+    {profile.region: profile for profile in (GLOBAL_DEMO, EEA_DEMO, US_DEMO)}
+)
+
+#: The region used when configuration does not say otherwise.
+DEFAULT_REGION = "global"
+DEFAULT_PROFILE = DEMO_PROFILES[DEFAULT_REGION]
+
+#: Kept as a module constant for the many call sites that just want a sane
+#: default host; the active profile's host is what the engine actually uses.
+DEMO_REST_HOST = DEFAULT_PROFILE.rest_host
+
+
+def profile_for(region: str) -> DemoProfile:
+    """The demo profile for ``region``. Unknown regions fail loudly."""
+    try:
+        return DEMO_PROFILES[region.strip().lower()]
+    except KeyError:
+        raise ValueError(
+            f"unknown OKX region {region!r}; valid regions: {sorted(DEMO_PROFILES)}"
+        ) from None
+
+
 # =====================================================================
 #  AUTHENTICATED HOST ALLOW-LIST
 #
-#  An authenticated client can only ever be constructed against a host in
-#  this frozenset. It is a module constant: not read from YAML, not read
-#  from the environment, not settable by a CLI flag. Changing it requires
-#  editing this file, which is exactly the level of friction live trading
-#  should have in a demo-only research system.
+#  An authenticated client can only ever be constructed against a host
+#  in this frozenset. It is derived from the compile-time profile
+#  registry: not read from YAML, not read from the environment, not
+#  settable by a CLI flag.
 #
-#  The user's account is an OKX Europe (EEA entity) account, so the EEA
-#  host is the only member. If OKX ever publishes an additional EEA API
-#  host, add it here — and nowhere else.
+#  Note what this does and does not prove. In every OKX region the demo
+#  and live environments share a REST host, so membership here does NOT
+#  mean "this host cannot trade real money" — it means "this host is an
+#  OKX API host we recognise". What keeps the system on demo is the
+#  unconditional x-simulated-trading header plus the negative control
+#  that must fail without it. The WS allow-list below is the one that
+#  genuinely separates environments by host.
 # =====================================================================
-DEMO_REST_HOST = "https://eea.okx.com"
-ALLOWED_DEMO_HOSTS: frozenset[str] = frozenset({DEMO_REST_HOST})
+ALLOWED_DEMO_HOSTS: frozenset[str] = frozenset(
+    host for profile in DEMO_PROFILES.values() for host in profile.rest_hosts
+)
 
-# EEA *demo* WebSocket endpoints. The ``pap`` infix marks the demo variant;
-# the business endpoint carries the brokerId query used by the demo service.
-# Candlestick channels live on the *business* endpoint in API v5.
-DEMO_WS_PUBLIC = "wss://wseeapap.okx.com:8443/ws/v5/public"
-DEMO_WS_PRIVATE = "wss://wseeapap.okx.com:8443/ws/v5/private"
-DEMO_WS_BUSINESS = "wss://wseeapap.okx.com:8443/ws/v5/business?brokerId=9999"
+
+def _ws_variants(url: str) -> set[str]:
+    """Both spellings of a demo WS URL: with and without the brokerId query."""
+    base = url.split("?", 1)[0]
+    return {url, base, f"{base}?brokerId=9999"}
+
 
 ALLOWED_WS_URLS: frozenset[str] = frozenset(
-    {DEMO_WS_PUBLIC, DEMO_WS_PRIVATE, DEMO_WS_BUSINESS}
+    variant
+    for profile in DEMO_PROFILES.values()
+    for url in profile.ws_urls
+    for variant in _ws_variants(url)
 )
 
 # =====================================================================
-#  FORBIDDEN HOSTS
+#  FORBIDDEN LIVE WEBSOCKET HOSTS
 #
-#  Hosts that exist at OKX but must never be contacted by this system.
-#  Listed explicitly so tests can assert each one is rejected — the EEA
-#  *live* WS host differs from the demo host by a single dropped "pap"
-#  infix, which is precisely why matching is exact, never substring.
+#  These are the *live* streams for each entity. They differ from their
+#  demo counterparts by a single infix, which is precisely why matching
+#  is exact rather than substring-based. Listed explicitly so tests can
+#  assert each one is rejected.
+#
+#  There is deliberately no equivalent REST list: REST hosts are shared
+#  between demo and live, so a REST deny-list would give false comfort.
+#  The header is what protects REST.
 # =====================================================================
-FORBIDDEN_HOSTS: frozenset[str] = frozenset(
+FORBIDDEN_WS_URLS: frozenset[str] = frozenset(
     {
-        "https://www.okx.com",        # OKX Global live REST
-        "https://us.okx.com",         # OKX US REST
-        "https://openapi.okx.com",    # OKX OpenAPI entity
-        "wss://wseea.okx.com:8443/ws/v5/public",     # EEA LIVE WS
-        "wss://wseea.okx.com:8443/ws/v5/private",    # EEA LIVE WS
-        "wss://wseea.okx.com:8443/ws/v5/business",   # EEA LIVE WS
-        "wss://ws.okx.com:8443/ws/v5/public",        # Global live WS
-        "wss://ws.okx.com:8443/ws/v5/private",       # Global live WS
-        "wss://wspap.okx.com:8443/ws/v5/public",     # Global demo WS (wrong entity)
-        "wss://wspap.okx.com:8443/ws/v5/private",    # Global demo WS (wrong entity)
-        "wss://wsuspap.okx.com:8443/ws/v5/private",  # US demo WS (wrong entity)
+        "wss://ws.okx.com:8443/ws/v5/public",        # Global LIVE
+        "wss://ws.okx.com:8443/ws/v5/private",       # Global LIVE
+        "wss://ws.okx.com:8443/ws/v5/business",      # Global LIVE
+        "wss://wseea.okx.com:8443/ws/v5/public",     # EEA LIVE
+        "wss://wseea.okx.com:8443/ws/v5/private",    # EEA LIVE
+        "wss://wseea.okx.com:8443/ws/v5/business",   # EEA LIVE
+        "wss://wsus.okx.com:8443/ws/v5/public",      # US LIVE
+        "wss://wsus.okx.com:8443/ws/v5/private",     # US LIVE
+        "wss://wsus.okx.com:8443/ws/v5/business",    # US LIVE
     }
 )
 
@@ -93,7 +217,7 @@ def is_allowed_authenticated_host(host: str) -> bool:
 
 
 def is_allowed_ws_url(url: str) -> bool:
-    """Exact-match check against the EEA demo WebSocket allow-list."""
+    """Exact-match check against the demo WebSocket allow-list."""
     return url in ALLOWED_WS_URLS
 
 
@@ -101,24 +225,31 @@ def is_allowed_ws_url(url: str) -> bool:
 #  LIVE-ENVIRONMENT NEGATIVE CONTROL — READ ONLY, MUST FAIL
 #
 #  Used by exactly one class: LiveEnvironmentNegativeControlProbe, which
-#  sends the credentials ONCE, read-only, to the EEA host WITHOUT the
-#  x-simulated-trading header and REQUIRES an environment-mismatch
-#  rejection (OKX error 50101). A success means the key can act on the
-#  live environment, and the system refuses to trade with it.
+#  sends the credentials ONCE, read-only, to the active region's host
+#  WITHOUT the x-simulated-trading header and REQUIRES an
+#  environment-mismatch rejection (OKX error 50101). A success means the
+#  key can act on the live environment, and the system refuses to trade
+#  with it.
 #
 #  This is a safety assertion, not a trading path. The probe class has no
 #  order methods and can only issue this one GET.
 # =====================================================================
 NEGATIVE_CONTROL_PATH = "/api/v5/account/config"
-# "APIKey does not match current environment" — the expected, safe outcome.
+#: "APIKey does not match current environment" — the expected, safe outcome.
 ENVIRONMENT_MISMATCH_CODE = 50101
+#: "API key doesn't exist" — in the negative control this is equally safe, but
+#: on an *authenticated demo* call it means the key belongs to another region.
+KEY_NOT_FOUND_CODE = 50119
 
 
 # --- endpoint paths (verbatim from the official SDK's consts.py) ---------
 
 
 class Paths:
-    """OKX API v5 endpoint paths used by this system."""
+    """OKX API v5 endpoint paths used by this system.
+
+    Identical across regions — only the host differs.
+    """
 
     # Public
     SERVER_TIME = "/api/v5/public/time"

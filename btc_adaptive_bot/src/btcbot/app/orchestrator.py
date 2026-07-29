@@ -31,6 +31,7 @@ from ..database.repositories import Repositories
 from ..decision.engine import DecisionEngine
 from ..decision.risk_state import RiskStateTracker
 from ..exchange.demo_guard import DemoGuard
+from ..exchange.endpoints import DEFAULT_PROFILE, DemoProfile, profile_for
 from ..exchange.instruments import CapabilityDiscovery
 from ..exchange.models import Candle, Execution, PositionMode, Ticker, WalletBalance
 from ..exchange.rest import OkxDemoClient
@@ -92,6 +93,9 @@ class Orchestrator:
 
         self.db: Database | None = None
         self.repos: Repositories | None = None
+        # Replaced during bootstrap with the profile named by exchange.region.
+        # Every candidate is a demo profile — see exchange/endpoints.py.
+        self.profile: DemoProfile = DEFAULT_PROFILE
         self.client: OkxDemoClient | None = None
         self.guard: DemoGuard | None = None
         self.discovery: CapabilityDiscovery | None = None
@@ -157,8 +161,10 @@ class Orchestrator:
         if applied:
             log.info("DB", f"Applied {applied} migration(s)")
 
-        # --- exchange client (EEA demo host is pinned in the constructor;
-        #     x-simulated-trading is injected by its transport layer) --------
+        # --- exchange client (the demo host for the configured region is
+        #     pinned in the constructor; x-simulated-trading is injected by
+        #     its transport layer) ---------------------------------------
+        self.profile = profile_for(self.config.exchange.region)
         self.client = OkxDemoClient(
             api_key=self.credentials.api_key if self.credentials else None,
             api_secret=self.credentials.api_secret if self.credentials else None,
@@ -166,9 +172,10 @@ class Orchestrator:
             timeout_seconds=self.config.exchange.request_timeout_seconds,
             max_retries=self.config.exchange.max_retries,
             backoff_base_seconds=self.config.exchange.retry_backoff_base_seconds,
+            profile=self.profile,
         )
         await self.client.sync_clock()
-        log.info("OKX", f"Connected to {self.client.base_url} (demo environment)")
+        log.info("OKX", f"Connected to {self.client.base_url} ({self.profile.label})")
         self.breakers.check_clock_drift(self.client.clock_offset_ms)
 
         # --- demo verification ----------------------------------------
@@ -178,6 +185,7 @@ class Orchestrator:
             api_secret=self.credentials.api_secret if self.credentials else None,
             passphrase=self.credentials.passphrase if self.credentials else None,
             run_mainnet_negative_control=self.config.safety.mainnet_negative_control,
+            profile=self.profile,
         )
         if self.credentials is not None:
             verification = await self.guard.verify()
@@ -602,6 +610,7 @@ class Orchestrator:
                 orderbook_depth=self.config.exchange.orderbook_depth,
                 ping_interval=self.config.exchange.ws_ping_interval_seconds,
                 max_backoff=self.config.exchange.ws_reconnect_max_backoff_seconds,
+                profile=self.profile,
             )
             self.public_stream.on_candle(self._on_candle)
             self.public_stream.on_ticker(self._on_ticker)
@@ -618,6 +627,7 @@ class Orchestrator:
                 passphrase=self.credentials.passphrase,
                 ping_interval=self.config.exchange.ws_ping_interval_seconds,
                 max_backoff=self.config.exchange.ws_reconnect_max_backoff_seconds,
+                profile=self.profile,
             )
             self.private_stream.on_execution(self._on_execution)
             self.private_stream.on_wallet(self._on_wallet)
@@ -1683,6 +1693,10 @@ class Orchestrator:
                 "running": self._running,
                 "mode": self.mode,
                 "dry_run": self.dry_run,
+                "region": self.profile.region,
+                "environment": self.profile.label,
+                "rest_host": self.profile.rest_host,
+                "ws_hosts": list(self.profile.ws_urls),
                 "demo_verified": bool(self.guard and self.guard.verified),
                 "verification_signals": (
                     [

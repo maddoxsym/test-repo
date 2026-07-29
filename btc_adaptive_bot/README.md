@@ -1,7 +1,7 @@
-# BTC Adaptive Bot — OKX Europe Demo Research System
+# BTC Adaptive Bot — OKX Demo Research System
 
 A trading **research** system for Bitcoin. It runs 52 different trading strategies
-against the **BTC X-Perp** on an OKX Europe **Demo** account for exactly 14 days,
+against the **BTC X-Perp** on an OKX **Demo** account for exactly 14 days,
 measures which ones actually work, and then picks a winner based on evidence.
 
 > ### This version cannot trade real money
@@ -10,9 +10,10 @@ measures which ones actually work, and then picks a winner based on evidence.
 > deposit code anywhere in this project. OKX selects live-vs-demo with a request
 > header, so that header is injected by a **single transport-layer function** that
 > every request passes through — no endpoint can omit it. The REST host is pinned
-> to the EEA entity, the WebSocket hosts are pinned to the EEA *demo* endpoints,
-> and the system refuses to send any order until four independent checks prove it
-> is talking to the demo environment. See
+> to one OKX regional entity (`exchange.region` — Global/UAE by default), the
+> WebSocket hosts are pinned to that region's *demo* endpoints, and the system
+> refuses to send any order until four independent checks prove it is talking to
+> the demo environment. See
 > [§3 What keeps this safe](#3-what-keeps-this-safe).
 
 ---
@@ -48,7 +49,7 @@ their keep and which did not.
 
 Concretely, once you start it, the bot:
 
-- connects to your OKX Europe Demo account and confirms it is really demo
+- connects to your OKX Demo account and confirms it is really demo
 - **discovers** the tradable BTC X-Perp from the exchange's instrument list —
   the instrument ID is never hardcoded
 - streams live BTC prices, order book, trades, funding and open interest
@@ -139,8 +140,26 @@ header unconditionally and cannot be overridden by its input. The safety audit a
 the test suite both assert that no second header-building path exists.
 
 WebSockets *are* host-separated, and the demo host differs from the live host by a
-single infix (`wseeapap` vs `wseea`) — so WS URLs are checked against an
-**exact-match allow-list**, never a substring test.
+single `pap` infix (`wspap` vs `ws`, `wseeapap` vs `wseea`, `wsuspap` vs `wsus`) —
+so WS URLs are checked against an **exact-match allow-list**, never a substring
+test, and the nine live URLs are named in an explicit deny-list as well.
+
+### Regions
+
+An OKX API key is issued by one regional entity and is unknown to the others,
+which OKX reports as `50119 API key doesn't exist` — the most common cause of a
+failed verification. Set `exchange.region` to the entity that issued your Demo
+Trading key:
+
+| `exchange.region` | Entity | REST | Demo WebSocket |
+|---|---|---|---|
+| `global` *(default)* | OKX Global / UAE | `https://openapi.okx.com` | `wss://wspap.okx.com:8443/ws/v5/…` |
+| `eea` | OKX Europe (EEA) | `https://eea.okx.com` | `wss://wseeapap.okx.com:8443/ws/v5/…` |
+| `us` | OKX US | `https://us.okx.com` | `wss://wsuspap.okx.com:8443/ws/v5/…` |
+
+Every profile in that registry is a demo profile. There is no region value that
+reaches a live endpoint, and `./scripts/verify_okx_demo_connection.sh` prints the full
+table if it sees a `50119`.
 
 ### Four independent demo checks
 
@@ -148,7 +167,7 @@ Order submission is structurally impossible until all four pass:
 
 | # | Check | What it proves |
 |---|---|---|
-| 1 | **Host pin** — REST base URL must be `https://eea.okx.com`; every WS URL must be on the EEA-demo allow-list. Not settable from YAML, env, or CLI. | The client cannot be built against the wrong entity, and the socket cannot be opened to a live host. |
+| 1 | **Host pin** — the REST base URL must be a recognised OKX demo host and every WS URL must be on the exact-match demo allow-list. The host set is fixed in code; YAML only picks *which* demo region, never an arbitrary URL. | The client cannot be built against an unrecognised host, and the socket cannot be opened to a live host. |
 | 2 | **Header enforcement** — the client's own header builder is exercised at runtime and must produce `x-simulated-trading: 1`. | No request can leave without the demo switch. |
 | 3 | **Authenticated demo reachability** — account config and balance succeed *with* the header, and a usable position mode comes back. | The key works in demo, and the account is usable. |
 | 4 | **Live-environment negative control** — the same credentials are sent **once**, read-only, **without** the header, and are *required to fail* with OKX error `50101`. | The key cannot act on the live environment. If it authenticates there, the system refuses to trade with it. |
@@ -285,7 +304,7 @@ the test suite. It does not touch an existing `.env`.
 **The key must be created inside OKX's Demo Trading area.** A normal account key
 will not work here — and the bot will refuse it on purpose.
 
-1. Log in to your OKX Europe account
+1. Log in to your OKX account
 2. Switch to **Demo Trading**
 3. Go to your profile → **API** → create a new **demo** API key
 4. Give it **Read** and **Trade** permissions. Withdrawal permission is neither
@@ -301,6 +320,12 @@ OKX_DEMO_PASSPHRASE=the_passphrase_you_chose
 The passphrase is the one **you** chose when creating the key — not your account
 login password.
 
+6. Set `exchange.region` in `config/default.yaml` to the OKX entity you just
+   created the key on — `global` (Global/UAE, the default), `eea`, or `us`. A key
+   from one entity does not exist on the others; see
+   [Regions](#regions) and the `50119` entry in
+   [Troubleshooting](#16-troubleshooting).
+
 `.env` is git-ignored. Set owner-only permissions:
 
 ```bash
@@ -309,7 +334,7 @@ chmod 600 .env
 
 ### About the instrument
 
-The OKX Europe demo interface shows the contract as **BTCUSD UM X-Perp**. That is a
+The OKX demo interface shows the contract as **BTCUSD UM X-Perp**. That is a
 display name; the API instrument ID behind it is **discovered at runtime** from
 `/api/v5/public/instruments`, filtered to a live linear BTC swap and ranked by your
 configured settle-currency preference. If no such instrument is available to your
@@ -532,8 +557,17 @@ Enable NTP time sync (System Settings → General → Date & Time → Set automa
 OKX rejects requests with stale timestamps, and the bot pauses authenticated
 trading rather than sending orders from an untrusted clock.
 
+**`50119 API key doesn't exist`**
+Almost always the wrong region, not a bad key: an OKX key is issued by one
+regional entity and does not exist on the others. Set `exchange.region` in
+`config/default.yaml` to the entity you created the Demo Trading key on —
+`global` (Global/UAE), `eea`, or `us`.
+`./scripts/verify_okx_demo_connection.sh` prints the full table when it sees this
+code. If the region is right, confirm the key was created
+*inside* Demo Trading rather than on the live account.
+
 **403 Forbidden reaching OKX**
-Either a proxy/firewall is blocking `eea.okx.com`, or your IP is in a region OKX
+Either a proxy/firewall is blocking the configured REST host, or your IP is in a region OKX
 refuses, or your account isn't eligible from your location. The error lists all
 three. This project does not attempt to work around any of them.
 

@@ -8,6 +8,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Prefer the project venv so the import-based checks below can run.
+if [ -x ".venv/bin/python" ]; then PY=".venv/bin/python"; else PY="python3"; fi
+
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
 FAILURES=0
 
@@ -16,7 +19,7 @@ pass()    { printf "  %s✓%s %s\n" "$GREEN" "$OFF" "$1"; }
 failure() { printf "  %s✗%s %s\n" "$RED" "$OFF" "$1"; FAILURES=$((FAILURES + 1)); }
 note()    { printf "  %s·%s %s\n" "$YELLOW" "$OFF" "$1"; }
 
-printf "%sSAFETY AUDIT — OKX EUROPE DEMO%s\n" "$BOLD" "$OFF"
+printf "%sSAFETY AUDIT — OKX DEMO (all regions)%s\n" "$BOLD" "$OFF"
 
 # ---------------------------------------------------------------
 section "1. No withdrawal / transfer / deposit endpoints"
@@ -46,32 +49,67 @@ else
   pass "every OKX host literal lives in exchange/endpoints.py"
 fi
 
-if grep -q 'DEMO_REST_HOST = "https://eea.okx.com"' src/btcbot/exchange/endpoints.py; then
-  pass "REST host pinned to the EEA entity (eea.okx.com)"
-else
-  failure "the EEA demo host constant is missing or altered"
-fi
-
 if grep -q 'ALLOWED_DEMO_HOSTS: frozenset\[str\] = frozenset' src/btcbot/exchange/endpoints.py &&
-   grep -q 'ALLOWED_WS_URLS: frozenset\[str\] = frozenset' src/btcbot/exchange/endpoints.py; then
-  pass "REST and WebSocket allow-lists are immutable frozensets"
+   grep -q 'ALLOWED_WS_URLS: frozenset\[str\] = frozenset' src/btcbot/exchange/endpoints.py &&
+   grep -q 'FORBIDDEN_WS_URLS: frozenset\[str\] = frozenset' src/btcbot/exchange/endpoints.py; then
+  pass "REST allow-list, WS allow-list and WS deny-list are immutable frozensets"
 else
-  failure "an allow-list is not a frozenset"
+  failure "an allow-list or the deny-list is not a frozenset"
 fi
 
-# The EEA *live* WS host differs from demo by one dropped infix. It must be
-# present in the forbidden list and must never be connected to.
-if grep -q 'wss://wseea.okx.com:8443/ws/v5/private' src/btcbot/exchange/endpoints.py &&
-   grep -q 'FORBIDDEN_HOSTS' src/btcbot/exchange/endpoints.py; then
-  pass "EEA live WebSocket hosts are explicitly listed as forbidden"
+# Every demo WS host carries the "pap" infix; its live twin is the same name
+# with that infix dropped. Both must be present — one allowed, one forbidden.
+for pair in "wspap ws" "wseeapap wseea" "wsuspap wsus"; do
+  demo="${pair% *}"; live="${pair#* }"
+  if grep -q "wss://${demo}\.okx\.com:8443/ws/v5/private" src/btcbot/exchange/endpoints.py; then
+    pass "demo WebSocket host ${demo}.okx.com is present"
+  else
+    failure "demo WebSocket host ${demo}.okx.com is missing"
+  fi
+  if grep -q "\"wss://${live}\.okx\.com:8443/ws/v5/private\"" src/btcbot/exchange/endpoints.py; then
+    pass "live WebSocket host ${live}.okx.com is explicitly forbidden"
+  else
+    failure "live WebSocket host ${live}.okx.com is not in FORBIDDEN_WS_URLS"
+  fi
+done
+
+# The grep checks above prove the literals exist. This proves the *sets* are
+# correct: no live URL leaked into an allow-list, every region resolves, and
+# no region resolves to anything outside the allow-lists.
+if profile_summary="$("$PY" - <<'PYEOF'
+import sys
+sys.path.insert(0, "src")
+from btcbot.exchange.endpoints import (
+    ALLOWED_DEMO_HOSTS, ALLOWED_WS_URLS, DEMO_PROFILES, FORBIDDEN_WS_URLS,
+    is_allowed_ws_url,
+)
+
+leaked = ALLOWED_WS_URLS & FORBIDDEN_WS_URLS
+assert not leaked, f"live WS URL in the allow-list: {sorted(leaked)}"
+assert not any(is_allowed_ws_url(u) for u in FORBIDDEN_WS_URLS), "a live WS URL is accepted"
+assert DEMO_PROFILES, "the demo profile registry is empty"
+for region, profile in DEMO_PROFILES.items():
+    assert profile.rest_hosts <= ALLOWED_DEMO_HOSTS, f"{region}: REST host not allow-listed"
+    for url in profile.ws_urls:
+        assert is_allowed_ws_url(url), f"{region}: WS URL not allow-listed: {url}"
+        assert "pap" in url.split("//", 1)[1].split(".", 1)[0], f"{region}: {url} is not a demo host"
+print(f"{len(DEMO_PROFILES)} demo regions; {len(ALLOWED_DEMO_HOSTS)} REST hosts; "
+      f"{len(FORBIDDEN_WS_URLS)} live WS URLs forbidden")
+PYEOF
+)"; then
+  pass "every region profile resolves to demo-only hosts; no live URL is reachable"
+  note "$profile_summary"
 else
-  failure "the EEA live WebSocket hosts are not in the forbidden list"
+  printf "%s\n" "$profile_summary"
+  failure "the region profile registry failed its invariants (see above)"
 fi
 
-if grep -q 'wseeapap.okx.com' src/btcbot/exchange/endpoints.py; then
-  pass "demo WebSocket hosts pinned to the EEA demo entity (wseeapap)"
+# No region may be a live-only entity: the registry is demo profiles only.
+if grep -q 'class DemoProfile' src/btcbot/exchange/endpoints.py &&
+   ! grep -qE 'LIVE_PROFILE|MAINNET_PROFILE|PROD_PROFILE' src/btcbot/exchange/endpoints.py; then
+  pass "the profile registry defines demo profiles only — no live profile exists"
 else
-  failure "the EEA demo WebSocket constants are missing"
+  failure "a live/mainnet profile appears in endpoints.py"
 fi
 
 # ---------------------------------------------------------------

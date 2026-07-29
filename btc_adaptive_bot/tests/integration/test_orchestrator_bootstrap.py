@@ -20,6 +20,7 @@ import pytest
 
 from btcbot.config.loader import Credentials, LoadedConfig
 from btcbot.config.schema import AppConfig
+from btcbot.exchange.endpoints import DEFAULT_PROFILE
 from btcbot.exchange.models import (
     AccountConfig,
     Candle,
@@ -43,7 +44,9 @@ class MockRestClient:
     """Serves deterministic market data; records what was asked for."""
 
     def __init__(self, instrument: InstrumentSpec, *, equity: float = 10_000.0) -> None:
-        self.base_url = "https://eea.okx.com"
+        self.base_url = DEFAULT_PROFILE.rest_host
+        self.profile = DEFAULT_PROFILE
+        self.construction_kwargs: dict[str, object] = {}
         self._instrument = instrument
         self._equity = equity
         self.consecutive_errors = 0
@@ -153,7 +156,7 @@ def loaded_config(tmp_path) -> LoadedConfig:
         },
         news={"enabled": False, "providers": []},
         # The live-environment negative control needs real outbound network
-        # access to eea.okx.com; offline it correctly reports "inconclusive"
+        # access to the region's host; offline it correctly reports "inconclusive"
         # and blocks trading. That behaviour is covered by test_safety_lock.py,
         # so it is switched off here to keep this test about bootstrap wiring.
         safety={"mainnet_negative_control": False},
@@ -169,9 +172,18 @@ def loaded_config(tmp_path) -> LoadedConfig:
 
 def _patch_client(monkeypatch, instrument, **kwargs) -> MockRestClient:
     mock = MockRestClient(instrument, **kwargs)
-    monkeypatch.setattr(
-        "btcbot.app.orchestrator.OkxDemoClient", lambda **_: mock
-    )
+
+    def _build(**client_kwargs):
+        # Record what the orchestrator asked for so tests can assert the
+        # region profile was threaded through rather than defaulted.
+        mock.construction_kwargs = client_kwargs
+        profile = client_kwargs.get("profile")
+        if profile is not None:
+            mock.profile = profile
+            mock.base_url = profile.rest_host
+        return mock
+
+    monkeypatch.setattr("btcbot.app.orchestrator.OkxDemoClient", _build)
     return mock
 
 
@@ -210,6 +222,43 @@ class TestBootstrap:
                 assert orchestrator.store.bars_available(timeframe) > 200
 
             assert len(orchestrator.registry) == 4
+        finally:
+            await orchestrator.shutdown()
+
+    @pytest.mark.parametrize("region", ["global", "eea", "us"])
+    async def test_configured_region_reaches_the_client_and_the_dashboard(
+        self, monkeypatch, loaded_config, perp_instrument, region
+    ):
+        """The region must be threaded end to end — not defaulted somewhere."""
+        from btcbot.app.orchestrator import Orchestrator
+        from btcbot.exchange.endpoints import profile_for
+
+        mock = _patch_client(monkeypatch, perp_instrument)
+        config = loaded_config.config.model_copy(
+            update={"exchange": loaded_config.config.exchange.model_copy(
+                update={"region": region}
+            )}
+        )
+        loaded = LoadedConfig(
+            config=config, config_hash=loaded_config.config_hash,
+            source_path=loaded_config.source_path, raw={},
+        )
+        orchestrator = Orchestrator(loaded, _credentials())
+        try:
+            await orchestrator.bootstrap()
+            expected = profile_for(region)
+
+            assert mock.construction_kwargs["profile"] is expected
+            assert orchestrator.profile is expected
+            assert orchestrator.guard.profile is expected
+
+            system = orchestrator.dashboard_state()["system"]
+            assert system["region"] == region
+            assert system["rest_host"] == expected.rest_host
+            assert system["ws_hosts"] == list(expected.ws_urls)
+            # Whatever the region, the dashboard must never show a live host.
+            for url in system["ws_hosts"]:
+                assert "pap" in url.split("//", 1)[1].split(".", 1)[0]
         finally:
             await orchestrator.shutdown()
 

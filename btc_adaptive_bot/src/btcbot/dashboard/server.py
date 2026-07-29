@@ -138,6 +138,10 @@ function render(d){
   cards.push(card('System',
     row('Status', tag(s.running,'RUNNING','STOPPED'))+
     row('Demo verified', tag(s.demo_verified,'VERIFIED','NOT VERIFIED'))+
+    row('Environment', esc(s.environment||'OKX Demo'))+
+    row('Region', esc((s.region||'-').toUpperCase()))+
+    row('REST host', '<code>'+esc(s.rest_host||'-')+'</code>')+
+    (s.ws_hosts||[]).map((u,i)=>row(i===0?'WS hosts':'', '<code>'+esc(u)+'</code>')).join('')+
     row('Mode', esc(s.mode||'-')+(s.dry_run?' (dry run)':''))+
     row('Data health', tag(s.data_healthy,'HEALTHY','DEGRADED'))+
     (s.data_healthy?'':row('Detail', esc(s.data_detail||''),'warn'))+

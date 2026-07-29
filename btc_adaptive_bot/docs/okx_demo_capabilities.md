@@ -1,26 +1,35 @@
-# OKX Europe Demo Capabilities — Verified Notes
+# OKX Demo Capabilities — Verified Notes
 
-**Researched:** 2026-07-28 · **Target:** OKX Europe (EEA entity, MiCA-regulated) **Demo
-Trading**, BTC USD-margined perpetual ("BTCUSD UM X-Perp" in the OKX Europe UI).
+**Researched:** 2026-07-28 · **Re-verified for the Global/UAE entity:** 2026-07-29
+**Target:** OKX **Demo Trading**, BTC USD-margined perpetual ("BTCUSD UM X-Perp" in the
+OKX UI). The default entity is **OKX Global / UAE**; EEA and US are selectable via
+`exchange.region` (§1a).
 
 ## 0. Source honesty (read this first)
 
 The primary documentation site `https://www.okx.com/docs-v5/en/` returned **HTTP 403** from
 this build environment (egress proxy), and `https://my.okx.com/docs-v5/en/` plus the legacy
-`okex.com` mirror were unreachable. Unlike the Bybit build — where the docs' own source
-repository was readable — OKX does not publish its docs in a public repo.
+`okex.com` mirror were unreachable. This was re-attempted on 2026-07-29 for the Global/UAE
+migration and **still returned 403** — the official docs have not been read directly at any
+point in this project. Unlike the Bybit build — where the docs' own source repository was
+readable — OKX does not publish its docs in a public repo.
 
 Every fact below was therefore corroborated from **two independent, actively maintained
 SDKs plus web search**, and is marked accordingly:
 
 | Source | What it provided |
 |---|---|
-| `github.com/okxapi/python-okx` (OKX's official Python SDK), `okx/utils.py` + `okx/consts.py` @ master | exact signing procedure, header names, timestamp format, all `/api/v5/*` endpoint paths |
-| `github.com/tiagosiebler/okx-api` (maintained TypeScript SDK), `websocket-util.ts` + `requestUtils.ts` @ master | the EEA REST base URL and the complete live/demo WebSocket URL matrix per region |
-| Web search (current pages, July 2026) | EEA entity host confirmation, demo header behaviour, error-code semantics |
+| `github.com/okxapi/python-okx` (OKX's official Python SDK), `okx/utils.py` + `okx/consts.py` @ master | exact signing procedure, header names, timestamp format, all `/api/v5/*` endpoint paths; `API_URL = 'https://www.okx.com'` (Global) |
+| `github.com/tiagosiebler/okx-api` (maintained TypeScript SDK), `websocket-util.ts` + `requestUtils.ts` @ master | the per-region REST base URLs and the complete live/demo WebSocket URL matrix (re-read 2026-07-29) |
+| Web search (current pages, July 2026) | entity/host confirmation, demo header behaviour, error-code semantics |
+
+**No authenticated call has ever been made from this environment.** The build sandbox
+cannot reach any exchange host, and the developer's credentials were never supplied to it.
+Every claim about authenticated behaviour below is derived from the sources above and is
+exercised in tests against mocked transports only.
 
 Where a value could **not** be corroborated to this standard (e.g. the exact `instId` and
-contract parameters of the EEA "BTCUSD UM X-Perp"), this document says so explicitly and
+contract parameters of the "BTCUSD UM X-Perp"), this document says so explicitly and
 the code performs **runtime discovery** instead of guessing. That is the same policy the
 Bybit build used (`docs/bybit_capabilities.md` §5), applied more aggressively because the
 primary docs were unreachable.
@@ -52,29 +61,64 @@ authenticated call would target the live environment. Consequences for the desig
 3. `scripts/audit_safety.sh` asserts the header constant is referenced by the transport
    layer and that no second header-building code path exists.
 
-### Hosts
+---
 
-| Purpose | Value | Corroboration |
-|---|---|---|
-| REST (EEA entity) | `https://eea.okx.com` | tiagosiebler SDK `EEA` market → `https://eea.okx.com`; matches the user-confirmed OKX Europe account entity |
-| WS public, demo (EEA) | `wss://wseeapap.okx.com:8443/ws/v5/public` | tiagosiebler SDK `EEA.demo.public` |
-| WS private, demo (EEA) | `wss://wseeapap.okx.com:8443/ws/v5/private` | tiagosiebler SDK `EEA.demo.private` |
-| WS business, demo (EEA) | `wss://wseeapap.okx.com:8443/ws/v5/business?brokerId=9999` | tiagosiebler SDK `EEA.demo.business` — note the `brokerId=9999` query, present on every demo business URL in the SDK matrix |
+## 1a. Regions — why an API key can be "not found"
 
-**Hosts that must be rejected** (compile-time forbidden — connecting to any of these is a
-bug, and `MainnetRejectedError` is raised before a socket is opened):
+OKX operates several regional entities. **An API key is issued by exactly one of them and
+does not exist on the others.** A key created in Demo Trading on the Global/UAE site,
+presented to `eea.okx.com`, returns:
 
-| Host | Why it exists | Why we reject it |
-|---|---|---|
-| `https://www.okx.com` | OKX Global REST | wrong entity for an EEA account; also the global live host |
-| `https://us.okx.com`, `https://openapi.okx.com` | US / OpenAPI entities | wrong entity |
-| `wss://wseea.okx.com:8443/...` | **EEA live** WebSockets | live trading environment — one dropped `pap` infix away from the demo host, so the check is an exact-host allow-list, never a substring match |
-| `wss://ws.okx.com:8443/...` | Global live WS | live |
-| `wss://wspap.okx.com:8443/...` | Global demo WS | wrong entity (demo, but not EEA) |
-| `wss://wsuspap.okx.com:8443/...` | US demo WS | wrong entity |
+```
+code=50119  "API key doesn't exist"
+```
 
-The demo/live WS distinction is a *hostname* distinction (`wseeapap` vs `wseea`), unlike
-REST where it is a *header* distinction. Both mechanisms are enforced.
+which reads like a typo'd key but is a *region* mismatch. This is selected by
+`exchange.region` in `config/default.yaml`. Every profile in the registry is a **demo**
+profile; there is no value that reaches a live endpoint.
+
+### The demo profile registry
+
+Defined once, in `src/btcbot/exchange/endpoints.py`. Source: tiagosiebler SDK
+`requestUtils.ts` (`getRestBaseUrl`) and `websocket-util.ts`, both re-read 2026-07-29.
+
+| `region` | Entity | REST | WS public / private / business (demo) |
+|---|---|---|---|
+| `global` *(default)* | OKX Global / UAE | `https://openapi.okx.com` (alt: `https://www.okx.com`) | `wss://wspap.okx.com:8443/ws/v5/{public,private,business}` |
+| `eea` | OKX Europe (EEA, MiCA) | `https://eea.okx.com` | `wss://wseeapap.okx.com:8443/ws/v5/{public,private,business}` |
+| `us` | OKX US | `https://us.okx.com` | `wss://wsuspap.okx.com:8443/ws/v5/{public,private,business}` |
+
+Two REST hosts are allow-listed for Global because the SDK exposes both: `GLOBAL`/`prod`
+→ `https://www.okx.com` (also `API_URL` in OKX's own Python SDK) and `OPENAPI_GLOBAL` →
+`https://openapi.okx.com`. The default is `openapi.okx.com`; switching is one config line.
+
+The demo business URL carries `?brokerId=9999` in the SDK matrix. Both spellings — with
+and without the query — are allow-listed, because the SDKs disagree and neither is a
+live endpoint.
+
+### Hosts that must be rejected
+
+REST is **not** environment-separated on OKX: every region serves demo and live from the
+same host, switched by the header. So a REST deny-list would be false comfort — what
+protects REST is the unconditional header plus the negative control (§4). The REST
+allow-list exists to stop the client being pointed at an *unrecognised* host at all.
+
+WebSockets *are* environment-separated, by a single `pap` infix. These nine URLs are
+explicitly forbidden and `MainnetRejectedError` is raised before a socket is opened:
+
+| Host | What it is |
+|---|---|
+| `wss://ws.okx.com:8443/ws/v5/{public,private,business}` | Global **live** |
+| `wss://wseea.okx.com:8443/ws/v5/{public,private,business}` | EEA **live** |
+| `wss://wsus.okx.com:8443/ws/v5/{public,private,business}` | US **live** |
+
+Each is one dropped infix away from its demo counterpart (`wspap`→`ws`,
+`wseeapap`→`wseea`, `wsuspap`→`wsus`), which is why the check is an **exact-match
+allow-list**, never a substring test. A test asserts no forbidden URL has leaked into the
+allow-list.
+
+The demo/live WS distinction is a *hostname* distinction; on REST it is a *header*
+distinction. Both mechanisms are enforced.
 
 ---
 
@@ -197,9 +241,9 @@ loans, staking. `scripts/audit_safety.sh` fails the build if any of these paths 
 
 | Stream | Channels used |
 |---|---|
-| public (demo EEA) | `tickers`, `trades`, `books`, `open-interest`, `funding-rate`, `mark-price` |
-| business (demo EEA) | `candle1m` / `candle5m` / … — **candlestick channels live on the business endpoint**, which is why the business URL (with `brokerId=9999`) is part of the required host set |
-| private (demo EEA) | `account`, `positions`, `orders`, `balance_and_position` |
+| public (demo) | `tickers`, `trades`, `books`, `open-interest`, `funding-rate`, `mark-price` |
+| business (demo) | `candle1m` / `candle5m` / … — **candlestick channels live on the business endpoint**, which is why the business URL (with `brokerId=9999`) is part of the required host set |
+| private (demo) | `account`, `positions`, `orders`, `balance_and_position` |
 
 WS candle payloads carry the same `confirm` flag; only confirmed candles reach strategies.
 
@@ -213,7 +257,7 @@ reconnect:
 
 | # | Signal | What it proves | Failure behaviour |
 |---|---|---|---|
-| 1 | **Host pin** — the REST base URL must equal `https://eea.okx.com` and WS URLs must be members of the compile-time EEA-demo allow-list. Not settable from YAML, env, or CLI. | We can only ever talk to the EEA entity, and only to demo WS hosts. | `MainnetRejectedError` at construction |
+| 1 | **Host pin** — the REST base URL must be a recognised OKX demo host and every WS URL the active profile will dial must be on the exact-match demo allow-list. YAML picks *which* demo region (§1a); it cannot supply a URL. | We can only ever talk to a known OKX entity, and only to demo WS hosts. | `MainnetRejectedError` at construction |
 | 2 | **Header enforcement probe** — the client's own header builder is inspected at runtime: every authenticated request path routes through the single `_headers()` implementation that hard-codes `x-simulated-trading: 1`. | No request can be emitted without the demo switch. | verification FAIL |
 | 3 | **Authenticated demo reachability** — `GET /api/v5/account/config` and `GET /api/v5/account/balance` succeed **with** the demo header, and the account config is sane (a `posMode` is returned). | The key is valid for the demo environment and the account is usable. | verification FAIL |
 | 4 | **Live-environment negative control** — the same credentials are sent **once**, read-only (`GET /api/v5/account/config`), **without** the demo header. This call is *required to fail* with `50101` (environment mismatch) or an equivalent auth rejection. If it authenticates, the key is live-scoped and the system refuses to trade with it. | The key cannot act on the live environment. | verification FAIL — hard stop |
@@ -242,13 +286,13 @@ ORDER SUBMISSION DISABLED
 
 "BTCUSD UM X-Perp" is the **display name** in the OKX Europe UI (MiCA-compliant
 perpetual-style product; "UM" = USD(T/C)-margined, i.e. a *linear* contract). The
-underlying API `instId` for the EEA entity could **not** be confirmed from primary
+underlying API `instId` could **not** be confirmed from primary
 documentation in this environment — and per the project rules it would not be hardcoded
 even if it had been.
 
 Discovery therefore works like this (`exchange/instruments.py`):
 
-1. `GET /api/v5/public/instruments?instType=SWAP` against `eea.okx.com` **at runtime**.
+1. `GET /api/v5/public/instruments?instType=SWAP` against the configured region's host **at runtime**.
 2. Filter: `uly`/`instFamily` referencing BTC, `ctType == "linear"`, `state == "live"`,
    settle currency in the configured accept-list (`USDT`/`USDC`/`USD`).
 3. If exactly one instrument matches, it is selected and its full spec is journaled. If
@@ -338,6 +382,7 @@ fail the build if a forbidden endpoint path or a non-allow-listed host string ap
 ## 9. Eligibility
 
 Unchanged policy from the Bybit build: nothing here circumvents age, KYC, geographic, or
-account restrictions, and nothing masks origin. The system talks to the documented EEA
-demo environment with a demo key the account holder generated themselves. If OKX declines
+account restrictions, and nothing masks origin. The system talks to the documented demo
+environment of the entity the account holder's own key belongs to, with a demo key they
+generated themselves. If OKX declines
 a request, the system reports the exchange's stated reason plainly and stops.

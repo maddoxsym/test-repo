@@ -78,6 +78,15 @@ class MarketConfig(StrictModel):
 
 
 class ExchangeConfig(StrictModel):
+    """Transport settings.
+
+    ``region`` selects which OKX *demo* entity to talk to — Global/UAE, EEA, or
+    US. An API key is issued by one entity and is unknown to the others, which
+    is what OKX reports as ``50119 API key doesn't exist``. Every choice here
+    resolves to a demo profile; there is no value that reaches a live endpoint.
+    """
+
+    region: Literal["global", "eea", "us"] = "global"
     request_timeout_seconds: float = Field(15.0, gt=0, le=120)
     max_retries: int = Field(4, ge=0, le=10)
     retry_backoff_base_seconds: float = Field(0.75, gt=0, le=10)
