@@ -45,6 +45,7 @@ class BreakerType(str, Enum):
     CLOCK_DRIFT = "clock_drift"
     LIQUIDATION_RISK = "liquidation_risk"
     UNCONFIRMED_FILL = "unconfirmed_fill"
+    UNPROTECTED_POSITION = "unprotected_position"
 
 
 @dataclass(slots=True)
@@ -310,6 +311,24 @@ class CircuitBreakers:
             f"order {order_id or client_order_id} accepted but not confirmed: {detail}",
             order_id=order_id,
             client_order_id=client_order_id,
+        )
+
+    def record_unprotected_position(
+        self, *, inst_id: str, detail: str, closed: bool
+    ) -> BreakerTrip:
+        """A real position existed without a verified exchange-side stop.
+
+        The most serious state this system can reach: real exposure with no
+        protection that survives this process. Trading stops immediately and
+        does not resume on a timer alone — the operator should confirm the
+        account is flat before restarting.
+        """
+        outcome = "position was closed" if closed else "POSITION MAY STILL BE OPEN"
+        return self._trip(
+            BreakerType.UNPROTECTED_POSITION,
+            f"{inst_id} had no verified exchange stop ({outcome}): {detail}",
+            inst_id=inst_id,
+            closed=closed,
         )
 
     def record_order_submitted(self) -> None:

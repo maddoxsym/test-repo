@@ -26,6 +26,7 @@ from btcbot.exchange.demo_guard import DemoGuard, DemoVerification, SignalResult
 from btcbot.exchange.endpoints import DEFAULT_PROFILE
 from btcbot.exchange.instruments import ExchangeCapabilities
 from btcbot.exchange.models import (
+    AlgoOrder,
     Execution,
     LeverageInfo,
     OrderDetails,
@@ -67,6 +68,9 @@ class MockOkxClient:
         order_state: str = "filled",
         order_visible_after: int = 1,
         fills_visible_after: int = 1,
+        algo_visible: bool = True,
+        algo_place_error: Exception | None = None,
+        algo_read_error: Exception | None = None,
     ) -> None:
         self.base_url = DEFAULT_PROFILE.rest_host
         self.profile = DEFAULT_PROFILE
@@ -84,6 +88,13 @@ class MockOkxClient:
         self._fills_visible_after = fills_visible_after
         self.order_lookups = 0
         self.fill_lookups = 0
+        # Exchange-side protection. `algo_visible` False models OKX accepting
+        # the placement but never registering it — the unprotected case.
+        self.algo_orders_placed: list[dict[str, Any]] = []
+        self._algo_live: list[AlgoOrder] = []
+        self._algo_visible = algo_visible
+        self._algo_place_error = algo_place_error
+        self._algo_read_error = algo_read_error
 
     async def get_order(self, inst_id, *, order_id=None, client_order_id=None):
         self.order_lookups += 1
@@ -148,6 +159,55 @@ class MockOkxClient:
 
     async def get_positions(self, inst_id=None):
         return []
+
+    # --- exchange-side protection (algo orders) -------------------------
+
+    async def place_algo_order(
+        self, inst_id, *, side, size, td_mode="isolated", pos_side=None,
+        sl_trigger_price=None, tp_trigger_price=None, reduce_only=True,
+        client_algo_id=None,
+    ):
+        self.algo_orders_placed.append(
+            {
+                "inst_id": inst_id, "side": side, "size": size, "pos_side": pos_side,
+                "sl": sl_trigger_price, "tp": tp_trigger_price,
+                "reduce_only": reduce_only, "client_algo_id": client_algo_id,
+            }
+        )
+        if self._algo_place_error is not None:
+            raise self._algo_place_error
+        if self._algo_visible:
+            self._algo_live.append(
+                AlgoOrder.from_response(
+                    {
+                        "algoId": f"algo-{len(self.algo_orders_placed)}",
+                        "algoClOrdId": client_algo_id or "",
+                        "instId": inst_id,
+                        "ordType": "oco" if (sl_trigger_price and tp_trigger_price)
+                                   else "conditional",
+                        "state": "live", "side": side.value, "posSide": pos_side or "net",
+                        "sz": size, "reduceOnly": "true",
+                        "slTriggerPx": sl_trigger_price or "0",
+                        "tpTriggerPx": tp_trigger_price or "0",
+                        "cTime": "1700000000000",
+                    }
+                )
+            )
+        return self._algo_live[-1] if self._algo_live else None
+
+    async def get_algo_orders(self, inst_id, *, order_type="oco"):
+        if self._algo_read_error is not None:
+            raise self._algo_read_error
+        return [o for o in self._algo_live if o.order_type == order_type]
+
+    async def get_protective_orders(self, inst_id):
+        if self._algo_read_error is not None:
+            raise self._algo_read_error
+        return list(self._algo_live)
+
+    async def cancel_algo_orders(self, inst_id, algo_ids, *, order_type="oco"):
+        self._algo_live = [o for o in self._algo_live if o.algo_id not in algo_ids]
+        return [{"algoId": a, "sCode": "0"} for a in algo_ids]
 
     async def cancel_all(self, inst_id: str) -> dict[str, Any]:
         self.cancels.append(inst_id)

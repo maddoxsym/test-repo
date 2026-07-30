@@ -62,6 +62,7 @@ from .endpoints import (
 )
 from .models import (
     AccountConfig,
+    AlgoOrder,
     Candle,
     ExchangePosition,
     Execution,
@@ -74,6 +75,7 @@ from .models import (
     OrderDetails,
     OrderRequest,
     OrderResult,
+    Side,
     Ticker,
     WalletBalance,
 )
@@ -753,6 +755,103 @@ class OkxDemoClient:
             raise
         data = self._data(payload)
         return OrderDetails.from_response(data[0]) if data else None
+
+    # --- authenticated: exchange-side protection (algo orders) -----------
+
+    async def place_algo_order(
+        self,
+        inst_id: str,
+        *,
+        side: Side,
+        size: str,
+        td_mode: str = "isolated",
+        pos_side: str | None = None,
+        sl_trigger_price: str | None = None,
+        tp_trigger_price: str | None = None,
+        reduce_only: bool = True,
+        client_algo_id: str | None = None,
+    ) -> AlgoOrder:
+        """Place a conditional / OCO order that protects an open position.
+
+        This is the only way to obtain protection that survives this process.
+        Both triggers together produce an OCO — OKX cancels the remaining leg
+        when one fires, which is what stops a filled take-profit from leaving
+        an orphaned stop behind.
+
+        Orders are ``reduceOnly`` by default: protection may only ever close a
+        position, never open or increase one.
+        """
+        if not sl_trigger_price and not tp_trigger_price:
+            raise ApiError(
+                -1, "an algo order needs a stop-loss or take-profit trigger", Paths.ORDER_ALGO
+            )
+        # Both legs -> OCO (one cancels the other). One leg -> conditional.
+        ord_type = "oco" if (sl_trigger_price and tp_trigger_price) else "conditional"
+        body: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side.value,
+            "ordType": ord_type,
+            "sz": size,
+            "reduceOnly": reduce_only,
+        }
+        if pos_side:
+            body["posSide"] = pos_side
+        if client_algo_id:
+            body["algoClOrdId"] = client_algo_id
+        if sl_trigger_price:
+            body["slTriggerPx"] = sl_trigger_price
+            body["slOrdPx"] = "-1"        # -1 = close at market when triggered
+        if tp_trigger_price:
+            body["tpTriggerPx"] = tp_trigger_price
+            body["tpOrdPx"] = "-1"
+        payload = await self._request(
+            "POST", Paths.ORDER_ALGO, body=body, authenticated=True, item_level_errors=True
+        )
+        item = self._check_items(payload, Paths.ORDER_ALGO, expected=1)[0]
+        return AlgoOrder.from_response({**body, **item})
+
+    async def get_algo_orders(
+        self, inst_id: str, *, order_type: str = "oco"
+    ) -> list[AlgoOrder]:
+        """Pending algo orders of one type — the verification read.
+
+        OKX requires ``ordType`` on this endpoint and does not accept a
+        wildcard, so callers that want the full picture ask for each type.
+        """
+        payload = await self._request(
+            "GET",
+            Paths.ORDERS_ALGO_PENDING,
+            params={"instId": inst_id, "ordType": order_type},
+            authenticated=True,
+        )
+        return [AlgoOrder.from_response(item) for item in self._data(payload)]
+
+    async def get_protective_orders(self, inst_id: str) -> list[AlgoOrder]:
+        """Every pending order that could protect ``inst_id``, all types.
+
+        A failure on one type is not allowed to look like "no protection" —
+        that would send the caller down the emergency-close path on a transient
+        read error — so read errors propagate.
+        """
+        found: dict[str, AlgoOrder] = {}
+        for order_type in ("oco", "conditional", "trigger", "move_order_stop"):
+            for order in await self.get_algo_orders(inst_id, order_type=order_type):
+                if order.algo_id:
+                    found[order.algo_id] = order
+        return list(found.values())
+
+    async def cancel_algo_orders(
+        self, inst_id: str, algo_ids: list[str], *, order_type: str = "oco"
+    ) -> list[dict[str, Any]]:
+        """Cancel protective orders by algoId (used when replacing them)."""
+        if not algo_ids:
+            return []
+        body = [{"instId": inst_id, "algoId": algo_id} for algo_id in algo_ids]
+        payload = await self._request(
+            "POST", Paths.CANCEL_ALGOS, body=body, authenticated=True, item_level_errors=True
+        )
+        return self._data(payload)
 
     async def get_open_orders(self, inst_id: str) -> list[OpenOrder]:
         payload = await self._request(

@@ -66,6 +66,7 @@ from ..utils.numeric import format_qty
 from ..utils.timeutil import iso, now_utc
 from .order_safety import OrderSafetyGuard, disclose_order
 from .position_ledger import LedgerPosition, PositionLedger
+from .protection import PositionProtector, ProtectionRegistry, ProtectionState
 from .reconciliation import FillReconciler, ReconciliationOutcome
 
 log = get_logger(__name__)
@@ -126,11 +127,16 @@ class DemoExecutor:
         position_mode: PositionMode = PositionMode.NET,
         dry_run: bool = False,
         reconciler: FillReconciler | None = None,
+        protector: PositionProtector | None = None,
     ) -> None:
         self.client = client
         # One reconciliation behaviour, shared with the smoke test. Injectable
         # so tests can shorten the backoff without changing what is tested.
         self.reconciler = reconciler or FillReconciler(client)
+        # Exchange-side protection. Every real entry must end with a verified
+        # stop registered at OKX — see execution/protection.py.
+        self.protector = protector or PositionProtector(client)
+        self.protection = ProtectionRegistry()
         self.guard = guard
         self.breakers = breakers
         self.sizer = sizer
@@ -479,6 +485,10 @@ class DemoExecutor:
                 )
 
             # --- submit ---------------------------------------------------
+            # Attach the stop and target to the entry itself, so OKX creates
+            # protection with the fill rather than in a later round trip. This
+            # is belt; the braces are the verified OCO placed after the fill.
+            # Both are needed: OKX can accept an order and reject its algo.
             request = OrderRequest(
                 inst_id=instrument.inst_id,
                 td_mode=TdMode.ISOLATED,
@@ -487,6 +497,12 @@ class DemoExecutor:
                 sz=sizing.quantity_str,
                 client_order_id=order_id,
                 pos_side=pos_side,
+                sl_trigger_price=str(instrument.round_price(signal.stop_price)),
+                tp_trigger_price=(
+                    str(instrument.round_price(signal.target_price))
+                    if signal.target_price
+                    else None
+                ),
             )
 
             try:
@@ -555,6 +571,28 @@ class DemoExecutor:
                     signal=signal,
                     setup_id=setup_id,
                     signal_id=signal_id,
+                )
+
+            # The position is real. It must not remain open for longer than it
+            # takes to prove a stop exists at the exchange.
+            protection = await self._ensure_protection(
+                instrument,
+                signal=signal,
+                direction=signal.direction,
+                filled_size=outcome.filled_size or float(sizing.contracts),
+                fill_price=outcome.avg_price or signal.entry_reference,
+                client_order_id=order_id,
+            )
+            if not protection.protected:
+                return await self._emergency_close_unprotected(
+                    instrument,
+                    direction=signal.direction,
+                    filled_size=outcome.filled_size or float(sizing.contracts),
+                    protection=protection,
+                    signal=signal,
+                    setup_id=setup_id,
+                    signal_id=signal_id,
+                    client_order_id=order_id,
                 )
 
             # Best-effort: read back the live position for its actual
@@ -786,6 +824,152 @@ class DemoExecutor:
             )
         finally:
             self.safety.finish(position.setup_id, intent)
+
+    # --- exchange-side protection ----------------------------------------
+
+    async def _ensure_protection(
+        self,
+        instrument,
+        *,
+        signal: StrategySignal,
+        direction: Direction,
+        filled_size: float,
+        fill_price: float,
+        client_order_id: str,
+    ) -> ProtectionState:
+        """Guarantee a verified exchange-side stop on a just-filled position.
+
+        Protection is computed from the **actual fill price**, not the signal's
+        reference: a stop placed around a price the exchange never traded sits
+        at the wrong distance and risks the wrong amount.
+        """
+        stop_price = signal.stop_price
+        target_price = signal.target_price
+        if fill_price > 0 and signal.entry_reference > 0:
+            # Preserve the strategy's intended risk *distance* around the price
+            # actually paid, rather than its absolute level.
+            drift = fill_price - signal.entry_reference
+            stop_price = signal.stop_price + drift
+            target_price = signal.target_price + drift if signal.target_price else None
+            if abs(drift) > 1e-9:
+                log.info(
+                    "PROTECTION",
+                    f"Filled at {fill_price:,.2f} vs reference {signal.entry_reference:,.2f} — "
+                    f"stop shifted to {stop_price:,.2f}",
+                )
+        try:
+            state = await self.protector.protect(
+                instrument,
+                direction=direction,
+                filled_size=filled_size,
+                entry_price=fill_price or signal.entry_reference,
+                stop_price=stop_price,
+                target_price=target_price,
+                position_mode=self.position_mode,
+                client_algo_id=f"p{client_order_id}"[:32],
+            )
+        except (ApiError, TransportError) as exc:
+            # A read/placement failure is NOT evidence of protection. Treated
+            # exactly like an absent stop.
+            state = ProtectionState.unprotected(
+                instrument.inst_id, f"protection could not be established: {exc}"
+            )
+        self.protection.record(state)
+        return state
+
+    async def _emergency_close_unprotected(
+        self,
+        instrument,
+        *,
+        direction: Direction,
+        filled_size: float,
+        protection: ProtectionState,
+        signal: StrategySignal,
+        setup_id: str,
+        signal_id: str | None,
+        client_order_id: str,
+    ) -> DemoExecutionResult:
+        """Close a position that has no verified stop, then stop trading.
+
+        The position is real and naked. Closing it at market is a known small
+        cost; leaving it open is an unbounded one. The ledger is deliberately
+        NOT updated with an open position — there must be nothing for the
+        software-side trade manager to "manage", because software-side
+        management is exactly what failed to protect it.
+        """
+        log.critical(
+            "PROTECTION",
+            f"{instrument.inst_id} position has NO verified exchange stop "
+            f"({protection.detail}) — closing it reduce-only now",
+        )
+        side, pos_side, reduce_only = self._exit_sides(direction)
+        close_id = client_order_id_new = f"x{client_order_id}"[:32]
+        closed = False
+        close_detail = ""
+        try:
+            close_request = OrderRequest(
+                inst_id=instrument.inst_id,
+                td_mode=TdMode.ISOLATED,
+                side=side,
+                order_type=OrderType.MARKET,
+                sz=format_qty(instrument.round_qty(filled_size), instrument.lot_size),
+                client_order_id=client_order_id_new,
+                pos_side=pos_side,
+                reduce_only=reduce_only,
+            )
+            close_result = await self.client.place_order(close_request)
+            closed = True
+            close_detail = f"closed with {close_result.exchange_order_id}"
+            log.critical("PROTECTION", f"Unprotected position CLOSED — {close_detail}")
+        except (ApiError, TransportError) as exc:
+            close_detail = f"CLOSE FAILED: {exc}"
+            log.critical(
+                "PROTECTION",
+                f"Could not close the unprotected {instrument.inst_id} position: {exc}. "
+                "CHECK YOUR OKX DEMO ACCOUNT IMMEDIATELY — a position may be open with "
+                "no stop.",
+            )
+
+        # Trading stops either way: an entry that cannot be protected is a
+        # defect, and the next one would be no safer.
+        self.breakers.record_unprotected_position(
+            inst_id=instrument.inst_id,
+            detail=f"{protection.detail}; {close_detail}",
+            closed=closed,
+        )
+        self.protection.forget(instrument.inst_id)
+        self.orders.mark_result(
+            client_order_id,
+            status="filled",
+            reject_reason=f"unprotected, emergency close: {protection.detail}",
+        )
+        self._journal_rejection(
+            layer_index=10,
+            layer_name="protection_unverified",
+            reason=protection.detail,
+            signal=signal,
+            setup_id=setup_id,
+            signal_id=signal_id,
+        )
+        self.system.event(
+            "position_unprotected",
+            f"{signal.strategy_id} entry had no verifiable exchange stop — "
+            f"{'closed' if closed else 'CLOSE FAILED'}; SAFE_MODE entered",
+            level="ERROR",
+            experiment_id=self.experiment_id,
+            payload={
+                "inst_id": instrument.inst_id,
+                "client_order_id": client_order_id,
+                "close_client_order_id": close_id,
+                "closed": closed,
+                "detail": protection.detail,
+            },
+        )
+        return DemoExecutionResult(
+            False,
+            reason=f"no verified exchange stop: {protection.detail}",
+            client_order_id_value=client_order_id,
+        )
 
     # --- fills and reconciliation -----------------------------------------
 

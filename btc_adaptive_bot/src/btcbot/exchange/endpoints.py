@@ -286,6 +286,13 @@ class Paths:
     FILLS = "/api/v5/trade/fills"
     CLOSE_POSITION = "/api/v5/trade/close-position"
 
+    # Algo (conditional / OCO) orders — exchange-side stop-loss and take-profit.
+    # These are what actually protect a position: they live at the exchange and
+    # keep working when this process, its network, or the machine does not.
+    ORDER_ALGO = "/api/v5/trade/order-algo"
+    ORDERS_ALGO_PENDING = "/api/v5/trade/orders-algo-pending"
+    CANCEL_ALGOS = "/api/v5/trade/cancel-algos"
+
 
 # =====================================================================
 #  ORDER-OPERATION RESPONSE CODES
@@ -314,6 +321,8 @@ ORDER_OPERATION_PATHS: frozenset[str] = frozenset(
         Paths.CANCEL_ORDER,
         Paths.CANCEL_BATCH_ORDERS,
         Paths.CLOSE_POSITION,
+        Paths.ORDER_ALGO,
+        Paths.CANCEL_ALGOS,
     }
 )
 

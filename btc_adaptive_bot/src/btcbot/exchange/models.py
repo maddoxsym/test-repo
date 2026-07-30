@@ -645,6 +645,87 @@ class OpenOrder:
 
 
 @dataclass(frozen=True, slots=True)
+class AlgoOrder:
+    """A conditional / OCO order living at the exchange.
+
+    This is what actually protects a position. A stop held only in this
+    process's memory protects nothing: it dies with the process, and does
+    nothing while the machine sleeps, the network drops, or the event loop is
+    blocked. An algo order sits in OKX's matching engine and triggers whether
+    or not this bot is running.
+
+    ``algo_id`` is the exchange's identifier — the thing to verify against and
+    the thing to cancel. ``state`` is OKX's own vocabulary: ``live``,
+    ``pause``, ``effective``, ``canceled``, ``order_failed``.
+    """
+
+    algo_id: str
+    client_algo_id: str
+    inst_id: str
+    order_type: str              # conditional | oco | trigger | move_order_stop
+    state: str
+    side: Side
+    pos_side: str
+    size: float
+    reduce_only: bool
+    tp_trigger_price: float
+    tp_order_price: float
+    sl_trigger_price: float
+    sl_order_price: float
+    created_ms: int
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    LIVE: ClassVar[str] = "live"
+    EFFECTIVE: ClassVar[str] = "effective"
+    CANCELED: ClassVar[str] = "canceled"
+    FAILED: ClassVar[str] = "order_failed"
+    #: States in which the order is still standing guard over the position.
+    ACTIVE_STATES: ClassVar[frozenset[str]] = frozenset({"live", "pause", "effective"})
+
+    @property
+    def is_active(self) -> bool:
+        return self.state in self.ACTIVE_STATES
+
+    @property
+    def has_stop_loss(self) -> bool:
+        """Whether this order will actually close the position on a stop."""
+        return self.is_active and self.sl_trigger_price > 0
+
+    @property
+    def has_take_profit(self) -> bool:
+        return self.is_active and self.tp_trigger_price > 0
+
+    def describe(self) -> str:
+        parts = [f"algoId={self.algo_id}", f"type={self.order_type}", f"state={self.state}"]
+        if self.sl_trigger_price > 0:
+            parts.append(f"SL@{self.sl_trigger_price:,.2f}")
+        if self.tp_trigger_price > 0:
+            parts.append(f"TP@{self.tp_trigger_price:,.2f}")
+        parts.append(f"sz={self.size:g}")
+        return " ".join(parts)
+
+    @classmethod
+    def from_response(cls, item: dict[str, Any]) -> AlgoOrder:
+        return cls(
+            algo_id=item.get("algoId", ""),
+            client_algo_id=item.get("algoClOrdId", "") or item.get("clOrdId", ""),
+            inst_id=item.get("instId", ""),
+            order_type=item.get("ordType", ""),
+            state=item.get("state", ""),
+            side=Side(item.get("side", "buy")),
+            pos_side=item.get("posSide", ""),
+            size=float(item.get("sz") or 0.0),
+            reduce_only=str(item.get("reduceOnly", "")).lower() == "true",
+            tp_trigger_price=float(item.get("tpTriggerPx") or 0.0),
+            tp_order_price=float(item.get("tpOrdPx") or 0.0),
+            sl_trigger_price=float(item.get("slTriggerPx") or 0.0),
+            sl_order_price=float(item.get("slOrdPx") or 0.0),
+            created_ms=int(item.get("cTime") or 0),
+            raw=item,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class OrderDetails:
     """One order from ``GET /api/v5/trade/order`` — the authority on its state.
 
