@@ -34,13 +34,23 @@ from ..decision.risk_state import RiskStateTracker
 from ..exchange.demo_guard import DemoGuard
 from ..exchange.endpoints import DEFAULT_PROFILE, DemoProfile, profile_for
 from ..exchange.instruments import CapabilityDiscovery
-from ..exchange.models import Candle, Execution, PositionMode, Ticker, WalletBalance
+from ..exchange.models import (
+    Candle,
+    Execution,
+    OrderRequest,
+    OrderType,
+    PositionMode,
+    TdMode,
+    Ticker,
+    WalletBalance,
+)
 from ..exchange.rest import OkxDemoClient
 from ..exchange.ws import PrivateAccountStream, PublicMarketStream
 from ..execution.allocator import DemoAllocator
 from ..execution.demo_executor import DemoExecutor
 from ..execution.order_safety import OrderSafetyGuard
 from ..execution.position_ledger import PositionLedger
+from ..execution.protection import ProtectionState, protective_size
 from ..execution.research_equity import (
     ResearchEquityLedger,
     components_from_records,
@@ -61,7 +71,7 @@ from ..safety.circuit_breakers import CircuitBreakers
 from ..scoring.champion import ChampionSelector
 from ..scoring.scorer import StrategyEvidence, StrategyScorer, rank_strategies
 from ..shadow.engine import ShadowEngine
-from ..strategies.base import Strategy, StrategyContext, StrategySignal
+from ..strategies.base import Direction, Strategy, StrategyContext, StrategySignal
 from ..strategies.registry import StrategyRegistry
 from ..utils.errors import (
     ApiError,
@@ -73,6 +83,7 @@ from ..utils.errors import (
 from ..utils.ids import setup_id as make_setup_id
 from ..utils.ids import signal_id as make_signal_id
 from ..utils.logging import get_logger
+from ..utils.numeric import format_qty
 from ..utils.timeutil import interval_seconds, iso, now_utc
 from .experiment import ExperimentManager, ExperimentMode, Preconditions
 
@@ -517,6 +528,133 @@ class Orchestrator:
         self.news = NewsEngine(self.config.news, self.repos.news, experiment_id=experiment_id)
         self.news.restore_influence()
 
+    async def _reconcile_protection(self, instrument, exchange_positions) -> None:
+        """Verify — or restore — an exchange-side stop on every open position.
+
+        Runs on every boot, before trading resumes. For each live position it
+        asks OKX (never the local ledger) whether a stop exists. If one cannot
+        be established, the position is closed reduce-only and SAFE_MODE is
+        entered, because an unprotected position is the one state this system
+        must never sit in.
+        """
+        if not (self.executor and self.client):
+            return
+        live = [p for p in exchange_positions if abs(p.contracts) > 0]
+        if not live:
+            self.executor.protection.forget(instrument.inst_id)
+            return
+
+        for position in live:
+            inst_id = position.inst_id or instrument.inst_id
+            size = abs(position.contracts)
+            direction = Direction.LONG if position.contracts > 0 else Direction.SHORT
+            try:
+                state = await self.executor.protector.verify(inst_id, expected_size=size)
+            except (ApiError, TransportError) as exc:
+                log.error(
+                    "PROTECTION",
+                    f"Could not read protection for {inst_id} on startup: {exc} — "
+                    "treating the position as unprotected",
+                )
+                state = ProtectionState.unprotected(inst_id, f"verification failed: {exc}")
+
+            if state.protected:
+                self.executor.protection.record(state)
+                log.info(
+                    "PROTECTION",
+                    f"SL submitted and verified — {inst_id} survived the restart with "
+                    f"a live stop at {state.sl_trigger_price:,.2f} (algoId {state.algo_id})",
+                )
+                continue
+
+            # No stop. Try to restore one from the position's own entry price
+            # before resorting to closing it.
+            log.critical(
+                "PROTECTION",
+                f"{inst_id} is OPEN with NO exchange-side stop ({state.detail})",
+            )
+            restored = await self._restore_protection(instrument, position, direction, size)
+            if restored is not None and restored.protected:
+                self.executor.protection.record(restored)
+                continue
+
+            await self._close_unprotected_on_startup(instrument, position, direction, size, state)
+
+    async def _restore_protection(self, instrument, position, direction, size):
+        """Attempt to re-establish a stop on a position found unprotected."""
+        entry = position.avg_price
+        if entry <= 0:
+            return None
+        # Reconstruct the stop from the configured risk distance. Without the
+        # original signal this is the best defensible level available, and it is
+        # strictly better than no stop at all.
+        distance = entry * self.config.risk.max_stop_distance_pct
+        stop = entry - distance if direction is Direction.LONG else entry + distance
+        target = None
+        try:
+            state = await self.executor.protector.protect(
+                instrument,
+                direction=direction,
+                filled_size=size,
+                entry_price=entry,
+                stop_price=stop,
+                target_price=target,
+                position_mode=self._position_mode,
+                client_algo_id=f"restore{int(now_utc().timestamp())}"[:32],
+            )
+        except (ApiError, TransportError) as exc:
+            log.error("PROTECTION", f"Could not restore a stop on {instrument.inst_id}: {exc}")
+            return None
+        if state.protected:
+            log.warning(
+                "PROTECTION",
+                f"SL submitted and verified — restored a protective stop at "
+                f"{state.sl_trigger_price:,.2f} on the recovered {instrument.inst_id} "
+                "position (no take-profit; review this trade manually)",
+            )
+        return state
+
+    async def _close_unprotected_on_startup(
+        self, instrument, position, direction, size, state
+    ) -> None:
+        """Close a recovered position that cannot be protected, then stop."""
+        side, pos_side, reduce_only = self.executor._exit_sides(direction)  # noqa: SLF001
+        closed = False
+        detail = ""
+        try:
+            await self.client.place_order(
+                OrderRequest(
+                    inst_id=instrument.inst_id,
+                    td_mode=TdMode.ISOLATED,
+                    side=side,
+                    order_type=OrderType.MARKET,
+                    # Rounded up: a close short of the position would leave the
+                    # remainder open and unprotected. Reduce-only clamps the excess.
+                    sz=format_qty(protective_size(instrument, size), instrument.lot_size),
+                    client_order_id=f"rescue{int(now_utc().timestamp())}"[:32],
+                    pos_side=pos_side,
+                    reduce_only=reduce_only,
+                )
+            )
+            closed = True
+            log.critical(
+                "PROTECTION",
+                f"Closed the unprotected {instrument.inst_id} position found at startup",
+            )
+        except (ApiError, TransportError) as exc:
+            detail = str(exc)
+            log.critical(
+                "PROTECTION",
+                f"Could NOT close the unprotected {instrument.inst_id} position: {exc}. "
+                "CHECK YOUR OKX DEMO ACCOUNT NOW.",
+            )
+        self.breakers.record_unprotected_position(
+            inst_id=instrument.inst_id,
+            detail=f"found unprotected at startup: {state.detail}; {detail}",
+            closed=closed,
+        )
+        self.executor.protection.forget(instrument.inst_id)
+
     # =================================================================
     #  RESEARCH EQUITY
     # =================================================================
@@ -638,6 +776,12 @@ class Orchestrator:
                     status="filled" if filled else "cancelled",
                     reject_reason=None if filled else "not present at exchange on reconciliation",
                 )
+
+        # Every open position must carry a verified exchange-side stop. A
+        # position that survived a restart without one is the exact hazard this
+        # check exists for — protection that lived only in the previous
+        # process's memory died with it.
+        await self._reconcile_protection(instrument, exchange_positions)
 
         # Exchange positions vs ledger. A mismatch is reported, not
         # auto-corrected: guessing here could double a position.
@@ -1869,6 +2013,12 @@ class Orchestrator:
             # The research ledger — what the bot actually runs on. Rendered
             # side by side with the real account so the two are never confused.
             "research_equity": self.research_equity.snapshot().as_dict(),
+            # Exchange-side protection, straight from the last verified read.
+            "protection": (
+                self.executor.protection.snapshot()
+                if self.executor
+                else {"tracked": 0, "all_protected": True, "positions": []}
+            ),
             "demo_account": {
                 # These four are the RESEARCH figures: every percentage the
                 # dashboard shows is a percentage of research capital.

@@ -540,6 +540,10 @@ class TestTheRelaxationIsNarrow:
                 Paths.CANCEL_ORDER,
                 Paths.CANCEL_BATCH_ORDERS,
                 Paths.CLOSE_POSITION,
+                # Protective algo orders are the same batch-shaped operation:
+                # OKX answers code=1 with the real reason in the item's sCode.
+                Paths.ORDER_ALGO,
+                Paths.CANCEL_ALGOS,
             }
         )
         assert expected == ORDER_OPERATION_PATHS

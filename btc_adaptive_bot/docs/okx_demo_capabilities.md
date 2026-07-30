@@ -314,6 +314,53 @@ Two more things this costs nothing to get right:
   order — the `UNIQUE(setup_id, intent)` reservation makes a second submission
   for that setup structurally impossible.
 
+### Protection must be registered at the exchange, not held in Python
+
+An entry that fills leaves a real position. Until an algo order exists at OKX,
+that position has no stop — regardless of what any Python object holds. This
+system opened exactly one such position before this was fixed: the bot's logs
+showed `stop_loss` and `take_profit` levels, and the exchange held nothing.
+
+`OrderRequest` has always emitted `attachAlgoOrds` when given
+`sl_trigger_price`/`tp_trigger_price`; the entry path simply never set them.
+The stop lived on `LedgerPosition` and was enforced by `TradeManager` issuing a
+market exit when price crossed it — software-side management that dies with the
+process, the WebSocket, or the machine.
+
+Endpoints used:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v5/trade/order` with `attachAlgoOrds` | TP/SL created with the entry fill |
+| `POST /api/v5/trade/order-algo` | standalone OCO placed after a fill |
+| `GET /api/v5/trade/orders-algo-pending` | **the only evidence protection exists** |
+| `POST /api/v5/trade/cancel-algos` | remove protection when the position closes |
+
+Four things this encodes, in `execution/protection.py`:
+
+* **OCO, not two conditionals.** A separate stop and target leave an orphan when
+  one fires: the position closes on the take-profit and the stop survives, ready
+  to open a *new* position in the opposite direction. OKX cancels an OCO's
+  sibling atomically, which is requirement "closing one cancels the other" for
+  free.
+* **Placement success is not evidence.** OKX can accept an order and reject its
+  attached algo. Every `protected=True` is backed by a read-back of
+  `orders-algo-pending` within the same call, polled on a short bounded backoff
+  (0/0.3/0.7/1.5s) because OKX registers an algo order a beat after accepting it.
+* **The size is rounded *up* onto the lot grid.** Rounding down under-covers the
+  position, and a fill below one lot would round to zero — no protection at all.
+  Over-covering is harmless because protection is reduce-only, so the exchange
+  clamps it to what is open.
+* **A read failure is not "unprotected".** It raises, so a network blip cannot
+  cause a healthy position to be closed. An unreadable stop *at startup* is
+  treated as absent, because there the position is already unattended.
+
+If a stop cannot be placed and verified, the position is closed reduce-only and
+SAFE_MODE is entered. If the stop verifies but the take-profit does not, the
+stop is kept, the position stays open, and further entries are blocked.
+
+---
+
 ---
 
 ## 4. How this system proves it is on Demo

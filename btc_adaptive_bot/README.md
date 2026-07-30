@@ -687,6 +687,27 @@ below the contract minimum, or the liquidation buffer could not be satisfied at 
 allowed leverage. Refusing is the correct outcome — and the reason is recorded in
 `rejected_signals`.
 
+**`[PROTECTION] ... is OPEN with NO exchange-side stop`**
+The bot found a real position at OKX with no stop registered *at the exchange*. It
+tries to place one immediately; if it cannot, it closes the position reduce-only
+and enters SAFE_MODE. Nothing is required of you except to check the position is
+gone in the OKX Demo UI. The "Position protection" card on the dashboard shows the
+live stop's order ID, trigger price and last verification time.
+
+**`[PROTECTION] TP NOT verified`**
+The stop-loss is live at the exchange and the position is safe, but the take-profit
+is not. The bot keeps the stop, keeps the position, and blocks further entries so
+the discrepancy cannot compound. Review that trade manually — the take-profit will
+not fire.
+
+**A shadow exit reads `take_profit` with a negative R**
+Not a contradiction, and not a bug. `exit_reason` names the leg that *closed* the
+trade; the R-multiple covers the *whole* trade, summed over every leg and net of
+fees, slippage and spread. A trade whose last leg touched the target can still be
+negative overall if an earlier partial exited at a loss, or if costs outweighed a
+thin final leg. The log line now shows the decomposition ("final leg +0.04R,
+earlier partials -0.36R, costs $x.xx") whenever the label and the number disagree.
+
 **Dashboard won't load**
 Confirm the bot is running, then check the port isn't taken:
 `lsof -i :8787`. Change `dashboard.port` in config if needed.

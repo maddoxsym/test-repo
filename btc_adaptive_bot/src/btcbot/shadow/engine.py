@@ -316,7 +316,17 @@ class ShadowEngine:
             return None
 
         account.book_trade(pnl, position.fees_paid, position.slippage_cost + position.spread_cost)
+        # `exit_reason` names the leg that *closed* the trade; `pnl` and
+        # `r_multiple` are the *whole trade*, summed over every leg net of
+        # costs. Those are two different scopes, which is how a trade can be
+        # labelled `take_profit` and still be recorded at negative R: an
+        # earlier partial exited at a loss, or costs outweighed a thin final
+        # leg. The decomposition below makes that arithmetic explicit rather
+        # than leaving the reader to infer it.
         total_pnl = position.realized_pnl
+        final_leg_pnl = pnl
+        partials_pnl = position.partial_pnl
+        costs = position.fees_paid + position.slippage_cost + position.spread_cost
         notional = position.entry_price * position.quantity
         entry_dt = ms_to_dt(position.entry_bar_ms)
         exit_dt = ms_to_dt(candle.open_ms) if candle is not None else now_utc()
@@ -339,6 +349,10 @@ class ShadowEngine:
             "mae": position.mae,
             "duration_seconds": int((exit_dt - entry_dt).total_seconds()),
             "exit_reason": event.reason.value,
+            # Why the whole-trade R can disagree with the exit label.
+            "final_leg_pnl": final_leg_pnl,
+            "partials_pnl": partials_pnl,
+            "costs": costs,
             "regime": position.entry_regime,
             "entry_regime": position.entry_regime,
             "news_state": position.news_state,
@@ -378,7 +392,8 @@ class ShadowEngine:
         log.debug(
             "SHADOW",
             f"{account.strategy_id} exited {event.reason.value} "
-            f"{record['r_multiple']:+.2f}R (equity ${account.equity:,.2f})",
+            f"{record['r_multiple']:+.2f}R (equity ${account.equity:,.2f})"
+            f"{_exit_discrepancy(position, record)}",
         )
         return record
 
@@ -418,3 +433,36 @@ class ShadowEngine:
             for sid, acc in self.accounts.items()
             if acc.open_position is not None
         }
+
+
+#: Exit reasons whose *name* promises a gain. When one of these closes a trade
+#: at negative R the line must show its working, because the label alone reads
+#: as a contradiction.
+PROFIT_LABELLED_EXITS = frozenset({ExitReason.TAKE_PROFIT.value, ExitReason.PARTIAL.value})
+
+
+def _exit_discrepancy(position: SimulatedPosition, record: dict[str, Any]) -> str:
+    """Explain a whole-trade R that the exit label does not account for.
+
+    ``exit_reason`` describes the leg that closed the trade; ``r_multiple``
+    describes the trade end to end. When a ``take_profit`` trade lands at
+    negative R the arithmetic is one of two things — an earlier partial exited
+    at a loss, or costs outweighed a thin final leg — and it should be stated,
+    not left for the reader to reconstruct.
+
+    Returns an empty string when label and number agree, so ordinary exits
+    stay terse.
+    """
+    final_leg = record["final_leg_pnl"]
+    total = record["pnl"]
+    legs_disagree = final_leg != 0 and (final_leg > 0) != (total > 0)
+    label_oversells = record["exit_reason"] in PROFIT_LABELLED_EXITS and total < 0
+    if not (legs_disagree or label_oversells):
+        return ""
+
+    risk = position.initial_risk
+    parts = [f"final leg {safe_div(final_leg, risk):+.2f}R"]
+    if abs(record["partials_pnl"]) > 1e-12:
+        parts.append(f"earlier partials {safe_div(record['partials_pnl'], risk):+.2f}R")
+    parts.append(f"costs ${record['costs']:,.2f}")
+    return f" — whole trade differs from the exit leg: {', '.join(parts)}"

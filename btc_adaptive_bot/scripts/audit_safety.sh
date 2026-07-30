@@ -266,6 +266,43 @@ else
   failure "the unconfirmed-fill SAFE_MODE path is missing"
 fi
 
+# Exchange-side protection. The incident this guards against: a real position
+# opened with its stop living only in Python, where a crash erases it.
+if grep -q 'sl_trigger_price=' src/btcbot/execution/demo_executor.py; then
+  pass "every entry order carries an attached stop-loss trigger"
+else
+  failure "the entry path does not set a stop-loss trigger on the order"
+fi
+
+# A stop is only real once OKX confirms it. Placement returning 200 is not
+# evidence, so `protect` must end in a read-back of the pending algo orders.
+if grep -q 'get_protective_orders' src/btcbot/execution/protection.py && \
+   grep -q 'async def verify' src/btcbot/execution/protection.py; then
+  pass "protection is confirmed by reading the exchange, not by placement success"
+else
+  failure "protection is not verified against the exchange"
+fi
+
+if grep -q '_emergency_close_unprotected' src/btcbot/execution/demo_executor.py && \
+   grep -q 'record_unprotected_position' src/btcbot/safety/circuit_breakers.py; then
+  pass "an unverifiable stop closes the position and enters SAFE_MODE"
+else
+  failure "the unprotected-position close/SAFE_MODE path is missing"
+fi
+
+if grep -q '_reconcile_protection' src/btcbot/app/orchestrator.py; then
+  pass "startup re-verifies an exchange-side stop on every open position"
+else
+  failure "startup does not reconcile position protection"
+fi
+
+# Protection must be incapable of increasing exposure: reduce-only, always.
+if grep -qE '\bplace_order\(' src/btcbot/execution/protection.py; then
+  failure "the protection module can submit a plain (non-algo) order"
+else
+  pass "protection places reduce-only algo orders only — it cannot open a position"
+fi
+
 if grep -q 'max_risk_pct' src/btcbot/risk/position_sizing.py && \
    grep -q 'clamp(risk_pct' src/btcbot/risk/position_sizing.py; then
   pass "position sizing is hard-clamped to the configured risk ceiling"

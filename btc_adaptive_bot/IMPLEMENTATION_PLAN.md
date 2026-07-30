@@ -242,6 +242,47 @@ cap and a `len(candles) < 2` check and never hung; the two paths had diverged.
 - [x] `tests/unit/test_backfill_timing.py` (38) + orchestrator and timer tests;
       2 new audit checks
 
+## Phase R10 — Exchange-side position protection  `[x]`
+
+The bot opened a real OKX Demo position with **no stop-loss and no take-profit
+registered at the exchange**. The logs showed `stop_loss` and `take_profit` events
+marked `(shadow)`; the actual position had neither.
+
+**Root cause.** `OrderRequest` has always supported `sl_trigger_price`/
+`tp_trigger_price` and emitted `attachAlgoOrds` correctly — the entry path at
+`demo_executor.py` simply never set them. The stop lived only on `LedgerPosition`,
+enforced by `TradeManager.evaluate` issuing a market exit when price crossed it.
+That is software-side management: it evaporates if the process exits, the WebSocket
+drops, the loop stalls or the network goes away — exactly when a stop matters.
+
+- [x] **Entries carry `attachAlgoOrds`** — `sl_trigger_price` always,
+      `tp_trigger_price` when the signal has a target
+- [x] `execution/protection.py` — `PositionProtector.protect()` places a standalone
+      reduce-only **OCO** after the fill (one order, both legs, so closing one
+      cancels the other atomically) and `verify()` reads it back from
+      `orders-algo-pending`. Placement success is never treated as evidence
+- [x] Protection is sized to the **actually filled** quantity and placed around the
+      **actually filled** price; the size rounds *up* onto the lot grid so a
+      remainder is never left naked
+- [x] `[PROTECTION] SL submitted and verified` / `TP submitted and verified` are
+      emitted only after a read-back confirms them
+- [x] **SL unverifiable → close reduce-only + SAFE_MODE.** TP unverifiable but SL
+      live → keep the stop, keep the position, block new entries, log the exact
+      failure
+- [x] Startup reconciliation verifies every open OKX position, restores a stop where
+      it can, and closes what it cannot protect
+- [x] Duplicate protection prevented by verifying before placing
+- [x] Dashboard card: protection status, SL/TP order IDs and trigger prices, size
+      covered, last verification time
+- [x] Shadow `take_profit` at negative R explained: `exit_reason` is the **final
+      leg**, `pnl`/`r_multiple` are the **whole trade** net of costs. The log line
+      now shows the decomposition whenever the two disagree
+- [x] `tests/unit/test_position_protection.py` (30),
+      `tests/integration/test_startup_protection_recovery.py` (12),
+      `tests/unit/test_shadow_exit_labelling.py` (5); 5 new audit checks
+
+---
+
 ---
 
 # Part I — Bybit Demo build (historical record, complete)

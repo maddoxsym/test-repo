@@ -66,7 +66,12 @@ from ..utils.numeric import format_qty
 from ..utils.timeutil import iso, now_utc
 from .order_safety import OrderSafetyGuard, disclose_order
 from .position_ledger import LedgerPosition, PositionLedger
-from .protection import PositionProtector, ProtectionRegistry, ProtectionState
+from .protection import (
+    PositionProtector,
+    ProtectionRegistry,
+    ProtectionState,
+    protective_size,
+)
 from .reconciliation import FillReconciler, ReconciliationOutcome
 
 log = get_logger(__name__)
@@ -912,7 +917,10 @@ class DemoExecutor:
                 td_mode=TdMode.ISOLATED,
                 side=side,
                 order_type=OrderType.MARKET,
-                sz=format_qty(instrument.round_qty(filled_size), instrument.lot_size),
+                # Rounded up, not down: a close one lot short of the position
+                # leaves the remainder open and still naked. Reduce-only means
+                # the exchange clamps any excess to what is actually held.
+                sz=format_qty(protective_size(instrument, filled_size), instrument.lot_size),
                 client_order_id=client_order_id_new,
                 pos_side=pos_side,
                 reduce_only=reduce_only,

@@ -185,6 +185,29 @@ function render(d){
     row('Other assets', '<span class="tag">EXCLUDED</span>')
   ));
 
+  // Exchange-side protection. Anything but "PROTECTED" here means a real
+  // position is exposed — it is rendered first and loudly for that reason.
+  const prot=d.protection||{};
+  const plist=prot.positions||[];
+  cards.push(card('Position protection (exchange-side)',
+    row('Status', plist.length
+        ? tag(prot.all_protected,'PROTECTED','UNPROTECTED')
+        : '<span class="tag">no open position</span>')+
+    plist.map(pp=>
+      row('Instrument', esc(pp.inst_id))+
+      row('Protection', tag(pp.protected, esc(String(pp.status).toUpperCase()), 'UNPROTECTED'))+
+      row('SL order / price', pp.sl_order_id
+          ? '<code>'+esc(pp.sl_order_id)+'</code> @ '+money(pp.sl_price)
+          : '<span class="tag off">NONE</span>')+
+      row('TP order / price', pp.tp_order_id
+          ? '<code>'+esc(pp.tp_order_id)+'</code> @ '+money(pp.tp_price)
+          : '<span class="tag warn">NONE</span>')+
+      row('Size covered', pp.size)+
+      row('Last verified', esc(pp.verified_at||'never'))+
+      (pp.detail?row('Detail', esc(pp.detail)):'')
+    ).join('')
+  ));
+
   cards.push(card('OKX Demo positions',
     row('Equity (research)', money(a.equity))+
     row('Available USDT (actual)', money(a.available))+

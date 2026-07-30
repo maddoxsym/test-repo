@@ -48,13 +48,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 
 from ..exchange.models import AlgoOrder, InstrumentSpec, PositionMode, PosSide, Side
 from ..strategies.base import Direction
 from ..utils.errors import ApiError, TransportError
 from ..utils.logging import get_logger
-from ..utils.numeric import format_qty
+from ..utils.numeric import format_qty, round_step_up
 from ..utils.timeutil import now_utc
 
 log = get_logger(__name__)
@@ -162,6 +163,18 @@ def protective_side(direction: Direction) -> Side:
     return Side.SELL if direction is Direction.LONG else Side.BUY
 
 
+def protective_size(instrument: InstrumentSpec, filled_size: float) -> Decimal:
+    """The contract quantity a protective order must carry.
+
+    Rounded **up** onto the lot grid, never down. A protective order one lot
+    short leaves that remainder naked, which is the exact failure this module
+    exists to prevent — and a fill smaller than one lot would round down to
+    zero, i.e. no protection at all. Over-covering is harmless: protection is
+    reduce-only, so the exchange clamps it to whatever is actually open.
+    """
+    return max(round_step_up(filled_size, instrument.lot_size), instrument.min_size)
+
+
 def stop_is_on_the_correct_side(
     direction: Direction, *, entry_price: float, stop_price: float
 ) -> bool:
@@ -265,9 +278,19 @@ class PositionProtector:
         must close the position; it never means "probably fine".
         """
         inst_id = instrument.inst_id
+        if filled_size <= 0:
+            return ProtectionState.unprotected(
+                inst_id, f"refusing to protect a position of size {filled_size:g}"
+            )
+
+        # The quantity protection must cover, on the exchange's lot grid. Both
+        # verification reads compare against *this*, not the raw fill: it is
+        # what we ask the exchange for, so it is what the read-back must show.
+        covered = protective_size(instrument, filled_size)
+        expected = float(covered)
 
         # Already protected? Never place a second OCO over an existing one.
-        existing = await self.verify(inst_id, expected_size=filled_size)
+        existing = await self.verify(inst_id, expected_size=expected)
         if existing.protected and existing.status is ProtectionStatus.PROTECTED:
             log.info("PROTECTION", f"{inst_id} already protected — {existing.detail}")
             return existing
@@ -288,7 +311,7 @@ class PositionProtector:
             if target_price and target_price > 0
             else None
         )
-        size = format_qty(instrument.round_qty(filled_size), instrument.lot_size)
+        size = format_qty(covered, instrument.lot_size)
         side = protective_side(direction)
         pos_side = None if position_mode is PositionMode.NET else (
             PosSide.LONG.value if direction is Direction.LONG else PosSide.SHORT.value
@@ -315,7 +338,7 @@ class PositionProtector:
                 )
                 continue
             # Placement claiming success proves nothing. Read it back.
-            state = await self.verify(inst_id, expected_size=filled_size)
+            state = await self.verify(inst_id, expected_size=expected)
             if state.protected:
                 self._log_verified(state)
                 return state
