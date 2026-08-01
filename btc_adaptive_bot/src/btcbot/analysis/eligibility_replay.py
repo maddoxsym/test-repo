@@ -43,8 +43,8 @@ from typing import Any
 
 from ..config.schema import ActualEligibilityConfig, RiskConfig
 from ..execution.eligibility import (
-    BALANCED_PROFILE,
-    STRICT_PROFILE,
+    FEE_SAFE_RR_100,
+    FEE_SAFE_RR_120,
     ActualTradeEligibility,
     TradeCosts,
 )
@@ -68,6 +68,7 @@ class ReplayTrade:
     #: None when the signal never produced a closed shadow trade.
     exit_price: float | None = None
     exit_reason: str = ""
+    exit_ts: str = ""
     notional: float = 0.0
     gross_pnl: float = 0.0
     fees: float = 0.0
@@ -110,6 +111,24 @@ class ReplayResult:
     def winners(self) -> int:
         return len([t for t in self.trades if t.resolved and t.net_pnl > 0])
 
+    def max_drawdown(self) -> float:
+        """Deepest peak-to-trough of cumulative net PnL, in currency.
+
+        Trades are walked in exit order, because drawdown is a property of the
+        sequence: the same set of trades in a different order has a different
+        worst moment. Returned as a positive number (0.0 = never underwater).
+        """
+        resolved = sorted(
+            (t for t in self.trades if t.resolved), key=lambda t: t.exit_ts or ""
+        )
+        equity = peak = 0.0
+        worst = 0.0
+        for trade in resolved:
+            equity += trade.net_pnl
+            peak = max(peak, equity)
+            worst = max(worst, peak - equity)
+        return worst
+
     @property
     def profitable(self) -> bool:
         """The gate on adopting a profile: positive after every cost."""
@@ -139,6 +158,7 @@ class ReplayResult:
             "gross_pnl": round(self.gross_pnl, 2),
             "fees": round(self.fees, 2),
             "net_pnl": round(self.net_pnl, 2),
+            "max_drawdown": round(self.max_drawdown(), 2),
             "profitable": self.profitable,
             "by_timeframe": self.by_timeframe(),
             "by_strategy": self.by_strategy(),
@@ -146,6 +166,71 @@ class ReplayResult:
                 self.shadow_only_reasons.items(), key=lambda kv: kv[1], reverse=True
             )[:6],
         }
+
+
+def describe_source(
+    db_path: str | Path, *, hours: int, experiment_id: str | None
+) -> dict[str, Any]:
+    """What database this is, and how many real rows are in the window.
+
+    Printed at the top of every report. A replay whose provenance is not shown
+    is a replay you cannot check, and the whole point of this tool is that its
+    conclusion can be checked.
+    """
+    resolved = Path(db_path).resolve()
+    out: dict[str, Any] = {
+        "database": str(resolved),
+        "exists": resolved.exists(),
+        "size_bytes": resolved.stat().st_size if resolved.exists() else 0,
+        "window_hours": hours,
+        "experiment_id": experiment_id or "(all)",
+    }
+    if not resolved.exists():
+        return out
+    connection = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        where = "ts_utc >= datetime('now', ?)"
+        params: list[Any] = [f"-{int(hours)} hours"]
+        if experiment_id:
+            where += " AND experiment_id = ?"
+            params.append(experiment_id)
+        out["signals_in_window"] = connection.execute(
+            f"SELECT COUNT(*) FROM signals WHERE {where}", params
+        ).fetchone()[0]
+        out["rejected_in_window"] = connection.execute(
+            f"SELECT COUNT(*) FROM rejected_signals WHERE {where}", params
+        ).fetchone()[0]
+        trade_where = "entry_ts_utc >= datetime('now', ?)"
+        trade_params: list[Any] = [f"-{int(hours)} hours"]
+        if experiment_id:
+            trade_where += " AND experiment_id = ?"
+            trade_params.append(experiment_id)
+        out["shadow_trades_in_window"] = connection.execute(
+            f"SELECT COUNT(*) FROM shadow_trades WHERE {trade_where}", trade_params
+        ).fetchone()[0]
+        order_where = "submitted_ts_utc >= datetime('now', ?)"
+        order_params: list[Any] = [f"-{int(hours)} hours"]
+        if experiment_id:
+            order_where += " AND experiment_id = ?"
+            order_params.append(experiment_id)
+        out["demo_orders_in_window"] = connection.execute(
+            f"SELECT COUNT(*) FROM demo_orders WHERE {order_where}", order_params
+        ).fetchone()[0]
+        out["demo_orders_filled_in_window"] = connection.execute(
+            f"SELECT COUNT(*) FROM demo_orders WHERE {order_where} AND status = 'filled'",
+            order_params,
+        ).fetchone()[0]
+        out["experiments_present"] = [
+            r[0] for r in connection.execute("SELECT experiment_id FROM experiments")
+        ]
+        out["totals"] = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("signals", "shadow_trades", "rejected_signals", "demo_orders")
+        }
+    finally:
+        connection.close()
+    return out
 
 
 def _signal_from_row(row: sqlite3.Row) -> StrategySignal | None:
@@ -207,6 +292,7 @@ def _price_the_trade(
     exit_price = float(outcome["exit_price"])
     trade.exit_price = exit_price
     trade.exit_reason = str(outcome["exit_reason"] or "")
+    trade.exit_ts = str(outcome["exit_ts_utc"] or outcome["entry_ts_utc"] or "")
 
     # Actual-trade sizing: risk a fixed fraction of equity across the stop.
     # This is the same rule position_sizing.py applies, reduced to its essence.
@@ -246,9 +332,17 @@ def replay(
     finally:
         connection.close()
 
+    # A: exactly what the live config says, unmodified. B and C hold every
+    # safety gate identical and vary ONLY the net reward:risk floor, which is
+    # the knob that actually controls trade frequency.
+    profiles: list[tuple[str, dict[str, float] | None]] = [
+        ("A_live", None),
+        ("B_feesafe_rr100", FEE_SAFE_RR_100),
+        ("C_feesafe_rr120", FEE_SAFE_RR_120),
+    ]
     results: dict[str, ReplayResult] = {}
-    for label, profile in (("strict", STRICT_PROFILE), ("balanced", BALANCED_PROFILE)):
-        config = base.model_copy(update=dict(profile))
+    for label, profile in profiles:
+        config = base if profile is None else base.model_copy(update=dict(profile))
         filt = ActualTradeEligibility(config, risk)
         result = ReplayResult(label=label)
         costs = TradeCosts(
@@ -319,33 +413,62 @@ def _load_outcomes(
     return outcomes
 
 
-def format_report(results: dict[str, ReplayResult], *, hours: int, costs: TradeCosts) -> str:
-    """The operator-facing A/B comparison."""
-    lines = [
-        f"ELIGIBILITY REPLAY — last {hours}h",
-        f"Cost model: {costs.describe()}",
-        "",
-    ]
-    for label in ("strict", "balanced"):
+def format_report(
+    results: dict[str, ReplayResult],
+    *,
+    hours: int,
+    costs: TradeCosts,
+    source: dict[str, Any] | None = None,
+) -> str:
+    """The operator-facing A/B/C comparison, with its provenance on top."""
+    titles = {
+        "A_live": "A — CURRENT LIVE PROFILE (config as-is)",
+        "B_feesafe_rr100": "B — FEE-SAFE, net reward:risk >= 1.00",
+        "C_feesafe_rr120": "C — FEE-SAFE, net reward:risk >= 1.20",
+    }
+    lines = [f"ELIGIBILITY REPLAY — last {hours}h"]
+    if source is not None:
+        lines += [
+            "",
+            "SOURCE (prove this is the real database before reading anything below)",
+            f"  database        {source.get('database')}",
+            f"  exists          {source.get('exists')}  ({source.get('size_bytes', 0):,} bytes)",
+            f"  experiment      {source.get('experiment_id')}",
+            f"  experiments in db  {source.get('experiments_present') or 'NONE'}",
+            f"  rows in window  signals={source.get('signals_in_window', 0)} "
+            f"shadow_trades={source.get('shadow_trades_in_window', 0)} "
+            f"rejected={source.get('rejected_in_window', 0)} "
+            f"demo_orders={source.get('demo_orders_in_window', 0)} "
+            f"(filled={source.get('demo_orders_filled_in_window', 0)})",
+            f"  rows in db      {source.get('totals')}",
+        ]
+        if not source.get("signals_in_window"):
+            lines += [
+                "",
+                "  *** NO SIGNALS IN THE WINDOW. Every number below is vacuous. ***",
+                "  *** Check the database path and the experiment id.          ***",
+            ]
+    lines += ["", f"Cost model: {costs.describe()}", ""]
+
+    for label in ("A_live", "B_feesafe_rr100", "C_feesafe_rr120"):
         result = results.get(label)
         if result is None:
             continue
         data = result.as_dict()
         lines += [
-            f"--- {label.upper()} "
-            f"({'3.00x' if label == 'strict' else '2.00x'} target-to-cost, "
-            f"{'33%' if label == 'strict' else '50%'} max cost share) ---",
-            f"  signals seen          {data['signals_seen']}",
-            f"  actual candidates     {data['actual_candidates']}",
-            f"  shadow-only           {data['shadow_only']}",
-            f"  trades sent           {data['trades_sent']}"
+            f"--- {titles[label]} ---",
+            f"  real signals analysed   {data['signals_seen']}",
+            f"  eligible candidates     {data['actual_candidates']}",
+            f"  shadow-only             {data['shadow_only']}",
+            f"  orders that would send  {data['trades_sent']}"
             f" ({data['unresolved_candidates']} still open, no PnL)",
-            f"  winners               {data['winners']}",
-            f"  estimated gross PnL   ${data['gross_pnl']:,.2f}",
-            f"  estimated fees        ${data['fees']:,.2f}",
-            f"  estimated NET PnL     ${data['net_pnl']:,.2f}",
-            f"  timeframes            {data['by_timeframe'] or '-'}",
-            f"  strategies            {dict(list(data['by_strategy'].items())[:6]) or '-'}",
+            f"  winners                 {data['winners']}",
+            f"  gross PnL               ${data['gross_pnl']:,.2f}",
+            f"  estimated fees          ${data['fees']:,.2f}",
+            f"  NET PnL                 ${data['net_pnl']:,.2f}",
+            f"  max drawdown            ${data['max_drawdown']:,.2f}",
+            f"  timeframes              {data['by_timeframe'] or '-'}",
+            f"  strategies              {dict(list(data['by_strategy'].items())[:6]) or '-'}",
         ]
         if data["top_shadow_only_reasons"]:
             lines.append("  why setups stayed shadow-only:")
@@ -355,24 +478,31 @@ def format_report(results: dict[str, ReplayResult], *, hours: int, costs: TradeC
             ]
         lines.append("")
 
-    strict, balanced = results.get("strict"), results.get("balanced")
-    if strict and balanced:
-        lines += ["--- VERDICT ---"]
-        if balanced.sent == 0:
+    lines += ["--- VERDICT ---"]
+    adoptable = [
+        (label, r) for label, r in results.items() if r.profitable
+    ]
+    if not adoptable:
+        lines.append(
+            "  NO profile is net positive on this window. Adopt none of them — "
+            "keep the current configuration and gather more data."
+        )
+    else:
+        # Requirement: adopt on net PnL after costs, never on trade count.
+        best_label, best = max(adoptable, key=lambda kv: kv[1].net_pnl)
+        lines.append(
+            f"  Most net-positive: {titles[best_label]}"
+        )
+        lines.append(
+            f"    net ${best.net_pnl:,.2f} over {best.sent} trades, "
+            f"max drawdown ${best.max_drawdown():,.2f}"
+        )
+        busiest = max(results.values(), key=lambda r: r.sent)
+        if busiest is not best and busiest.sent > best.sent:
             lines.append(
-                "  BALANCED sent no resolvable trades in this window — there is no "
-                "evidence to adopt it on. Keep STRICT."
-            )
-        elif not balanced.profitable:
-            lines.append(
-                f"  BALANCED net PnL ${balanced.net_pnl:,.2f} is NOT positive after "
-                "costs. Do not adopt it."
-            )
-        else:
-            lines.append(
-                f"  BALANCED is net positive (${balanced.net_pnl:,.2f} over "
-                f"{balanced.sent} trades) and takes {balanced.candidates - strict.candidates:+d} "
-                "more candidates than STRICT."
+                f"    NOTE: a different profile sent more trades ({busiest.sent} vs "
+                f"{best.sent}) but less net PnL (${busiest.net_pnl:,.2f}). "
+                "Trade count is not the criterion."
             )
     return "\n".join(lines)
 

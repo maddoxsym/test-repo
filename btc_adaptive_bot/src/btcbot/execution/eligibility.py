@@ -76,6 +76,18 @@ BALANCED_PROFILE: dict[str, float] = {
     "min_net_reward_risk": 1.20,
 }
 
+#: "Fee-safe" means every gate that decides whether a trade can LOSE money is
+#: on: the stop floor, positive expected net profit, verified fees, the cost
+#: multiple. The only thing that varies between these two is the net
+#: reward:risk floor, which is what actually controls trade frequency — so the
+#: replay can measure that one variable against real data instead of guessing.
+FEE_SAFE_RR_100: dict[str, float] = {
+    "min_target_to_cost_multiple": 2.0,
+    "max_cost_pct_of_target": 0.50,
+    "min_net_reward_risk": 1.00,
+}
+FEE_SAFE_RR_120: dict[str, float] = dict(BALANCED_PROFILE)
+
 
 @dataclass(frozen=True, slots=True)
 class TradeCosts:

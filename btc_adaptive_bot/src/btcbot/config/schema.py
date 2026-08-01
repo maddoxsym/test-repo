@@ -180,8 +180,12 @@ class ActualEligibilityConfig(StrictModel):
     enabled: bool = True
     #: Minimum target move, as a fraction of entry price.
     min_target_distance_pct: float = Field(0.004, gt=0, le=0.5)
-    #: Reward:risk *after* costs are charged to both legs.
-    min_net_reward_risk: float = Field(1.20, gt=0, le=10)
+    #: Reward:risk *after* costs are charged to both legs. Left at the value
+    #: the live experiment has been running on. Raising it to 1.20 tightens the
+    #: gate that actually controls trade frequency, so that change belongs to
+    #: the replay's verdict on real data, not to a guess — see
+    #: `btcbot replay-eligibility`, profiles B and C.
+    min_net_reward_risk: float = Field(1.00, gt=0, le=10)
     #: The target must be at least this multiple of total round-trip costs.
     min_target_to_cost_multiple: float = Field(2.0, ge=1.0, le=50)
     #: The same constraint from the other direction: costs may not exceed this

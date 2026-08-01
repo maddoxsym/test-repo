@@ -123,7 +123,7 @@ class TestItDoesNotFlatterAProfile:
         path = tmp_path / "open.db"
         seed(path, [("ema_adx_trend_1h", "60", 0.006, 0.035, None, 2)])
 
-        result = run(path)["balanced"]
+        result = run(path)["C_feesafe_rr120"]
 
         assert result.candidates == 1
         assert result.unresolved == 1
@@ -135,7 +135,7 @@ class TestItDoesNotFlatterAProfile:
         path = tmp_path / "fees.db"
         seed(path, [WIDE_WINNER])
 
-        trade = run(path)["balanced"].trades[0]
+        trade = run(path)["C_feesafe_rr120"].trades[0]
 
         # The seeded shadow row recorded zero fees. The replay must ignore that
         # and charge the full round trip on the actual-trade notional.
@@ -147,7 +147,7 @@ class TestItDoesNotFlatterAProfile:
         path = tmp_path / "size.db"
         seed(path, [WIDE_WINNER])
 
-        trade = run(path)["balanced"].trades[0]
+        trade = run(path)["C_feesafe_rr120"].trades[0]
 
         # risk budget / stop distance, the essence of the sizing rule.
         assert trade.notional == pytest.approx(10_000.0 * 0.0075 / 0.006, rel=1e-6)
@@ -156,7 +156,7 @@ class TestItDoesNotFlatterAProfile:
         path = tmp_path / "loss.db"
         seed(path, [WIDE_LOSER, WIDE_LOSER, WIDE_LOSER])
 
-        result = run(path)["balanced"]
+        result = run(path)["C_feesafe_rr120"]
 
         assert result.sent == 3
         assert result.net_pnl < 0
@@ -166,22 +166,23 @@ class TestItDoesNotFlatterAProfile:
             costs=TradeCosts(taker_fee_rate=TAKER, spread_bps=2.0,
                              slippage_bps=2.0, source="exchange"),
         )
-        assert "Do not adopt it" in report
+        assert "NO profile is net positive" in report
 
     def test_an_empty_window_is_not_adoptable_either(self, tmp_path):
         path = tmp_path / "empty.db"
         seed(path, [MICRO])          # micro setups are all shadow-only
 
         results = run(path)
-        assert results["balanced"].sent == 0
-        assert not results["balanced"].profitable
+        assert results["C_feesafe_rr120"].sent == 0
+        assert not results["C_feesafe_rr120"].profitable
 
         report = format_report(
             results, hours=24,
             costs=TradeCosts(taker_fee_rate=TAKER, spread_bps=2.0,
                              slippage_bps=2.0, source="exchange"),
         )
-        assert "no evidence to adopt it on" in report
+        assert "NO profile is net positive" in report
+        assert "Adopt none of them" in report
 
 
 class TestTheWindowAndTheProfiles:
@@ -189,20 +190,21 @@ class TestTheWindowAndTheProfiles:
         path = tmp_path / "window.db"
         seed(path, [WIDE_WINNER, ("ema_adx_trend_1h", "60", 0.006, 0.035, True, 40)])
 
-        result = run(path)["balanced"]
+        result = run(path)["C_feesafe_rr120"]
 
         assert result.signals_seen == 1, "a signal older than 24h was replayed"
 
-    def test_both_profiles_are_reported(self, tmp_path):
+    def test_all_three_profiles_are_reported(self, tmp_path):
+        """A = live config, B = fee-safe RR 1.00, C = fee-safe RR 1.20."""
         path = tmp_path / "both.db"
         seed(path, [WIDE_WINNER, MICRO])
 
         results = run(path)
 
-        assert set(results) == {"strict", "balanced"}
+        assert set(results) == {"A_live", "B_feesafe_rr100", "C_feesafe_rr120"}
         assert all(r.signals_seen == 2 for r in results.values())
 
-    def test_micro_setups_are_shadow_only_under_both(self, tmp_path):
+    def test_micro_setups_are_shadow_only_under_every_profile(self, tmp_path):
         path = tmp_path / "micro.db"
         seed(path, [MICRO, MICRO, MICRO])
 
@@ -210,8 +212,8 @@ class TestTheWindowAndTheProfiles:
             assert result.candidates == 0
             assert result.shadow_only == 3
 
-    def test_the_balanced_profile_never_takes_fewer_candidates(self, tmp_path):
-        """It is a relaxation; it cannot refuse something strict accepted."""
+    def test_a_lower_reward_risk_floor_never_takes_fewer_candidates(self, tmp_path):
+        """B relaxes only RR, so it cannot refuse anything C accepted."""
         path = tmp_path / "mono.db"
         seed(path, [
             WIDE_WINNER, WIDE_LOSER, MICRO,
@@ -220,7 +222,18 @@ class TestTheWindowAndTheProfiles:
         ])
 
         results = run(path)
-        assert results["balanced"].candidates >= results["strict"].candidates
+        assert (
+            results["B_feesafe_rr100"].candidates
+            >= results["C_feesafe_rr120"].candidates
+        )
+
+    def test_the_reward_risk_floor_is_the_only_difference_between_b_and_c(self):
+        from btcbot.execution.eligibility import FEE_SAFE_RR_100, FEE_SAFE_RR_120
+
+        differing = {
+            k for k in FEE_SAFE_RR_100 if FEE_SAFE_RR_100[k] != FEE_SAFE_RR_120[k]
+        }
+        assert differing == {"min_net_reward_risk"}
 
 
 class TestReportShape:
@@ -228,7 +241,7 @@ class TestReportShape:
         path = tmp_path / "shape.db"
         seed(path, [WIDE_WINNER, WIDE_LOSER, MICRO])
 
-        data = run(path)["balanced"].as_dict()
+        data = run(path)["C_feesafe_rr120"].as_dict()
 
         for key in (
             "actual_candidates", "trades_sent", "gross_pnl", "fees", "net_pnl",

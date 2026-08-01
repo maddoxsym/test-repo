@@ -279,7 +279,13 @@ async def cmd_replay_eligibility(args: argparse.Namespace) -> int:
     Read-only: it opens the database in `mode=ro`, places no order, and
     touches no experiment state. Safe to run while the bot is trading.
     """
-    from ..analysis.eligibility_replay import TradeCosts, format_report, replay, results_as_json
+    from ..analysis.eligibility_replay import (
+        TradeCosts,
+        describe_source,
+        format_report,
+        replay,
+        results_as_json,
+    )
 
     loaded = load_config(args.config)
     _configure_logging(loaded, override_level=args.log_level)
@@ -296,6 +302,13 @@ async def cmd_replay_eligibility(args: argparse.Namespace) -> int:
             "It is printed at startup as: [FEES] Account fee schedule: ... taker 0.2500%",
             file=sys.stderr,
         )
+        return 2
+
+    source = describe_source(
+        config.database.path, hours=args.hours, experiment_id=args.experiment_id
+    )
+    if not source["exists"]:
+        print(f"No database at {source['database']}", file=sys.stderr)
         return 2
 
     results = replay(
@@ -317,7 +330,7 @@ async def cmd_replay_eligibility(args: argparse.Namespace) -> int:
     if args.json:
         print(results_as_json(results))
     else:
-        print(format_report(results, hours=args.hours, costs=costs))
+        print(format_report(results, hours=args.hours, costs=costs, source=source))
     return 0
 
 

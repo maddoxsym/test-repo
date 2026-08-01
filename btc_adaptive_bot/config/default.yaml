@@ -101,11 +101,14 @@ actual_eligibility:
   min_target_distance_pct: 0.004
   # Reward:risk AFTER costs are charged to both legs — they shrink the reward
   # and deepen the loss, so a gross 2:1 can easily be a net 0.4:1.
-  # BALANCED profile. This is the binding gate in practice: at a 0.56% round
-  # trip, RR >= 1.20 requires target >= 1.2*stop + 1.232%, which is stricter
-  # than the 2.0x rule below for EVERY stop size. Relaxing the multiple alone
-  # therefore changes almost nothing — this is the number that decides.
-  min_net_reward_risk: 1.20
+  # This is the gate that actually controls trade frequency. At a 0.56% round
+  # trip, RR >= R requires target >= R*stop + (1+R)*cost, so raising it cuts
+  # candidates fast. Left at 1.00 — the value the live experiment has been
+  # running on. Do not raise it on a hunch: run
+  #     btcbot replay-eligibility --hours 24 --taker-fee-rate <your rate>
+  # which compares 1.00 (profile B) against 1.20 (profile C) on YOUR recorded
+  # signals, and adopt whichever is net positive after costs.
+  min_net_reward_risk: 1.00
   # The target must be at least this multiple of total round-trip costs.
   # 2.0x (BALANCED). The strict profile used 3.0x.
   min_target_to_cost_multiple: 2.0
