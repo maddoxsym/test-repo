@@ -118,6 +118,25 @@ class TestSafeModeDisplay:
         assert "check the logs" in html
         assert "unknown" not in html.lower()
 
+    def test_no_dashboard_field_falls_back_to_the_word_unknown(self):
+        """"unknown" reads as "it broke and we lost the detail".
+
+        Every placeholder the state provider can emit is a *known* startup
+        state, so each one says which state it is.
+        """
+        import inspect
+
+        from btcbot.app import orchestrator
+
+        source = inspect.getsource(orchestrator.Orchestrator.dashboard_state)
+        # Comments are allowed to name the word; emitted values are not.
+        code = "\n".join(
+            line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "unknown" not in code.lower()
+        assert "market data store not started yet" in code
+        assert "NOT YET CLASSIFIED" in code
+
     def test_the_page_never_falls_back_to_the_word_unknown_for_safe_mode(self):
         script = page_script()
         safe_mode_fn = script[script.index("function safeModeRows") :]

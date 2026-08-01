@@ -2178,7 +2178,12 @@ class Orchestrator:
                     else []
                 ),
                 "data_healthy": bool(health and health.healthy),
-                "data_detail": health.describe() if health else "unknown",
+                # "no store yet" is a startup state, not a mystery. Saying
+                # "unknown" here reads as "something is wrong and we lost the
+                # detail", which is the opposite of what it means.
+                "data_detail": (
+                    health.describe() if health else "market data store not started yet"
+                ),
                 "news_health": self.news.health_summary() if self.news else {"degraded": True},
                 "safety": self.breakers.snapshot(),
             },
@@ -2230,7 +2235,14 @@ class Orchestrator:
             },
             "market": self.store.snapshot() if self.store else {},
             "regime": {
-                "current": self._current_regime.regime.value if self._current_regime else "UNKNOWN",
+                # Not `UNCERTAIN`: that is a real classification the engine can
+                # return. Having no snapshot at all is a different state, and
+                # conflating them hides which one you are looking at.
+                "current": (
+                    self._current_regime.regime.value
+                    if self._current_regime
+                    else "NOT YET CLASSIFIED"
+                ),
                 "confidence": round(self._current_regime.confidence, 3) if self._current_regime else 0.0,
                 "distribution": self.regime_tracker.distribution(),
                 "stability": round(self.regime_tracker.stability(), 3),
