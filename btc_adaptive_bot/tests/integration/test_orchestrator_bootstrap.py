@@ -24,6 +24,7 @@ from btcbot.exchange.endpoints import DEFAULT_PROFILE
 from btcbot.exchange.models import (
     AccountConfig,
     Candle,
+    FeeRates,
     InstrumentSpec,
     InstType,
     PositionMode,
@@ -50,6 +51,10 @@ class MockRestClient:
         self._instrument = instrument
         self._equity = equity
         self.consecutive_errors = 0
+        # The account fee schedule the eligibility cost model reads. Demo's
+        # real taker rate is 0.25% per side, not the config placeholder.
+        self.maker_fee = 0.001
+        self.taker_fee = 0.0025
         self.clock_offset_ms = 12
         self.clock_synced = True
         self.closed = False
@@ -129,6 +134,11 @@ class MockRestClient:
             uid="demo-123", account_level="2", position_mode=PositionMode.NET,
             raw={"uid": "demo-123", "acctLv": "2", "posMode": "net_mode"},
         )
+
+    async def get_fee_rates(self, inst_id: str) -> FeeRates:
+        """OKX Demo's real schedule: 0.25% per side, so 0.5% per round trip."""
+        self.calls.append("fee_rates")
+        return FeeRates(maker=self.maker_fee, taker=self.taker_fee)
 
     async def get_positions(self, inst_id=None):
         return []

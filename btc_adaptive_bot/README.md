@@ -529,6 +529,14 @@ execution:
   # performance figure. See §3.
   research_equity_cap_usdt: 10000
 
+actual_eligibility:
+  # Whether a setup may be OFFERED to the allocator as a real trade. Not a
+  # safety gate — the executor's own layers still run on whatever passes.
+  min_target_distance_pct: 0.004        # 0.40% minimum target move
+  min_net_reward_risk: 1.0              # R:R AFTER costs hit both legs
+  min_target_to_cost_multiple: 2.0      # target >= 2x round-trip costs
+  max_spread_bps: 10                    # wider than this is too thin to price
+
 risk:
   margin_mode: isolated       # cannot be changed — no cross fallback
   normal_risk_pct: 0.0075     # 0.75% risk per real demo trade
@@ -686,6 +694,29 @@ Also normal. Usually the stop was too tight to size safely, the position rounded
 below the contract minimum, or the liquidation buffer could not be satisfied at any
 allowed leverage. Refusing is the correct outcome — and the reason is recorded in
 `rejected_signals`.
+
+**Lots of `[ACTUAL ELIGIBILITY] SHADOW_ONLY`, few or no real Demo trades**
+Working as designed, and worth understanding. OKX Demo charges 0.25% taker per
+side, so a round trip costs about 0.56% once spread and slippage are included. A
+1-minute setup targeting 0.05% cannot pay for that — the costs are ten times the
+edge. Those setups keep trading in shadow research (where they cost nothing and
+still generate evidence); they simply never become real order candidates.
+
+The dashboard's "Signal funnel" card shows the whole picture: how many signals
+were evaluated, how many stayed shadow-only, and — separately — how many actual
+orders were blocked by the executor's gates. It also shows the cost model, so
+you can check the arithmetic yourself.
+
+If you want more real trades, the honest lever is
+`actual_eligibility.min_target_to_cost_multiple` in `config/research.yaml`.
+Lowering it will produce more trades. It will not produce more profit.
+
+**`Demo orders blocked` is gone from the dashboard**
+Deliberately. It counted every strategy signal that did not become a real order,
+which was almost all of them by design, and made the bot look like it was
+constantly being refused. It is replaced by the five separate counters in the
+"Signal funnel" card, of which "Final execution blocks" is the one that means
+what the old counter claimed to.
 
 **`[PROTECTION] ... is OPEN with NO exchange-side stop`**
 The bot found a real position at OKX with no stop registered *at the exchange*. It

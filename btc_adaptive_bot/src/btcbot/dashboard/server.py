@@ -98,6 +98,9 @@ padding:1.25rem;background:#f6f7f9;color:#181b1f;line-height:1.5}
 th{background:#23272e!important}code{background:#23272e!important}}
 h1{font-size:1.35rem;margin:0 0 .2rem;letter-spacing:-.02em}
 .sub{opacity:.6;font-size:.82rem;margin-bottom:1.1rem}
+.grp{opacity:.55;font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;
+font-weight:700;margin:.75rem 0 .25rem;padding-top:.5rem;border-top:1px solid #e2e5e9}
+@media(prefers-color-scheme:dark){.grp{border-color:#2a2e35}}
 .grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(310px,1fr))}
 .card{background:#fff;border:1px solid #e2e5e9;border-radius:10px;padding:1rem 1.1rem}
 .card h2{font-size:.74rem;text-transform:uppercase;letter-spacing:.07em;opacity:.6;
@@ -132,6 +135,23 @@ const tag=(ok,on,off)=>`<span class="tag ${ok?'on':'off'}">${ok?on:off}</span>`;
 function row(k,v,cls){return `<div class="row"><span class="k">${esc(k)}</span><span class="v ${cls||''}">${v}</span></div>`}
 function card(title,inner){return `<div class="card"><h2>${esc(title)}</h2>${inner}</div>`}
 
+// Safe mode, stated plainly in both directions. An inactive breaker has no
+// reason, and "None" is the honest word for that — never "unknown", which
+// reads as "something tripped and we lost the detail".
+function safeModeRows(s){
+  const sm=((s||{}).safety||{}).safe_mode||{};
+  if(!sm.active){
+    return row('Safe mode', tag(true,'CLEAR','ACTIVE'))+row('Safe mode reason','None');
+  }
+  const last=(sm.recent||[])[(sm.recent||[]).length-1]||{};
+  const breaker=last.breaker||'';
+  const reason=sm.reason||last.reason||'';
+  return row('Safe mode', tag(false,'CLEAR','ACTIVE'))+
+    (breaker?row('Safe mode breaker', esc(breaker),'bad'):'')+
+    row('Safe mode reason', esc(reason||'reported active without a reason — check the logs'),'bad')+
+    (sm.entered_at?row('Safe mode since', esc(sm.entered_at)):'');
+}
+
 function render(d){
   const cards=[];
   const s=d.system||{};
@@ -146,7 +166,7 @@ function render(d){
     row('Data health', tag(s.data_healthy,'HEALTHY','DEGRADED'))+
     (s.data_healthy?'':row('Detail', esc(s.data_detail||''),'warn'))+
     row('News', tag(!(s.news_health||{}).degraded,'OK','DEGRADED'))+
-    row('Safe mode', tag(!((s.safety||{}).safe_mode||{}).active,'CLEAR','ACTIVE'))
+    safeModeRows(s)
   ));
 
   const e=d.experiment;
@@ -236,9 +256,30 @@ function render(d){
     row('Shadow trades', sh.total_trades||0)+
     row('Open shadow positions', sh.open_positions||0)+
     row('Winners / losers', `${sh.winners||0} / ${sh.losers||0}`)+
-    row('Demo orders sent', (res.demo_orders||{}).submitted||0)+
-    row('Demo orders blocked', (res.demo_orders||{}).rejected||0)+
     row('Allocation fairness', Number(res.allocation_fairness||0).toFixed(2))
+  ));
+
+  // The signal funnel. Each number answers one question, so "blocked" finally
+  // means an order that was actually blocked — not a shadow signal that never
+  // became an order candidate in the first place.
+  const p=d.pipeline||{}, cm=p.cost_model||{};
+  cards.push(card('Signal funnel (shadow vs actual)',
+    row('Signals evaluated', p.signals_evaluated||0)+
+    row('Refused by decision layers 1-7', p.decision_rejections||0)+
+    row('Assessed for actual eligibility', p.eligibility_assessed||0)+
+    row('Shadow-only signals', p.shadow_only_signals||0)+
+    row('Preliminary eligibility rejections', p.eligibility_rejections||0)+
+    row('Final execution blocks (layers 8-10)', p.final_execution_blocks||0)+
+    row('Actual Demo orders sent', p.actual_orders_sent||0,'ok')+
+    '<div class="grp">Round-trip cost model</div>'+
+    row('Taker fee (per side)', `${Number(cm.taker_fee_pct||0).toFixed(4)}%`)+
+    row('Round trip', `${Number(cm.round_trip_pct||0).toFixed(4)}%`)+
+    row('Spread / slippage', `${Number(cm.spread_bps||0).toFixed(2)} / ${Number(cm.slippage_bps||0).toFixed(2)} bps`)+
+    row('Fee source', esc(cm.source||'-'), cm.source==='exchange'?'ok':'warn')+
+    ((p.eligibility_reasons||[]).length
+      ? '<div class="grp">Why setups stayed shadow-only</div>'+
+        (p.eligibility_reasons||[]).map(r=>row(String(r[0]).slice(0,60), r[1])).join('')
+      : '')
   ));
 
   const lb=res.leaderboard||[];

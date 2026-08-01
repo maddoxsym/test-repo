@@ -76,6 +76,47 @@ execution:
   # checked before every order.
   research_equity_cap_usdt: 10000
 
+# Whether a setup may be OFFERED to the allocator as an actual Demo trade.
+#
+# A pre-filter, not a safety gate — the executor's leverage, sizing and
+# order-safety layers still run unchanged on everything that passes here. This
+# exists because the allocator was spending its exploration budget on setups
+# that could never survive those layers: 1-minute microstructure signals with
+# 0.04% stops against a 0.08% minimum, and targets smaller than the round-trip
+# cost of reaching them.
+#
+# The arithmetic that matters, at OKX Demo's 0.25% taker rate:
+#
+#     round trip = 2 x 0.25% (fees) + spread + 2 x slippage  ~= 0.56%
+#
+# so with the defaults below a setup needs a target of roughly 1.2% before it
+# is worth taking at all. That is a 15m-to-1h move on BTC, not a 1m one.
+# Loosening these will produce more trades; it will not produce more profit.
+#
+# Nothing here is a timeframe rule. A 1m setup with a genuinely wide target
+# passes; a 1h setup with a thin one does not.
+actual_eligibility:
+  enabled: true
+  # Minimum target move, as a fraction of entry price.
+  min_target_distance_pct: 0.004
+  # Reward:risk AFTER costs are charged to both legs — they shrink the reward
+  # and deepen the loss, so a gross 2:1 can easily be a net 0.4:1.
+  min_net_reward_risk: 1.0
+  # The target must be at least this multiple of total round-trip costs.
+  min_target_to_cost_multiple: 2.0
+  # Above this spread the book is too thin to price the trade honestly.
+  max_spread_bps: 10
+  # Modelled slippage per leg, applied to both legs.
+  slippage_bps: 2
+  # Used ONLY when OKX will not report the account's fee schedule. The real
+  # rate is read at startup; this is a fallback, and it is logged when used.
+  fallback_taker_fee_rate: 0.0005
+  # Refuse to judge liquidity from an order book that is not yet valid.
+  require_orderbook: true
+  # The minimum STOP distance is not configured here on purpose — it is shared
+  # with risk.min_stop_distance_pct so the pre-filter and the position sizer
+  # can never drift apart.
+
 data:
   candle_buffer: 1500
   history_days: 400

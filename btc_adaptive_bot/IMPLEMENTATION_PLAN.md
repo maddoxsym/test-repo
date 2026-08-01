@@ -283,6 +283,52 @@ drops, the loop stalls or the network goes away — exactly when a stop matters.
 
 ---
 
+## Phase R11 — Actual-trade eligibility + dashboard honesty  `[x]`
+
+Live logs showed the allocator repeatedly selecting candidates the executor then
+refused: stop distances of 0.034%–0.043% against a 0.080% minimum, and setups whose
+round-trip costs came to 190%–310% of target profit. Each was announced as
+`allocated actual Demo trade` moments before being blocked.
+
+**Root cause.** Nothing between the decision layers (1–7) and the executor's gates
+(8–10) asked whether a setup could *pay for itself*. The allocator scored candidates
+on expected R-multiple alone, so exploration — which deliberately favours
+under-observed strategies, most of them 1m microstructure — kept drawing setups whose
+target was an order of magnitude smaller than the cost of reaching it. At OKX Demo's
+0.25% taker rate a round trip costs ~0.56%; a 0.05% target is a guaranteed loss.
+
+- [x] `execution/eligibility.py` — `ActualTradeEligibility` runs **before**
+      allocation and answers ELIGIBLE / SHADOW_ONLY per setup, checking minimum stop
+      distance, minimum target distance, round-trip fees, spread, slippage, positive
+      expected net profit, net reward:risk and target-to-cost multiple, plus liquidity
+- [x] Costs charged to **both legs**: they shrink the reward and deepen the loss, so
+      net R:R is `(target − cost) / (stop + cost)`
+- [x] The stop floor is **shared** with `risk.min_stop_distance_pct` rather than
+      duplicated, so the pre-filter cannot drift from the sizer
+- [x] The taker rate is **read from the exchange** at bootstrap
+      (`/api/v5/account/trade-fee`); the config value is a logged fallback only
+- [x] Exploration is constrained structurally, not by a new rule: ineligible
+      candidates are removed from the pool before `allocate()` is called, so there is
+      nothing ineligible left to draw
+- [x] No timeframe rule. A 1m setup with a genuinely wide target passes; a 1h setup
+      with a thin one does not
+- [x] Executor layers 8–10 unchanged, and asserted to have no dependency on the
+      pre-filter — an independent second check
+- [x] `[ACTUAL ELIGIBILITY]` log block: strategy, stop distance, target distance,
+      estimated cost, expected net profit, ELIGIBLE/SHADOW_ONLY, reason
+- [x] Shadow-only verdicts journaled to `rejected_signals` as **layer 0** — they
+      never entered the order pipeline, so they are not blocked orders
+- [x] Dashboard: `Safe mode reason: None` when clear, exact breaker + reason + since
+      when active; "Demo orders blocked" replaced by a five-stage signal funnel
+      (signals evaluated / shadow-only / eligibility rejections / final execution
+      blocks / actual orders sent) plus the live cost model
+- [x] `tests/unit/test_actual_eligibility.py` (25),
+      `tests/integration/test_allocation_eligibility.py` (13),
+      `tests/unit/test_dashboard_counters.py` (15, exercising the real page JS in
+      node); 3 new audit checks
+
+---
+
 ---
 
 # Part I — Bybit Demo build (historical record, complete)

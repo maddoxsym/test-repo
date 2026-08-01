@@ -163,6 +163,37 @@ class ExecutionConfig(StrictModel):
     research_equity_cap_usdt: float = Field(10_000.0, gt=0, le=10_000_000)
 
 
+class ActualEligibilityConfig(StrictModel):
+    """Whether a setup may be *offered* to the allocator as a real trade.
+
+    A pre-filter, not a safety gate — the executor's leverage, sizing and
+    order-safety layers still run unchanged on everything that gets through.
+    This exists so the allocator stops spending its exploration budget on
+    setups whose target cannot cover the cost of trading it.
+
+    The defaults are demanding on purpose. At a 0.25% taker rate a round trip
+    costs roughly 0.5% before spread and slippage, so a target must clear
+    ~1.2% before the trade is worth taking. Loosen them and the bot will take
+    more trades; it will not make more money.
+    """
+
+    enabled: bool = True
+    #: Minimum target move, as a fraction of entry price.
+    min_target_distance_pct: float = Field(0.004, gt=0, le=0.5)
+    #: Reward:risk *after* costs are charged to both legs.
+    min_net_reward_risk: float = Field(1.0, gt=0, le=10)
+    #: The target must be at least this multiple of total round-trip costs.
+    min_target_to_cost_multiple: float = Field(2.0, ge=1.0, le=50)
+    #: Above this spread the book is too thin to price the trade honestly.
+    max_spread_bps: float = Field(10.0, gt=0, le=500)
+    #: Modelled slippage per leg. Applied to both legs.
+    slippage_bps: float = Field(2.0, ge=0, le=200)
+    #: Used only when the exchange will not report the account's fee schedule.
+    fallback_taker_fee_rate: float = Field(0.0005, gt=0, le=0.01)
+    #: Refuse to assess liquidity from an order book that is not yet valid.
+    require_orderbook: bool = True
+
+
 class RiskConfig(StrictModel):
     # Present for transparency; may not be changed — this system never falls
     # back to cross margin, silently or otherwise.
@@ -464,6 +495,7 @@ class AppConfig(StrictModel):
     data: DataConfig = DataConfig()
     risk: RiskConfig = RiskConfig()
     execution: ExecutionConfig = ExecutionConfig()
+    actual_eligibility: ActualEligibilityConfig = ActualEligibilityConfig()
     shadow: ShadowConfig = ShadowConfig()
     allocator: AllocatorConfig = AllocatorConfig()
     backtesting: BacktestingConfig = BacktestingConfig()

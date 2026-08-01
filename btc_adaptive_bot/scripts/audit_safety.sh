@@ -266,6 +266,27 @@ else
   failure "the unconfirmed-fill SAFE_MODE path is missing"
 fi
 
+# Actual-trade eligibility. A pre-filter, never a replacement for the gates
+# below it — the executor must stay independent of it.
+if grep -q 'self.eligibility.filter' src/btcbot/app/orchestrator.py; then
+  pass "actual-trade eligibility is assessed before allocation"
+else
+  failure "the pre-allocation eligibility filter is missing"
+fi
+
+if grep -q 'eligibility' src/btcbot/execution/demo_executor.py; then
+  failure "the executor depends on the eligibility pre-filter — gates must stay independent"
+else
+  pass "the executor's final gates are independent of the eligibility pre-filter"
+fi
+
+# The cost model must read the account's real fee schedule, not assume one.
+if grep -q 'get_fee_rates' src/btcbot/app/orchestrator.py; then
+  pass "the cost model reads the account's real fee schedule"
+else
+  failure "the eligibility cost model never reads the exchange fee schedule"
+fi
+
 # Exchange-side protection. The incident this guards against: a real position
 # opened with its stop living only in Python, where a crash erases it.
 if grep -q 'sl_trigger_price=' src/btcbot/execution/demo_executor.py; then
