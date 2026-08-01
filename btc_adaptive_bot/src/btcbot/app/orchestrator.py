@@ -1288,6 +1288,8 @@ class Orchestrator:
             # itself. These stay in shadow research; they are NOT blocked
             # orders, because they never became order candidates.
             "eligibility_assessed": eligibility.assessed,
+            # Passed every preliminary gate and were offered to the allocator.
+            "actual_eligible_candidates": eligibility.eligible,
             "shadow_only_signals": max(
                 0, self._signals_evaluated - eligibility.eligible
             ),

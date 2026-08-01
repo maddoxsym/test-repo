@@ -273,6 +273,54 @@ async def cmd_backup(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- parser
 
 
+async def cmd_replay_eligibility(args: argparse.Namespace) -> int:
+    """Replay recorded signals under the strict and balanced profiles.
+
+    Read-only: it opens the database in `mode=ro`, places no order, and
+    touches no experiment state. Safe to run while the bot is trading.
+    """
+    from ..analysis.eligibility_replay import TradeCosts, format_report, replay, results_as_json
+
+    loaded = load_config(args.config)
+    _configure_logging(loaded, override_level=args.log_level)
+    config = loaded.config
+
+    taker = args.taker_fee_rate
+    if taker is None:
+        # No rate supplied and none discoverable offline. Refuse rather than
+        # silently price the comparison at the config placeholder, which at
+        # OKX Demo is five times too cheap and would flatter every profile.
+        print(
+            "A taker fee rate is required. Pass the account's real rate, e.g.\n"
+            "  btcbot replay-eligibility --taker-fee-rate 0.0025\n"
+            "It is printed at startup as: [FEES] Account fee schedule: ... taker 0.2500%",
+            file=sys.stderr,
+        )
+        return 2
+
+    results = replay(
+        config.database.path,
+        hours=args.hours,
+        taker_fee_rate=taker,
+        spread_bps=args.spread_bps,
+        equity=config.execution.research_equity_cap_usdt,
+        risk=config.risk,
+        base_config=config.actual_eligibility,
+        experiment_id=args.experiment_id,
+    )
+    costs = TradeCosts(
+        taker_fee_rate=taker,
+        spread_bps=args.spread_bps,
+        slippage_bps=config.actual_eligibility.slippage_bps,
+        source="exchange",
+    )
+    if args.json:
+        print(results_as_json(results))
+    else:
+        print(format_report(results, hours=args.hours, costs=costs))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="btcbot",
@@ -298,6 +346,25 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("export", help="export all research data to CSV")
     sub.add_parser("backup", help="back up the database")
 
+    replay_parser = sub.add_parser(
+        "replay-eligibility",
+        help="replay recorded signals under the strict and balanced profiles (read-only)",
+    )
+    replay_parser.add_argument("--hours", type=int, default=24, help="window to replay")
+    replay_parser.add_argument(
+        "--taker-fee-rate", type=float, default=None, dest="taker_fee_rate",
+        help="the account's real taker rate per side, e.g. 0.0025 for 0.25%%",
+    )
+    replay_parser.add_argument(
+        "--spread-bps", type=float, default=2.0, dest="spread_bps",
+        help="modelled spread in basis points",
+    )
+    replay_parser.add_argument(
+        "--experiment-id", default=None, dest="experiment_id",
+        help="restrict the replay to one experiment",
+    )
+    replay_parser.add_argument("--json", action="store_true", help="machine-readable output")
+
     smoke = sub.add_parser(
         "smoke-test",
         help="minimum-size demo round trip (places ONE order; no 14-day timer)",
@@ -322,6 +389,7 @@ COMMANDS = {
     "report": cmd_report,
     "export": cmd_export,
     "backup": cmd_backup,
+    "replay-eligibility": cmd_replay_eligibility,
 }
 
 

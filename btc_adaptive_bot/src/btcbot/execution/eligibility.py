@@ -60,6 +60,22 @@ log = get_logger(__name__)
 ELIGIBLE = "ELIGIBLE"
 SHADOW_ONLY = "SHADOW_ONLY"
 
+#: The two named profiles, so a replay can compare them without hand-editing
+#: config. STRICT demands a target of 3x round-trip costs (equivalently, costs
+#: no more than a third of the target); BALANCED demands 2x (half). Both keep
+#: every safety-relevant gate identical — net profit must still be positive,
+#: net reward:risk must still clear 1.20, and the stop floor is the sizer's.
+STRICT_PROFILE: dict[str, float] = {
+    "min_target_to_cost_multiple": 3.0,
+    "max_cost_pct_of_target": 1.0 / 3.0,
+    "min_net_reward_risk": 1.20,
+}
+BALANCED_PROFILE: dict[str, float] = {
+    "min_target_to_cost_multiple": 2.0,
+    "max_cost_pct_of_target": 0.50,
+    "min_net_reward_risk": 1.20,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class TradeCosts:
@@ -75,6 +91,11 @@ class TradeCosts:
     spread_bps: float
     slippage_bps: float
     source: str = "config"
+
+    @property
+    def verified(self) -> bool:
+        """Whether the taker rate came from the exchange rather than a guess."""
+        return self.source == "exchange"
 
     @property
     def fee_cost(self) -> float:
@@ -118,6 +139,7 @@ class EligibilityVerdict:
     net_reward_risk: float = 0.0
     target_to_cost: float = 0.0
     spread_bps: float = 0.0
+    cost_share_of_target: float = 0.0
     cost_detail: str = ""
 
     @property
@@ -137,6 +159,7 @@ class EligibilityVerdict:
             "expected_net_profit_pct": round(self.expected_net_profit_pct * 100, 4),
             "net_reward_risk": round(self.net_reward_risk, 3),
             "target_to_cost": round(self.target_to_cost, 3),
+            "cost_pct_of_target": round(self.cost_share_of_target * 100, 1),
             "spread_bps": round(self.spread_bps, 2),
         }
 
@@ -228,11 +251,26 @@ class ActualTradeEligibility:
                 net_reward_risk=net_rr,
                 target_to_cost=target_to_cost,
                 spread_bps=costs.spread_bps,
+                cost_share_of_target=safe_div(cost_pct, target_pct),
                 cost_detail=costs.describe(),
             )
             self.stats.record(result)
             self._log(result)
             return result
+
+        # --- 0. the cost model must be real ------------------------------
+        # Everything below is arithmetic on the fee rate. If that rate is a
+        # configured guess rather than the account's actual schedule, every
+        # verdict below is a guess too — and at OKX Demo the guess is five
+        # times too cheap, which is exactly the direction that approves losing
+        # trades. Refuse rather than pretend.
+        if self.config.block_when_fee_rate_unverified and not costs.verified:
+            return verdict(
+                False,
+                "the account fee schedule has not been verified with the exchange "
+                f"(using {costs.source}) — refusing to price an actual trade from an "
+                "assumed fee rate",
+            )
 
         # --- 1. minimum stop distance (the sizer's own floor) ------------
         if stop_pct < self.risk.min_stop_distance_pct:
@@ -283,12 +321,22 @@ class ActualTradeEligibility:
                 f"target move {target_pct * 100:.4f}% is smaller than round-trip costs "
                 f"{cost_pct * 100:.4f}%",
             )
+        cost_share = safe_div(cost_pct, target_pct)
         if target_to_cost < self.config.min_target_to_cost_multiple:
             return verdict(
                 False,
                 f"target is only {target_to_cost:.2f}× round-trip costs, below the "
                 f"minimum {self.config.min_target_to_cost_multiple:.2f}× "
-                f"(costs are {safe_div(cost_pct, target_pct) * 100:.0f}% of target profit)",
+                f"(costs are {cost_share * 100:.0f}% of target profit)",
+            )
+        # The same constraint stated the other way round. Both are checked so a
+        # future edit to one cannot quietly widen the other; the config
+        # validator keeps them in agreement.
+        if cost_share > self.config.max_cost_pct_of_target:
+            return verdict(
+                False,
+                f"costs are {cost_share * 100:.0f}% of target profit, above the "
+                f"maximum {self.config.max_cost_pct_of_target * 100:.0f}%",
             )
 
         # --- 5. net reward:risk, after costs on both legs ----------------

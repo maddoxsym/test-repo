@@ -181,17 +181,37 @@ class ActualEligibilityConfig(StrictModel):
     #: Minimum target move, as a fraction of entry price.
     min_target_distance_pct: float = Field(0.004, gt=0, le=0.5)
     #: Reward:risk *after* costs are charged to both legs.
-    min_net_reward_risk: float = Field(1.0, gt=0, le=10)
+    min_net_reward_risk: float = Field(1.20, gt=0, le=10)
     #: The target must be at least this multiple of total round-trip costs.
     min_target_to_cost_multiple: float = Field(2.0, ge=1.0, le=50)
+    #: The same constraint from the other direction: costs may not exceed this
+    #: fraction of the target. 50% <-> 2.0x. Both are enforced, and the
+    #: validator below forces them to agree so the pair cannot silently drift
+    #: apart and start refusing setups for two different reasons.
+    max_cost_pct_of_target: float = Field(0.50, gt=0, le=1.0)
     #: Above this spread the book is too thin to price the trade honestly.
     max_spread_bps: float = Field(10.0, gt=0, le=500)
     #: Modelled slippage per leg. Applied to both legs.
     slippage_bps: float = Field(2.0, ge=0, le=200)
     #: Used only when the exchange will not report the account's fee schedule.
     fallback_taker_fee_rate: float = Field(0.0005, gt=0, le=0.01)
+    #: With no verified fee schedule the cost model is a guess, and a guess is
+    #: not a basis for a real order. Default: refuse actual entries entirely.
+    block_when_fee_rate_unverified: bool = True
     #: Refuse to assess liquidity from an order book that is not yet valid.
     require_orderbook: bool = True
+
+    @model_validator(mode="after")
+    def _profitability_knobs_agree(self) -> ActualEligibilityConfig:
+        implied = 1.0 / self.min_target_to_cost_multiple
+        if abs(self.max_cost_pct_of_target - implied) > 1e-9:
+            raise ValueError(
+                "max_cost_pct_of_target and min_target_to_cost_multiple express the "
+                "same constraint and must agree: "
+                f"{self.min_target_to_cost_multiple}x implies "
+                f"{implied:.4f}, got {self.max_cost_pct_of_target}"
+            )
+        return self
 
 
 class RiskConfig(StrictModel):

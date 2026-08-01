@@ -695,6 +695,29 @@ below the contract minimum, or the liquidation buffer could not be satisfied at 
 allowed leverage. Refusing is the correct outcome — and the reason is recorded in
 `rejected_signals`.
 
+**Which gate is actually stopping trades?**
+Run the replay against your own database — it is read-only and safe while the
+bot is trading:
+
+```bash
+btcbot replay-eligibility --hours 24 --taker-fee-rate 0.0025
+```
+
+It reports, for the strict and balanced profiles side by side: actual candidates,
+trades that would have been sent, estimated gross PnL, fees, net PnL, and which
+strategies and timeframes were selected — plus a breakdown of why setups stayed
+shadow-only.
+
+The arithmetic worth knowing before you tune anything. At a 0.56% round trip,
+net reward:risk >= 1.20 requires
+
+    target >= 1.2 x stop + 1.232%
+
+That is stricter than the 2.0x target-to-cost rule for *every* stop size, so the
+smallest target-to-cost multiple that can ever be admitted is about **2.37x**
+(reached at the 0.080% stop floor). Lowering `min_target_to_cost_multiple` below
+that changes nothing at all; `min_net_reward_risk` is the number that decides.
+
 **Lots of `[ACTUAL ELIGIBILITY] SHADOW_ONLY`, few or no real Demo trades**
 Working as designed, and worth understanding. OKX Demo charges 0.25% taker per
 side, so a round trip costs about 0.56% once spread and slippage are included. A

@@ -329,6 +329,43 @@ target was an order of magnitude smaller than the cost of reaching it. At OKX De
 
 ---
 
+## Phase R12 — Balanced actual-trading profile + replay  `[x]`
+
+No actual Demo trades were being taken. The brief was to relax the duplicated
+profitability restrictions (target-to-cost 3.00x -> 2.00x, max cost share 35% -> 50%)
+while keeping every safety gate.
+
+**What the arithmetic showed.** At a 0.56% round trip (0.25% taker per side + 2bps
+spread + 2x2bps slippage), net reward:risk >= 1.20 requires
+
+    target >= 1.2 x stop + 2.2 x cost  =  1.2 x stop + 1.232%
+
+which exceeds the 2.0x rule (target >= 1.12%) for **every** positive stop. The
+smallest admissible target-to-cost multiple is therefore ~2.37x, set by RR at the
+0.080% stop floor — not by the multiple. Relaxing 3.00x -> 2.00x only recovers the
+band 2.37x–3.00x; below 2.37x nothing is reachable at all.
+
+- [x] `min_target_to_cost_multiple` 3.00x -> **2.00x**, `max_cost_pct_of_target`
+      **0.50** added as the same constraint stated the other way, with a config
+      validator forcing the pair to agree so they cannot drift into two rules
+- [x] `min_net_reward_risk` set to **1.20** (was 1.0) — a tightening, and the gate
+      that actually decides
+- [x] **Fee-rate failure now blocks actual entries**
+      (`block_when_fee_rate_unverified`): an unverified schedule means the cost
+      model is a guess, and the fallback guess is 5x too cheap — the exact
+      direction that approves losing trades
+- [x] `analysis/eligibility_replay.py` + `btcbot replay-eligibility` — read-only
+      (`mode=ro`) A/B of both profiles over a window, re-pricing each recorded
+      shadow outcome at the real fee rate and actual-trade size, reporting
+      candidates, trades sent, gross/fees/net PnL, and strategies/timeframes
+- [x] The replay refuses to recommend a profile that is not net positive, and
+      counts still-open candidates separately rather than as winners
+- [x] Dashboard: `actual_eligible_candidates` added to the signal funnel
+- [x] `tests/unit/test_balanced_profile.py` (33),
+      `tests/integration/test_eligibility_replay.py` (14)
+
+---
+
 ---
 
 # Part I — Bybit Demo build (historical record, complete)

@@ -267,6 +267,7 @@ function render(d){
     row('Signals evaluated', p.signals_evaluated||0)+
     row('Refused by decision layers 1-7', p.decision_rejections||0)+
     row('Assessed for actual eligibility', p.eligibility_assessed||0)+
+    row('Actual-eligible candidates', p.actual_eligible_candidates||0,'ok')+
     row('Shadow-only signals', p.shadow_only_signals||0)+
     row('Preliminary eligibility rejections', p.eligibility_rejections||0)+
     row('Final execution blocks (layers 8-10)', p.final_execution_blocks||0)+

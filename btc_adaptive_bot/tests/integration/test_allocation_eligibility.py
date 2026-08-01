@@ -270,8 +270,12 @@ class TestCostsDriveTheVerdictNotTheTimeframe:
     def test_a_higher_fee_rate_makes_previously_eligible_setups_shadow_only(self):
         candidate = wide_candidate()
 
-        cheap = TradeCosts(taker_fee_rate=0.0005, spread_bps=2.0, slippage_bps=2.0)
-        expensive = TradeCosts(taker_fee_rate=0.01, spread_bps=2.0, slippage_bps=2.0)
+        # Both marked verified: this is about the rate's size, not whether it
+        # was confirmed. The unverified case has its own test.
+        cheap = TradeCosts(taker_fee_rate=0.0005, spread_bps=2.0, slippage_bps=2.0,
+                           source="exchange")
+        expensive = TradeCosts(taker_fee_rate=0.01, spread_bps=2.0, slippage_bps=2.0,
+                               source="exchange")
 
         assert eligibility().assess(candidate[1], costs=cheap).eligible
         assert not eligibility().assess(candidate[1], costs=expensive).eligible
